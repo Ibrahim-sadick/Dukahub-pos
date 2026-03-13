@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.staffRecordsRouter = void 0;
+const express_1 = require("express");
+const auth_1 = require("../middleware/auth");
+const validate_1 = require("../middleware/validate");
+const asyncHandler_1 = require("../utils/asyncHandler");
+const staffRecords_controller_1 = require("../controllers/staffRecords.controller");
+const staffRecords_validators_1 = require("../validators/staffRecords.validators");
+exports.staffRecordsRouter = (0, express_1.Router)();
+exports.staffRecordsRouter.get('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, asyncHandler_1.asyncHandler)(staffRecords_controller_1.listStaffRecordsHandler));
+exports.staffRecordsRouter.post('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, validate_1.validateBody)(staffRecords_validators_1.createStaffRecordSchema), (0, asyncHandler_1.asyncHandler)(staffRecords_controller_1.createStaffRecordHandler));
+exports.staffRecordsRouter.patch('/:id', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, validate_1.validateBody)(staffRecords_validators_1.patchStaffRecordSchema), (0, asyncHandler_1.asyncHandler)(staffRecords_controller_1.patchStaffRecordHandler));

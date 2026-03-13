@@ -1,0 +1,12 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.activityRouter = void 0;
+const express_1 = require("express");
+const auth_1 = require("../middleware/auth");
+const validate_1 = require("../middleware/validate");
+const asyncHandler_1 = require("../utils/asyncHandler");
+const activity_controller_1 = require("../controllers/activity.controller");
+const activity_validators_1 = require("../validators/activity.validators");
+exports.activityRouter = (0, express_1.Router)();
+exports.activityRouter.get('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN']), (0, asyncHandler_1.asyncHandler)(activity_controller_1.listActivityHandler));
+exports.activityRouter.post('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, validate_1.validateBody)(activity_validators_1.createActivitySchema), (0, asyncHandler_1.asyncHandler)(activity_controller_1.createActivityHandler));

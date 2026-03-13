@@ -1,0 +1,46 @@
+export const UNIT_OPTIONS = [
+  'try',
+  'tray',
+  'kg',
+  'gram',
+  'pcs',
+  'piece',
+  'pkt',
+  'packet',
+  'bags',
+  'bag',
+  'bottles',
+  'bottle',
+  'mls',
+  'liter',
+  'glass',
+  'tots/shot',
+  'other',
+  'box',
+  'item',
+  'set'
+];
+
+export const UNIT_LABELS = {
+  try: 'Tray',
+  tray: 'Tray',
+  kg: 'Kilogram',
+  gram: 'Gram',
+  pcs: 'Pieces',
+  piece: 'Piece',
+  pkt: 'Packet',
+  packet: 'Packet',
+  bags: 'Bags',
+  bag: 'Bag',
+  bottles: 'Bottles',
+  bottle: 'Bottle',
+  mls: 'mls',
+  liter: 'Liter',
+  glass: 'Glass',
+  'tots/shot': 'Tots/Shot',
+  other: 'Other',
+  box: 'Box',
+  item: 'Item',
+  set: 'Set'
+};
+

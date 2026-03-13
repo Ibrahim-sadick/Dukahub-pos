@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.usersRouter = void 0;
+const express_1 = require("express");
+const auth_1 = require("../middleware/auth");
+const validate_1 = require("../middleware/validate");
+const users_validators_1 = require("../validators/users.validators");
+const users_controller_1 = require("../controllers/users.controller");
+const asyncHandler_1 = require("../utils/asyncHandler");
+exports.usersRouter = (0, express_1.Router)();
+exports.usersRouter.get('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, asyncHandler_1.asyncHandler)(users_controller_1.listUsersHandler));
+exports.usersRouter.post('/', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, validate_1.validateBody)(users_validators_1.createUserSchema), (0, asyncHandler_1.asyncHandler)(users_controller_1.createUserHandler));
+exports.usersRouter.patch('/:id', auth_1.requireAuth, auth_1.requireActiveSubscription, (0, auth_1.requireRole)(['ADMIN', 'MANAGER']), (0, validate_1.validateBody)(users_validators_1.patchUserSchema), (0, asyncHandler_1.asyncHandler)(users_controller_1.patchUserHandler));

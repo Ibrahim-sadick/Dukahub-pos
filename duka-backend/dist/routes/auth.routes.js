@@ -1,0 +1,17 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.authRouter = void 0;
+const express_1 = require("express");
+const validate_1 = require("../middleware/validate");
+const auth_1 = require("../middleware/auth");
+const auth_validators_1 = require("../validators/auth.validators");
+const auth_controller_1 = require("../controllers/auth.controller");
+const asyncHandler_1 = require("../utils/asyncHandler");
+exports.authRouter = (0, express_1.Router)();
+exports.authRouter.post('/signup', (0, validate_1.validateBody)(auth_validators_1.signupSchema), (0, asyncHandler_1.asyncHandler)(auth_controller_1.signupHandler));
+exports.authRouter.post('/login/admin', (0, validate_1.validateBody)(auth_validators_1.adminLoginSchema), (0, asyncHandler_1.asyncHandler)(auth_controller_1.loginAdminHandler));
+exports.authRouter.post('/login/staff', (0, validate_1.validateBody)(auth_validators_1.staffLoginSchema), (0, asyncHandler_1.asyncHandler)(auth_controller_1.loginStaffHandler));
+exports.authRouter.post('/logout', (0, asyncHandler_1.asyncHandler)(auth_controller_1.logoutHandler));
+exports.authRouter.get('/me', auth_1.requireAuth, (0, asyncHandler_1.asyncHandler)(auth_controller_1.meHandler));
+exports.authRouter.post('/password-reset/request', (0, validate_1.validateBody)(auth_validators_1.passwordResetRequestSchema), (0, asyncHandler_1.asyncHandler)(auth_controller_1.passwordResetRequestHandler));
+exports.authRouter.post('/password-reset/confirm', (0, validate_1.validateBody)(auth_validators_1.passwordResetConfirmSchema), (0, asyncHandler_1.asyncHandler)(auth_controller_1.passwordResetConfirmHandler));

@@ -1,0 +1,603 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  CASHIER
+  ATTENDANT
+  STAFF
+}
+
+enum SubscriptionStatus {
+  PAID
+  TRIAL
+  PENDING
+  EXPIRED
+  CANCELLED
+}
+
+model Business {
+  id           Int      @id @default(autoincrement())
+  businessName String
+  ownerUserId  Int?
+  phone        String?
+  email        String?
+  address      String?
+  currency     String   @default("TZS")
+  timezone     String   @default("Africa/Dar_es_Salaam")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  owner          User?            @relation("BusinessOwner", fields: [ownerUserId], references: [id])
+  users          User[]
+  workspaces     Workspace[]
+  modules        BusinessModule[]
+  subscriptions  Subscription[]
+  payments       Payment[]
+  roles          Role[]
+  staffRecords   StaffRecord[]
+  customers      Customer[]
+  suppliers      Supplier[]
+  inventoryItems InventoryItem[]
+  stockMovements StockMovement[]
+  sales          Sale[]
+  salesOrders    SalesOrder[]
+  purchaseOrders PurchaseOrder[]
+  expenses       Expense[]
+
+  @@index([ownerUserId])
+}
+
+model Workspace {
+  id        Int      @id @default(autoincrement())
+  businessId Int
+  name      String
+  location  String?
+  isMain    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  users    User[]
+  sales    Sale[]
+  salesOrders SalesOrder[]
+  purchaseOrders PurchaseOrder[]
+  expenses Expense[]
+  stockMovements StockMovement[]
+
+  @@index([businessId])
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  fullName     String
+  phone        String?  @unique
+  email        String?  @unique
+  employeeId   String?
+  passwordHash String
+  role         UserRole
+  businessId   Int
+  workspaceId  Int?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business      Business       @relation(fields: [businessId], references: [id])
+  workspace     Workspace?     @relation(fields: [workspaceId], references: [id])
+  refreshTokens RefreshToken[]
+  sales         Sale[]
+  salesOrders   SalesOrder[]
+  purchaseOrders PurchaseOrder[]
+  expenses      Expense[]
+
+  ownedBusinesses Business[] @relation("BusinessOwner")
+
+  @@index([businessId])
+  @@index([workspaceId])
+  @@unique([businessId, employeeId])
+}
+
+model Role {
+  id              Int      @id @default(autoincrement())
+  businessId      Int
+  name            String
+  description     String?
+  isDefault       Boolean  @default(false)
+  permissionsJson Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@index([businessId])
+  @@unique([businessId, name])
+}
+
+model StaffRecord {
+  id             Int      @id @default(autoincrement())
+  businessId     Int
+  employeeId     String
+  fullName       String
+  email          String?
+  status         String   @default("live")
+  age            Int
+  nationalId     String
+  placeFrom      String?
+  salaryPerMonth Int
+  allowance      Int      @default(0)
+  date           DateTime
+  message        String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@index([businessId])
+  @@unique([businessId, employeeId])
+}
+
+model Plan {
+  id             Int      @id @default(autoincrement())
+  name           String   @unique
+  price          Int
+  pricePerMonth  Int
+  months         Int
+  durationDays   Int      @default(30)
+  discountPercent Int     @default(0)
+  userLimit      Int
+  trialDays      Int      @default(0)
+  featuresJson   Json?
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id             Int               @id @default(autoincrement())
+  businessId     Int
+  planId         Int
+  status         SubscriptionStatus
+  startedAt      DateTime
+  endsAt         DateTime
+  trialEndsAt    DateTime?
+  months         Int
+  durationDays   Int               @default(30)
+  discountPercent Int
+  userLimit      Int
+  amountPaid     Int?
+  paymentPhone   String?
+  paymentProvider String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  plan     Plan     @relation(fields: [planId], references: [id])
+  payments Payment[]
+
+  @@index([businessId])
+  @@index([planId])
+}
+
+model Module {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  businesses BusinessModule[]
+}
+
+model BusinessModule {
+  id         Int      @id @default(autoincrement())
+  businessId Int
+  moduleId   Int
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id])
+  module   Module   @relation(fields: [moduleId], references: [id])
+
+  @@index([businessId])
+  @@index([moduleId])
+  @@unique([businessId, moduleId])
+}
+
+model Payment {
+  id             Int      @id @default(autoincrement())
+  businessId     Int
+  subscriptionId Int?
+  reference      String?  @unique
+  phoneNumber    String?
+  amount         Int
+  provider       String?
+  status         String
+  rawResponse    Json?
+  paidAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  business     Business      @relation(fields: [businessId], references: [id])
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  @@index([businessId])
+  @@index([subscriptionId])
+}
+
+model Customer {
+  id            Int      @id @default(autoincrement())
+  businessId    Int
+  name          String
+  companyName   String?
+  prefix        String?
+  firstName     String?
+  middleName    String?
+  lastName      String?
+  mainEmail     String?
+  ccEmail       String?
+  mainPhone     String?
+  workPhone     String?
+  mobile        String?
+  fax           String?
+  website       String?
+  other         String?
+  address       String?
+  billTo        String?
+  shipTo        String?
+  defaultShipTo Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  salesOrders SalesOrder[]
+  sales Sale[]
+
+  @@index([businessId])
+  @@index([businessId, name])
+}
+
+model Supplier {
+  id                 Int      @id @default(autoincrement())
+  businessId         Int
+  name               String
+  companyName        String?
+  contactFirstName   String?
+  contactLastName    String?
+  jobTitle           String?
+  phone              String?
+  workPhone          String?
+  mobile             String?
+  fax                String?
+  email              String?
+  ccEmail            String?
+  website            String?
+  other              String?
+  billedFrom         String?
+  shippedFrom        String?
+  openingBalance     Decimal? @db.Decimal(18, 2)
+  openingBalanceAsOf DateTime?
+  inactive           Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  purchaseOrders PurchaseOrder[]
+
+  @@index([businessId])
+  @@index([businessId, name])
+}
+
+model InventoryItem {
+  id           Int      @id @default(autoincrement())
+  businessId   Int
+  name         String
+  category     String   @default("general")
+  unit         String   @default("kg")
+  buyingPrice  Decimal  @default(0) @db.Decimal(18, 2)
+  sellingPrice Decimal  @default(0) @db.Decimal(18, 2)
+  sku          String?
+  barcode      String?
+  description  String?  @db.Text
+  imageDataUrl String?  @db.LongText
+  status       String   @default("active")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  saleItems SaleItem[]
+  salesOrderItems SalesOrderItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+  stockMovements StockMovement[]
+
+  @@index([businessId])
+  @@unique([businessId, name])
+  @@index([businessId, category])
+}
+
+model StockMovement {
+  id            Int      @id @default(autoincrement())
+  businessId    Int
+  workspaceId   Int?
+  inventoryItemId Int?
+  itemName      String
+  itemType      String   @default("general")
+  movementType  String
+  date          DateTime
+  quantity      Decimal  @db.Decimal(18, 3)
+  unit          String
+  pricePerItem  Decimal? @db.Decimal(18, 2)
+  supplierName  String?
+  reason        String?
+  note          String?  @db.Text
+  referenceType String?
+  referenceId   String?
+  createdAt     DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id])
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  inventoryItem InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  @@index([businessId, date])
+  @@index([workspaceId, date])
+  @@index([inventoryItemId, date])
+}
+
+model Sale {
+  id               Int      @id @default(autoincrement())
+  businessId        Int
+  workspaceId       Int?
+  userId            Int?
+  customerId        Int?
+  saleNumber        String?
+  date              DateTime
+  customerName      String?
+  customerType      String?
+  customerPhone     String?
+  customerEmail     String?
+  paymentMethod     String
+  bank              String?
+  accountNumber     String?
+  referenceId       String?
+  mobileProvider    String?
+  transactionId     String?
+  chequeNumber      String?
+  creditCardNumber  String?
+  saleType          String?
+  discount          Decimal  @default(0) @db.Decimal(18, 2)
+  discountType      String?
+  taxRate           Decimal  @default(0) @db.Decimal(10, 4)
+  notes             String?  @db.Text
+  subtotal          Decimal  @default(0) @db.Decimal(18, 2)
+  taxTotal          Decimal  @default(0) @db.Decimal(18, 2)
+  total             Decimal  @default(0) @db.Decimal(18, 2)
+  status            String   @default("paid")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id])
+  items SaleItem[]
+
+  @@index([businessId, date])
+  @@index([customerId])
+  @@index([userId])
+}
+
+model SaleItem {
+  id             Int      @id @default(autoincrement())
+  saleId         Int
+  inventoryItemId Int?
+  productType    String?
+  eggType        String?
+  productName    String
+  description    String?  @db.Text
+  quantity       Decimal  @db.Decimal(18, 3)
+  unit           String
+  unitPrice      Decimal  @db.Decimal(18, 2)
+  lineTotal      Decimal  @db.Decimal(18, 2)
+  createdAt      DateTime @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id])
+  inventoryItem InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  @@index([saleId])
+  @@index([inventoryItemId])
+}
+
+model SalesOrder {
+  id            Int      @id @default(autoincrement())
+  businessId    Int
+  workspaceId   Int?
+  userId        Int?
+  customerId    Int?
+  orderNumber   String
+  invoiceNumber String?
+  orderDate     DateTime
+  orderDateTime DateTime?
+  dueDate       DateTime?
+  paymentMethod String
+  itemType      String
+  currency      String   @default("TZS")
+  usdEnabled    Boolean  @default(false)
+  usdRate       Decimal? @db.Decimal(18, 6)
+  subtotal      Decimal  @default(0) @db.Decimal(18, 2)
+  tax           Decimal  @default(0) @db.Decimal(18, 2)
+  shipping      Decimal  @default(0) @db.Decimal(18, 2)
+  total         Decimal  @default(0) @db.Decimal(18, 2)
+  totalTzs      Decimal? @db.Decimal(18, 2)
+  status        String   @default("open")
+  stockApplied  Boolean  @default(false)
+
+  customerName  String?
+  customerEmail String?
+  customerPhone String?
+  billTo        String?  @db.Text
+  shipTo        String?  @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id])
+  items SalesOrderItem[]
+
+  @@index([businessId, orderDate])
+  @@index([customerId])
+  @@unique([businessId, orderNumber])
+}
+
+model SalesOrderItem {
+  id            Int      @id @default(autoincrement())
+  salesOrderId  Int
+  inventoryItemId Int?
+  item          String
+  description   String?  @db.Text
+  qty           Decimal  @db.Decimal(18, 3)
+  unit          String
+  rate          Decimal  @db.Decimal(18, 2)
+  amount        Decimal  @db.Decimal(18, 2)
+  amountTzs     Decimal? @db.Decimal(18, 2)
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id])
+  inventoryItem InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  @@index([salesOrderId])
+}
+
+model PurchaseOrder {
+  id             Int      @id @default(autoincrement())
+  businessId     Int
+  workspaceId    Int?
+  userId         Int?
+  supplierId     Int?
+  lpoNumber      String
+  date           DateTime
+  supplierName   String?
+  supplierAddress String? @db.Text
+  terms          String?  @db.Text
+  notes          String?  @db.Text
+  shipToName     String?
+  shipToAddress  String?  @db.Text
+  vendorMessage  String?  @db.Text
+  memo           String?  @db.Text
+  subtotal       Decimal  @default(0) @db.Decimal(18, 2)
+  taxTotal       Decimal  @default(0) @db.Decimal(18, 2)
+  total          Decimal  @default(0) @db.Decimal(18, 2)
+  status         String?  @default("open")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+  supplier Supplier? @relation(fields: [supplierId], references: [id])
+  items PurchaseOrderItem[]
+
+  @@index([businessId, date])
+  @@index([supplierId])
+  @@unique([businessId, lpoNumber])
+}
+
+model PurchaseOrderItem {
+  id              Int      @id @default(autoincrement())
+  purchaseOrderId Int
+  inventoryItemId Int?
+  item            String
+  description     String?  @db.Text
+  qty             Decimal  @db.Decimal(18, 3)
+  unit            String
+  price           Decimal  @db.Decimal(18, 2)
+  tax             Decimal  @default(0) @db.Decimal(10, 4)
+  total           Decimal  @db.Decimal(18, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  inventoryItem InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+
+  @@index([purchaseOrderId])
+}
+
+model Expense {
+  id            Int      @id @default(autoincrement())
+  businessId    Int
+  workspaceId   Int?
+  userId        Int?
+  expenseNumber String
+  date          DateTime
+  status        String
+  paymentMethod String
+  reference     String?
+  location      String?
+  category      String
+  amount        Decimal  @db.Decimal(18, 2)
+  notes         String?  @db.Text
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+  workspace Workspace? @relation(fields: [workspaceId], references: [id])
+  user User? @relation(fields: [userId], references: [id])
+  items ExpenseItem[]
+
+  @@index([businessId, date])
+  @@unique([businessId, expenseNumber])
+}
+
+model ExpenseItem {
+  id          Int      @id @default(autoincrement())
+  expenseId   Int
+  category    String
+  subcategory String
+  description String?
+  unit        String
+  qty         Decimal  @db.Decimal(18, 3)
+  rate        Decimal  @db.Decimal(18, 2)
+  amount      Decimal  @db.Decimal(18, 2)
+
+  expense Expense @relation(fields: [expenseId], references: [id])
+
+  @@index([expenseId])
+}
+
+model Otp {
+  id           Int      @id @default(autoincrement())
+  phone        String
+  codeHash     String?
+  purpose      String
+  status       String
+  attemptCount Int      @default(0)
+  expiresAt    DateTime
+  verifiedAt   DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([phone, purpose])
+}
+
+model RefreshToken {
+  id             Int      @id @default(autoincrement())
+  userId         Int
+  tokenHash      String
+  expiresAt      DateTime
+  lastActivityAt DateTime @default(now())
+  revokedAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
