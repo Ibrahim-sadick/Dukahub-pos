@@ -1,22 +1,11 @@
-const readJson = (raw, fallback) => {
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-};
+import { isAdminLikeRole } from './role';
 
 export const getCurrentUser = () => {
   try {
-    const local = readJson(localStorage.getItem('currentUser') || 'null', null);
-    if (local) return local;
-  } catch {}
-  try {
-    const session = readJson(sessionStorage.getItem('currentUser') || 'null', null);
-    if (session) return session;
-  } catch {}
-  return null;
+    return JSON.parse(String(window.localStorage.getItem('currentUser') || 'null'));
+  } catch {
+    return null;
+  }
 };
 
 export const getBusinessIdForUser = (user) => {
@@ -26,11 +15,11 @@ export const getBusinessIdForUser = (user) => {
 };
 
 export const getSystemPreferences = (businessId) => {
-  const key = `systemPreferences:${businessId || 'default'}`;
-  return readJson(localStorage.getItem(key) || 'null', null);
+  void businessId;
+  return null;
 };
 
-export const isAdminUser = (user) => String(user?.role || '').toLowerCase() === 'admin';
+export const isAdminUser = (user) => isAdminLikeRole(user?.role);
 
 export const canDeleteRecords = () => isAdminUser(getCurrentUser());
 

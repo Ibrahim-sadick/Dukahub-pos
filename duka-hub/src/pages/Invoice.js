@@ -4,6 +4,38 @@ import DateInput from '../shared/DateInput';
 import InvoicePrint from '../shared/InvoicePrint';
 import { flushSync } from 'react-dom';
  
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    void safeJsonParse;
+    try {
+      window.localStorage.setItem(String(key || ''), JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+};
+
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+const setStoredJson = (key, value) => Promise.resolve(localStore.set(key, value));
+
 
 const Invoice = () => {
   const [activeTab, setActiveTab] = useState('generator');
@@ -50,32 +82,32 @@ const Invoice = () => {
 
   useEffect(() => {
     const loadCompanyInfo = () => {
-      const savedInfo = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-      setCompanyInfo(savedInfo);
+      Promise.resolve()
+        .then(async () => {
+          const savedInfo = await getStoredJson('companyInfo', {});
+          setCompanyInfo(savedInfo && typeof savedInfo === 'object' ? savedInfo : {});
+        })
+        .catch(() => setCompanyInfo({}));
     };
 
     loadCompanyInfo();
 
     // Load existing invoices
-    const existingInvoices = JSON.parse(localStorage.getItem('invoicedSales') || '[]');
-    setInvoices(existingInvoices);
+    Promise.resolve()
+      .then(async () => {
+        const existingInvoices = await getStoredJson('invoicedSales', []);
+        setInvoices(Array.isArray(existingInvoices) ? existingInvoices : []);
+      })
+      .catch(() => setInvoices([]));
 
     // Listen for company info updates (when logo is changed in settings)
     const handleStorageChange = () => {
       loadCompanyInfo();
     };
-    window.addEventListener('storage', handleStorageChange);
     window.addEventListener('companyInfoUpdated', handleStorageChange);
-    
-    // Also check periodically for changes (in case same tab)
-    const interval = setInterval(() => {
-      loadCompanyInfo();
-    }, 1000);
 
     return () => {
-      window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('companyInfoUpdated', handleStorageChange);
-      clearInterval(interval);
     };
   }, []);
 
@@ -147,54 +179,46 @@ const Invoice = () => {
 
 
 
-  const generatePDF = () => {
+  const generatePDF = async () => {
     setIsLoading(true);
-    
-    setTimeout(() => {
-    // Generate invoice and save to localStorage
-    const existingInvoices = JSON.parse(localStorage.getItem('invoicedSales') || '[]');
-    const subtotal = calculateTotal();
-    const tax = (subtotal * (invoiceData.taxRate || 0)) / 100;
-    const shipping = parseFloat(invoiceData.shipping || 0);
-    const finalTotal = subtotal + tax + shipping;
-    const amountPaid = parseFloat(invoiceData.amountPaid || 0);
-    const balanceDue = finalTotal - amountPaid;
-    
-    const newInvoice = {
-      id: Date.now(),
-      invoiceNumber: invoiceData.invoiceNumber,
-      poNumber: invoiceData.poNumber,
-      customerName: invoiceData.customerName,
-      customerEmail: invoiceData.customerEmail,
-      customerPhone: invoiceData.customerPhone,
-      customerAddress: invoiceData.customerAddress,
-      date: invoiceData.date,
-      paymentTerms: invoiceData.paymentTerms,
-      dueDate: invoiceData.dueDate,
-      items: invoiceData.items,
-      subtotal: subtotal,
-      tax: tax,
-      shipping: shipping,
-      finalTotal: finalTotal,
-      amountPaid: amountPaid,
-      balanceDue: balanceDue,
-      status: amountPaid >= finalTotal ? 'Paid' : 'Not Paid'
-    };
-    
-    // Add new invoice to existing invoices
-    const updatedInvoices = [...existingInvoices, newInvoice];
-    localStorage.setItem('invoicedSales', JSON.stringify(updatedInvoices));
-    setInvoices(updatedInvoices);
-    
-    
-    
-    // Trigger data update event for dashboard and reports
-    window.dispatchEvent(new CustomEvent('dataUpdated'));
-    
-    
-    
-    setIsLoading(false);
-    }, 5000); // 5 seconds loading
+    try {
+      const existingInvoices = Array.isArray(await getStoredJson('invoicedSales', [])) ? await getStoredJson('invoicedSales', []) : [];
+      const subtotal = calculateTotal();
+      const tax = (subtotal * (invoiceData.taxRate || 0)) / 100;
+      const shipping = parseFloat(invoiceData.shipping || 0);
+      const finalTotal = subtotal + tax + shipping;
+      const amountPaid = parseFloat(invoiceData.amountPaid || 0);
+      const balanceDue = finalTotal - amountPaid;
+
+      const newInvoice = {
+        id: Date.now(),
+        invoiceNumber: invoiceData.invoiceNumber,
+        poNumber: invoiceData.poNumber,
+        customerName: invoiceData.customerName,
+        customerEmail: invoiceData.customerEmail,
+        customerPhone: invoiceData.customerPhone,
+        customerAddress: invoiceData.customerAddress,
+        date: invoiceData.date,
+        paymentTerms: invoiceData.paymentTerms,
+        dueDate: invoiceData.dueDate,
+        items: invoiceData.items,
+        subtotal: subtotal,
+        tax: tax,
+        shipping: shipping,
+        finalTotal: finalTotal,
+        amountPaid: amountPaid,
+        balanceDue: balanceDue,
+        status: amountPaid >= finalTotal ? 'Paid' : 'Not Paid'
+      };
+
+      const updatedInvoices = [...existingInvoices, newInvoice];
+      void setStoredJson('invoicedSales', updatedInvoices).catch(() => {});
+      setInvoices(updatedInvoices);
+
+      window.dispatchEvent(new CustomEvent('dataUpdated'));
+    } finally {
+      setIsLoading(false);
+    }
   };
 
 

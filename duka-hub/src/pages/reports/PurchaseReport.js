@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Download, FileText, Printer } from 'lucide-react';
 import { formatDisplayDate } from '../../utils/date';
-import { downloadCsvFile, printWithTitle } from '../../utils/reportActions';
+import { downloadExcelFile, printWithTitle } from '../../utils/reportActions';
+import { reportingApi } from '../../services/reportingApi';
+import { purchasesApi } from '../../services/purchasingApi';
 
 const toNum = (v) => {
   const n = Number(String(v ?? '').replace(/,/g, ''));
@@ -64,25 +66,37 @@ export default function PurchaseReport() {
   const [supplier, setSupplier] = useState('all');
   const [status, setStatus] = useState('all');
   const [refreshKey, setRefreshKey] = useState(0);
+  const [allPurchases, setAllPurchases] = useState([]);
+  const [purchaseSummary, setPurchaseSummary] = useState(null);
+  const [prevPurchaseSummary, setPrevPurchaseSummary] = useState(null);
 
   useEffect(() => {
     const onEvent = () => setRefreshKey((v) => v + 1);
     window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
     return () => {
       window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
     };
   }, []);
 
-  const allPurchases = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('purchases') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const raw = await purchasesApi.list().catch(() => []);
+        if (!alive) return;
+        const list = Array.isArray(raw) ? raw : [];
+        const normalized = list.map((p) => ({
+          ...p,
+          supplier: p?.supplierName,
+          poNumber: p?.lpoNumber,
+          destination: p?.destination || 'stock'
+        }));
+        setAllPurchases(normalized);
+      })
+      .catch(() => setAllPurchases([]));
+    return () => {
+      alive = false;
+    };
   }, [refreshKey]);
 
   const supplierOptions = useMemo(() => {
@@ -153,6 +167,38 @@ export default function PurchaseReport() {
     return { start: null, end: null };
   }, [period]);
 
+  const rangeRequest = useMemo(() => ({
+    from: range.start || new Date(2000, 0, 1),
+    to: range.end || new Date()
+  }), [range.end, range.start]);
+
+  const prevRangeRequest = useMemo(() => {
+    if (!prevRange.start || !prevRange.end) return null;
+    return { from: prevRange.start, to: prevRange.end };
+  }, [prevRange.end, prevRange.start]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const [currentSummary, previousSummary] = await Promise.all([
+          reportingApi.purchasesSummary(rangeRequest),
+          prevRangeRequest ? reportingApi.purchasesSummary(prevRangeRequest) : Promise.resolve(null)
+        ]);
+        if (!alive) return;
+        setPurchaseSummary(currentSummary || null);
+        setPrevPurchaseSummary(previousSummary || null);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setPurchaseSummary(null);
+        setPrevPurchaseSummary(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [prevRangeRequest, rangeRequest, refreshKey]);
+
   const prevTotal = useMemo(() => {
     if (!prevRange.start || !prevRange.end) return 0;
     return annotate
@@ -174,14 +220,40 @@ export default function PurchaseReport() {
     return { total, orders, received, pending, topSupplier: top ? top[0] : '—', topAmount: top ? top[1] : 0, bySupplier };
   }, [filtered]);
 
-  const deltaTotal = pct(kpis.total, prevTotal);
+  const useBackendSummary = supplier === 'all' && status === 'all';
+
+  const summaryKpis = useMemo(() => {
+    if (!useBackendSummary || !purchaseSummary) return kpis;
+    const total = toNum(purchaseSummary?.aggregate?._sum?.total);
+    const orders = toNum(purchaseSummary?.aggregate?._count?._all);
+    const byStatusList = Array.isArray(purchaseSummary?.byStatus) ? purchaseSummary.byStatus : [];
+    const received = byStatusList
+      .filter((entry) => String(entry?.status || '').trim().toLowerCase() === 'received')
+      .reduce((sum, entry) => sum + toNum(entry?._count?._all), 0);
+    const pending = Math.max(0, orders - received);
+    const bySupplier = new Map(
+      (Array.isArray(purchaseSummary?.bySupplier) ? purchaseSummary.bySupplier : []).map((entry) => [
+        String(entry?.supplierName || 'Unknown').trim() || 'Unknown',
+        toNum(entry?._sum?.total)
+      ])
+    );
+    const top = Array.from(bySupplier.entries()).sort((a, b) => b[1] - a[1])[0] || null;
+    return { total, orders, received, pending, topSupplier: top ? top[0] : '—', topAmount: top ? top[1] : 0, bySupplier };
+  }, [kpis, purchaseSummary, useBackendSummary]);
+
+  const summaryPrevTotal = useMemo(() => {
+    if (!useBackendSummary || !prevPurchaseSummary) return prevTotal;
+    return toNum(prevPurchaseSummary?.aggregate?._sum?.total);
+  }, [prevPurchaseSummary, prevTotal, useBackendSummary]);
+
+  const deltaTotal = pct(summaryKpis.total, summaryPrevTotal);
 
   const purchasesBySupplier = useMemo(() => {
-    const entries = Array.from(kpis.bySupplier.entries()).map(([label, value]) => ({ label, value }));
+    const entries = Array.from(summaryKpis.bySupplier.entries()).map(([label, value]) => ({ label, value }));
     entries.sort((a, b) => b.value - a.value);
     const palette = ['#2563eb', '#ef4444', '#d97706', '#7c3aed', '#16a34a'];
     return entries.slice(0, 5).map((r, i) => ({ ...r, color: palette[i % palette.length] }));
-  }, [kpis.bySupplier]);
+  }, [summaryKpis.bySupplier]);
 
   const supplierPerformance = useMemo(() => {
     const by = new Map();
@@ -203,19 +275,26 @@ export default function PurchaseReport() {
     return arr.slice(0, 12);
   }, [filtered]);
 
-  const exportCSV = () => {
-    const rows = [['PO Number', 'Supplier', 'Items', 'Amount', 'Order Date', 'Expected', 'Status']];
+  const exportExcel = () => {
+    const rows = [['PO Number', 'Supplier', 'Items', 'Subtotal (TSH)', 'Tax (TSH)', 'Total (TSH)', 'Order Date', 'Destination', 'Expected', 'Status']];
     filtered.forEach((p) => {
       const po = String(p.lpoNumber || p.poNumber || p.id || '');
       const sup = String(p.supplierName || p.supplier || '');
       const items = Array.isArray(p.items) ? p.items.length : 0;
+      const subtotal = String(toNum(p.subtotal));
+      const tax = String(toNum(p.taxTotal));
       const amt = String(toNum(p.total));
       const od = String(p.date || '');
+      const dest = String(p.destination || '').trim() || 'stock';
       const ex = p._expected ? p._expected.toISOString().slice(0, 10) : '';
       const st = p._status === 'received' ? 'Received' : 'Pending';
-      rows.push([po, sup, String(items), amt, od, ex, st]);
+      rows.push([po, sup, String(items), subtotal, tax, amt, od, dest, ex, st]);
     });
-    downloadCsvFile(`purchase_report_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+    downloadExcelFile(`purchase_report_${new Date().toISOString().slice(0, 10)}.xls`, {
+      title: 'Purchase Report',
+      subtitle: String(range?.label || ''),
+      rows
+    });
   };
 
   const exportPDF = () => printWithTitle(`Purchase Report - ${range.label}`);
@@ -234,11 +313,14 @@ export default function PurchaseReport() {
   return (
     <div className="space-y-6">
       <style>{`
+        .report-print-only { display: none; }
         @media print {
+          @page { size: landscape; margin: 12mm; }
           body * { visibility: hidden !important; }
           .report-print-scope, .report-print-scope * { visibility: visible !important; }
           .report-print-scope { position: absolute !important; inset: 0 !important; padding: 16px !important; background: white !important; }
           .report-no-print { display: none !important; }
+          .report-print-only { display: block !important; }
         }
       `}</style>
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -256,9 +338,9 @@ export default function PurchaseReport() {
             <FileText className="w-4 h-4" />
             PDF
           </button>
-          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportCSV}>
+          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportExcel}>
             <Download className="w-4 h-4" />
-            CSV
+            Excel
           </button>
           <button type="button" className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 inline-flex items-center gap-2" onClick={exportPDF}>
             <Printer className="w-4 h-4" />
@@ -267,12 +349,11 @@ export default function PurchaseReport() {
         </div>
       </div>
 
-      <div className="report-print-scope bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
+      <div className="bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
             <div className="text-[12px] text-orange-700 font-medium tracking-wide">Procurement analysis</div>
-            <div className="mt-2 text-3xl font-semibold text-gray-900">Purchase Report</div>
-            <div className="mt-2 text-sm text-gray-600">All stock purchases from suppliers — {range.label}</div>
+            <div className="mt-2 text-sm text-gray-600">All stock purchases from suppliers</div>
           </div>
           <div className="flex items-center gap-3 report-no-print">
             <select value={supplier} onChange={(e) => setSupplier(e.target.value)} className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm">
@@ -291,18 +372,17 @@ export default function PurchaseReport() {
         </div>
 
         <div className="mt-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
-          {card('TOTAL PURCHASED', `TSH ${money0(kpis.total)}`, `${deltaTotal >= 0 ? '▲' : '▼'} ${Math.abs(deltaTotal).toFixed(1)}% vs last month`, '#f97316')}
-          {card('PURCHASE ORDERS', String(kpis.orders), range.label, '#2563eb')}
-          {card('RECEIVED', String(kpis.received), `${kpis.orders ? ((kpis.received * 100) / kpis.orders).toFixed(1) : '0'}% fulfilled`, '#16a34a')}
-          {card('PENDING DELIVERY', String(kpis.pending), 'In transit', '#d97706')}
-          {card('TOP SUPPLIER', String(kpis.topSupplier || '—'), `TSH ${money0(kpis.topAmount)} this month`, '#7c3aed')}
+          {card('TOTAL PURCHASED', `TSH ${money0(summaryKpis.total)}`, `${deltaTotal >= 0 ? '▲' : '▼'} ${Math.abs(deltaTotal).toFixed(1)}% vs last month`, '#f97316')}
+          {card('PURCHASE ORDERS', String(summaryKpis.orders), 'Orders', '#2563eb')}
+          {card('RECEIVED', String(summaryKpis.received), `${summaryKpis.orders ? ((summaryKpis.received * 100) / summaryKpis.orders).toFixed(1) : '0'}% fulfilled`, '#16a34a')}
+          {card('PENDING DELIVERY', String(summaryKpis.pending), 'In transit', '#d97706')}
+          {card('TOP SUPPLIER', String(summaryKpis.topSupplier || '—'), `TSH ${money0(summaryKpis.topAmount)}`, '#7c3aed')}
         </div>
 
         <div className="mt-6 grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="xl:col-span-2 bg-white border border-gray-200 rounded-2xl">
             <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
               <div className="text-base font-semibold text-gray-900">Purchase by Supplier</div>
-              <span className="px-3 py-1 rounded-full bg-sky-50 text-sky-700 text-xs font-medium">{range.label}</span>
             </div>
             <div className="p-5">
               {purchasesBySupplier.length ? <LineOrBars rows={purchasesBySupplier} /> : <div className="text-sm text-gray-600">No purchases for this filter.</div>}
@@ -336,10 +416,14 @@ export default function PurchaseReport() {
           </div>
         </div>
 
-        <div className="mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
+        <div className="report-print-scope mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
           <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
-            <div className="text-base font-semibold text-gray-900">Purchase Order Records</div>
-            <span className="px-3 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">{range.label}</span>
+            <div>
+              <div className="report-print-only">
+                <div className="text-lg font-semibold text-gray-900">Purchase Report</div>
+              </div>
+              <div className="report-no-print text-base font-semibold text-gray-900">Purchase Order Records</div>
+            </div>
           </div>
           <div className="overflow-auto">
             <table className="min-w-[980px] w-full">

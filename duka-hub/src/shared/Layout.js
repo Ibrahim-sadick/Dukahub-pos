@@ -1,64 +1,312 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useI18n } from '../i18n';
-import { authApi, syncLocalAuthStateFromBackendMe } from '../services/backendApi';
+import { appendSystemActivity } from '../utils/systemActivity';
+import { productsApi } from '../services/productsApi';
 import {
   RiStackLine,
   RiShoppingCart2Line,
   RiShoppingBag3Line,
-  RiGroupLine,
   RiBarChart2Line,
-  RiCalculatorLine,
-  RiBankLine,
-  RiPlug2Line,
   RiWallet3Line,
   RiSearchLine,
   RiNotification3Line,
   RiPulseLine,
   RiCheckboxCircleFill,
+  RiErrorWarningLine,
   RiSettings3Line,
   RiDownload2Line,
   RiApps2Line,
   RiUser3Line,
   RiArrowDownSLine,
   RiArrowRightSLine,
-  RiLock2Line
+  RiLock2Line,
+  RiMenuLine,
+  RiCloseLine
 } from 'react-icons/ri';
 
-const Layout = ({ children, onLogout }) => {
-  const location = useLocation();
-  const navigate = useNavigate();
-  const { t } = useI18n();
-  const [companyInfo, setCompanyInfo] = useState(() => {
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const authApi = {
+  getCurrentUserSync() {
+    void safeJsonParse;
     try {
-      return JSON.parse(localStorage.getItem('companyInfo') || '{}') || {};
-    } catch {
-      return {};
-    }
-  });
-  const [currentUser, setCurrentUser] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
+      return safeJsonParse(window.localStorage.getItem('currentUser'), null);
     } catch {
       return null;
     }
-  });
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    const k = String(key || '');
+    if (!k) return false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+    } catch {
+      return false;
+    }
+    if (!options?.silent) {
+      try {
+        window.dispatchEvent(new CustomEvent('dataUpdated'));
+      } catch {}
+    }
+    return true;
+  },
+  list() {
+    try {
+      const keys = [];
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i);
+        if (k) keys.push(k);
+      }
+      return keys.sort();
+    } catch {
+      return [];
+    }
+  }
+};
+
+const migrateLegacyToScopedCacheOnce = async () => {
+  return;
+};
+
+const Layout = ({ onLogout }) => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { t } = useI18n();
+  const [companyInfo, setCompanyInfo] = useState({});
+  const [currentUser, setCurrentUser] = useState(() => (authApi.getCurrentUserSync ? authApi.getCurrentUserSync() : null));
   const [openSubmenu, setOpenSubmenu] = useState(null);
   const [sidebarCollapsed] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(() => {
+    try {
+      return window.matchMedia('(min-width: 1024px)').matches;
+    } catch {
+      return true;
+    }
+  });
   const [profileOpen, setProfileOpen] = useState(false);
   const [headerSearch, setHeaderSearch] = useState('');
-  const isAdmin = String(currentUser?.role || '').toLowerCase() === 'admin';
+  const isAdmin = true;
   const [toast, setToast] = useState({ open: false, id: 0, text: '', tone: 'info' });
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [notifications, setNotifications] = useState([]);
+  // eslint-disable-next-line no-unused-vars
   const [clock, setClock] = useState(() => Date.now());
   const audioRef = useRef({ ctx: null, unlocked: false });
+  // eslint-disable-next-line no-unused-vars
   const meRefreshRef = useRef({ inFlight: false, lastAt: 0 });
+  const prevCountsRef = useRef({});
+  const pushNotificationRef = useRef(null);
   const businessId = useMemo(() => {
     const role = String(currentUser?.role || '').toLowerCase();
     if (role && role !== 'admin') return String(currentUser?.businessId || '');
     return String(currentUser?.id || '');
   }, [currentUser]);
+
+  useEffect(() => {
+    let mq;
+    try {
+      mq = window.matchMedia('(min-width: 1024px)');
+    } catch {
+      return;
+    }
+    const onChange = () => setIsDesktop(Boolean(mq.matches));
+    onChange();
+    try {
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    } catch {
+      mq.addListener(onChange);
+      return () => mq.removeListener(onChange);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isDesktop) setSidebarOpen(false);
+  }, [isDesktop]);
+
+  useEffect(() => {
+    if (!isDesktop) setSidebarOpen(false);
+  }, [location.pathname, isDesktop]);
+
+  useEffect(() => {
+    if (isDesktop || !sidebarOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [sidebarOpen, isDesktop]);
+
+  const staffAuditRef = useRef({ ready: false, prevByKey: {} });
+  const staffLoginRef = useRef({ key: '' });
+  useEffect(() => {
+    if (!currentUser) return;
+    const defs = [
+      { key: 'sales', entityType: 'Sale', idFields: ['id', 'invoiceNo', 'invoiceNumber'], nameFields: ['customerName', 'customer', 'name'] },
+      { key: 'salesOrders', entityType: 'Sales Order', idFields: ['id', 'invoiceNo', 'invoiceNumber'], nameFields: ['customerName', 'customer', 'name'] },
+      { key: 'invoicedSales', entityType: 'Sale', idFields: ['id', 'invoiceNo', 'invoiceNumber'], nameFields: ['customerName', 'customer', 'name'] },
+      { key: 'expenses', entityType: 'Expense', idFields: ['id'], nameFields: ['category', 'type', 'description'] },
+      { key: 'purchases', entityType: 'Purchase', idFields: ['id', 'purchaseId', 'poNumber'], nameFields: ['supplierName', 'supplier', 'reference'] },
+      { key: 'inventoryItems', entityType: 'Product', idFields: ['id', 'sku', 'barcode'], nameFields: ['name', 'itemName'] },
+      { key: 'damagedStocks', entityType: 'Damage Stock', idFields: ['id'], nameFields: ['productName', 'itemName', 'name', 'reason'] }
+    ];
+
+    const prune = (obj) => {
+      if (!obj || typeof obj !== 'object') return obj;
+      const next = Array.isArray(obj) ? obj.slice() : { ...obj };
+      delete next.updatedAt;
+      delete next.lastUpdated;
+      delete next.lastUpdatedAt;
+      delete next.timestamp;
+      delete next.ts;
+      return next;
+    };
+
+    const pickFirst = (o, keys) => {
+      for (const k of keys || []) {
+        const v = o?.[k];
+        if (v != null && String(v).trim() !== '') return String(v);
+      }
+      return '';
+    };
+
+    const getRowId = (def, row, idx) => {
+      const id = pickFirst(row, def.idFields);
+      return id ? `${id}` : `${def.key}#${idx}`;
+    };
+
+    const normalizeList = (def, list) => {
+      const map = new Map();
+      (Array.isArray(list) ? list : []).forEach((row, idx) => {
+        const id = getRowId(def, row, idx);
+        map.set(id, {
+          id,
+          name: pickFirst(row, def.nameFields),
+          raw: row,
+          sig: (() => {
+            try {
+              return JSON.stringify(prune(row));
+            } catch {
+              return String(id);
+            }
+          })()
+        });
+      });
+      return map;
+    };
+
+    const log = (action, title, details, entityType, entityId) => {
+      appendSystemActivity(action, title, details, entityType, 'success', { entityId });
+    };
+
+    const processOnce = async () => {
+      const nextPrev = { ...(staffAuditRef.current.prevByKey || {}) };
+      if (!staffAuditRef.current.ready) {
+        for (const def of defs) {
+          const raw = await localStore.get(def.key, []);
+          const list = Array.isArray(raw) ? raw : [];
+          const map = normalizeList(def, list);
+          const saved = {};
+          map.forEach((v, id) => {
+            saved[id] = v.sig;
+          });
+          nextPrev[def.key] = saved;
+        }
+        staffAuditRef.current.prevByKey = nextPrev;
+        staffAuditRef.current.ready = true;
+        return;
+      }
+
+      for (const def of defs) {
+        const raw = await localStore.get(def.key, []);
+        const list = Array.isArray(raw) ? raw : [];
+        const map = normalizeList(def, list);
+        const prev = staffAuditRef.current.prevByKey?.[def.key] || {};
+        const next = {};
+        const added = [];
+        const updated = [];
+        map.forEach((v, id) => {
+          next[id] = v.sig;
+          if (!prev[id]) added.push(v);
+          else if (prev[id] !== v.sig) updated.push(v);
+        });
+        const removedIds = Object.keys(prev).filter((id) => !next[id]);
+
+        const cap = 4;
+        added.slice(0, cap).forEach((v) => {
+          const label = v.name ? ` (${v.name})` : '';
+          log('create', `${def.entityType} created${label}`, `Created ${def.entityType}${label}`, def.entityType, v.id);
+        });
+        updated.slice(0, cap).forEach((v) => {
+          const label = v.name ? ` (${v.name})` : '';
+          log('update', `${def.entityType} updated${label}`, `Updated ${def.entityType}${label}`, def.entityType, v.id);
+        });
+        removedIds.slice(0, cap).forEach((id) => {
+          try {
+            const actorName = String(currentUser?.fullName || currentUser?.name || '').trim() || 'Staff';
+            pushNotificationRef.current?.({ title: `${def.entityType} deleted`, message: `${actorName} deleted ${def.entityType}`, type: 'warning', read: false });
+          } catch {}
+          log('delete', `${def.entityType} deleted`, `Deleted ${def.entityType} (#${id})`, def.entityType, id);
+        });
+
+        if (added.length > cap) log('create', `${def.entityType} created`, `Created ${added.length} ${def.entityType}s`, def.entityType, '');
+        if (updated.length > cap) log('update', `${def.entityType} updated`, `Updated ${updated.length} ${def.entityType}s`, def.entityType, '');
+        if (removedIds.length > cap) log('delete', `${def.entityType} deleted`, `Deleted ${removedIds.length} ${def.entityType}s`, def.entityType, '');
+
+        nextPrev[def.key] = next;
+      }
+
+      staffAuditRef.current.prevByKey = nextPrev;
+    };
+
+    const onData = () => {
+      void Promise.resolve(processOnce()).catch(() => {});
+    };
+
+    onData();
+    window.addEventListener('dataUpdated', onData);
+    window.addEventListener('storage', onData);
+    return () => {
+      window.removeEventListener('dataUpdated', onData);
+      window.removeEventListener('storage', onData);
+    };
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const key = String(currentUser?.id || '').trim();
+    if (!key) return;
+    if (staffLoginRef.current.key === key) return;
+    staffLoginRef.current.key = key;
+    const actorName = String(currentUser?.fullName || currentUser?.name || '').trim() || 'Staff';
+    try {
+      pushNotificationRef.current?.({ title: 'Staff login', message: `${actorName} logged in`, type: 'info', read: false });
+    } catch {}
+  }, [currentUser]);
+
+  useEffect(() => {
+    setHeaderSearch('');
+  }, [location.pathname]);
 
   useEffect(() => {
     const unlock = () => {
@@ -85,6 +333,30 @@ const Layout = ({ children, onLogout }) => {
     const id = setInterval(() => setClock(Date.now()), 30000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const path = String(location.pathname || '').trim();
+    if (path === '/plans' || path === '/login' || path === '/signup' || path.startsWith('/signup/')) return;
+    const status = String(currentUser?.subscriptionPaymentStatus || companyInfo?.subscriptionPaymentStatus || '').trim().toLowerCase();
+    const trialEndsAt = String(currentUser?.subscriptionTrialEndsAt || companyInfo?.subscriptionTrialEndsAt || '').trim();
+    const endsAt = String(currentUser?.subscriptionEndsAt || companyInfo?.subscriptionEndsAt || '').trim();
+    const targetDate = status === 'trial' ? trialEndsAt : endsAt;
+    if (!targetDate) return;
+    const ts = Date.parse(targetDate);
+    if (!Number.isFinite(ts)) return;
+    if (clock < ts) return;
+    try {
+      window.dispatchEvent(new CustomEvent('subscriptionLocked'));
+    } catch {}
+  }, [
+    clock,
+    companyInfo?.subscriptionEndsAt,
+    companyInfo?.subscriptionPaymentStatus,
+    companyInfo?.subscriptionTrialEndsAt,
+    currentUser,
+    location.pathname
+  ]);
 
   const showToast = useCallback((text, tone, sound) => {
     setToast({ open: true, id: Date.now(), text, tone });
@@ -129,13 +401,25 @@ const Layout = ({ children, onLogout }) => {
   const notificationKey = useMemo(() => `notifications:${businessId || 'default'}`, [businessId]);
 
   const loadNotifications = useCallback(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(notificationKey) || '[]');
-      const list = Array.isArray(raw) ? raw : [];
-      setNotifications(list);
-    } catch {
-      setNotifications([]);
-    }
+    Promise.resolve()
+      .then(async () => {
+        const raw = await localStore.get(notificationKey, []);
+        const list = Array.isArray(raw) ? raw : [];
+        const filtered = list.filter((n) => {
+          const title = String(n?.title || '').toLowerCase();
+          const message = String(n?.message || '').toLowerCase();
+          const type = String(n?.type || '').toLowerCase();
+          if (type === 'plan') return false;
+          if (title.includes('payment due')) return false;
+          if (message.includes('subscription is ending')) return false;
+          return true;
+        });
+        if (filtered.length !== list.length) {
+          void Promise.resolve(localStore.set(notificationKey, filtered, { silent: true })).catch(() => {});
+        }
+        setNotifications(filtered);
+      })
+      .catch(() => setNotifications([]));
   }, [notificationKey]);
 
   const pushNotification = useCallback((item) => {
@@ -147,39 +431,48 @@ const Layout = ({ children, onLogout }) => {
       type: String(item?.type || 'info'),
       read: Boolean(item?.read)
     };
-    try {
-      const raw = JSON.parse(localStorage.getItem(notificationKey) || '[]');
-      const list = Array.isArray(raw) ? raw : [];
+    setNotifications((prev) => {
+      const list = Array.isArray(prev) ? prev : [];
       const updated = [next, ...list].slice(0, 200);
-      localStorage.setItem(notificationKey, JSON.stringify(updated));
-      setNotifications(updated);
+      void Promise.resolve(localStore.set(notificationKey, updated, { silent: true })).catch(() => {});
       try {
         window.dispatchEvent(new CustomEvent('notificationsUpdated'));
       } catch {}
-    } catch {}
+      return updated;
+    });
   }, [notificationKey]);
+
+  useEffect(() => {
+    pushNotificationRef.current = pushNotification;
+  }, [pushNotification]);
   
 
   useEffect(() => {
     const handleCompanyUpdate = () => {
+      Promise.resolve()
+        .then(async () => {
+          const savedInfo = await localStore.get('companyInfo', {});
+          setCompanyInfo(savedInfo && typeof savedInfo === 'object' ? savedInfo : {});
+        })
+        .catch(() => {});
       try {
-        const savedInfo = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-        setCompanyInfo(savedInfo || {});
-      } catch {}
-      try {
-        const user = JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
+        const user = authApi.getCurrentUserSync ? authApi.getCurrentUserSync() : null;
         setCurrentUser(user || null);
       } catch {}
     };
-    window.addEventListener('storage', handleCompanyUpdate);
     window.addEventListener('companyInfoUpdated', handleCompanyUpdate);
     window.addEventListener('dataUpdated', handleCompanyUpdate);
+    handleCompanyUpdate();
     return () => {
-      window.removeEventListener('storage', handleCompanyUpdate);
       window.removeEventListener('companyInfoUpdated', handleCompanyUpdate);
       window.removeEventListener('dataUpdated', handleCompanyUpdate);
     };
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    migrateLegacyToScopedCacheOnce();
+  }, [currentUser]);
 
   useEffect(() => {
     if (!businessId) return;
@@ -194,44 +487,23 @@ const Layout = ({ children, onLogout }) => {
   }, [businessId, loadNotifications]);
 
   useEffect(() => {
-    const getLen = (key) => {
-      try {
-        const arr = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(arr) ? arr.length : 0;
-      } catch {
-        return 0;
-      }
-    };
-    const keys = ['salesOrders', 'sales', 'purchases', 'expenses'];
-    const check = () => {
+    const keys = ['salesOrders', 'purchases', 'expenses', 'inventoryItems', 'damagedStocks'];
+    const ref = { timer: null };
+    const check = async () => {
       const deltas = {};
-      keys.forEach((k) => {
-        const cur = getLen(k);
-        const prevKey = `prevCount:${k}`;
-        const hasPrev = (() => {
-          try {
-            return localStorage.getItem(prevKey) !== null;
-          } catch {
-            return false;
-          }
-        })();
-        let prev = cur;
-        try {
-          prev = parseInt(localStorage.getItem(prevKey) || String(cur), 10);
-        } catch {}
-        const d = cur - (Number.isFinite(prev) ? prev : cur);
+      const scope = String(businessId || 'default');
+      for (const k of keys) {
+        const curArr = await localStore.get(k, []);
+        const cur = Array.isArray(curArr) ? curArr.length : 0;
+        const slot = `${scope}:${k}`;
+        const prev = prevCountsRef.current[slot];
+        const hasPrev = typeof prev === 'number' && Number.isFinite(prev);
+        const d = cur - (hasPrev ? prev : cur);
         if (hasPrev && d > 0) deltas[k] = d;
-        try {
-          localStorage.setItem(prevKey, String(cur));
-        } catch {}
-      });
+        prevCountsRef.current[slot] = cur;
+      }
       if (deltas.salesOrders) {
         const msg = `${deltas.salesOrders} sale order(s) recorded`;
-        showToast(msg, 'success', 'ripples');
-        pushNotification({ title: 'New sale order', message: msg, type: 'sales', read: false });
-      }
-      if (deltas.sales) {
-        const msg = `${deltas.sales} sale order(s) recorded`;
         showToast(msg, 'success', 'ripples');
         pushNotification({ title: 'New sale order', message: msg, type: 'sales', read: false });
       }
@@ -245,52 +517,45 @@ const Layout = ({ children, onLogout }) => {
         showToast(msg, 'success', 'ripples');
         pushNotification({ title: 'New expense', message: msg, type: 'expenses', read: false });
       }
+      if (deltas.inventoryItems) {
+        const msg = `${deltas.inventoryItems} product(s) added`;
+        showToast(msg, 'success', 'ripples');
+        pushNotification({ title: 'New product', message: msg, type: 'inventory', read: false });
+      }
+      if (deltas.damagedStocks) {
+        const msg = `${deltas.damagedStocks} damaged stock record(s) recorded`;
+        showToast(msg, 'warning', 'ripples');
+        pushNotification({ title: 'Damaged stock', message: msg, type: 'inventory', read: false });
+      }
     };
     // Initialize once
-    check();
-    const onEvent = () => check();
-    window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
-    return () => {
-      window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
+    void check();
+    const onEvent = () => {
+      if (ref.timer) window.clearTimeout(ref.timer);
+      ref.timer = window.setTimeout(() => void check(), 250);
     };
-  }, [pushNotification, showToast]);
+    window.addEventListener('dataUpdated', onEvent);
+    return () => {
+      if (ref.timer) window.clearTimeout(ref.timer);
+      window.removeEventListener('dataUpdated', onEvent);
+    };
+  }, [businessId, pushNotification, showToast]);
 
   const unreadNotifications = useMemo(() => (notifications || []).filter((n) => !n?.read), [notifications]);
   const unreadCount = unreadNotifications.length;
-
-  useEffect(() => {
-    const endsAtIso = String(companyInfo?.subscriptionEndsAt || '').trim();
-    const planId = String(companyInfo?.subscriptionPlan || '').trim();
-    if (!businessId || !planId || !endsAtIso) return;
-    let endsAt;
-    try {
-      endsAt = new Date(endsAtIso);
-      if (Number.isNaN(endsAt.getTime())) return;
-    } catch {
-      return;
-    }
-    const now = clock;
-    const msLeft = endsAt.getTime() - now;
-    const daysLeft = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
-    if (daysLeft <= 0) return;
-    if (daysLeft > 3) return;
-    const key = `notified:planExpiry:${businessId}:${endsAtIso}`;
-    try {
-      if (localStorage.getItem(key) === '1') return;
-      localStorage.setItem(key, '1');
-    } catch {}
-    const title = 'Plan Expiry Alert';
-    const message = `Mpango wako unakaribia kuisha (${daysLeft} siku). Tafadhali lipa ili uendelee kutumia mfumo.`;
-    pushNotification({
-      title,
-      message,
-      type: 'plan',
-      read: false
-    });
-    showToast(message, 'warning', 'ripples');
-  }, [businessId, clock, companyInfo?.subscriptionEndsAt, companyInfo?.subscriptionPlan, pushNotification, showToast]);
+  const topbarTitle = useMemo(() => {
+    const name = String(
+      companyInfo?.companyName ||
+        companyInfo?.name ||
+        companyInfo?.businessName ||
+        currentUser?.businessName ||
+        currentUser?.companyName ||
+        currentUser?.company ||
+        ''
+    ).trim();
+    const branch = String(companyInfo?.branch || 'HQ').trim() || 'HQ';
+    return `${name || 'Duka Hub'} ${branch}`.trim();
+  }, [companyInfo?.branch, companyInfo?.businessName, companyInfo?.companyName, companyInfo?.name, currentUser?.businessName, currentUser?.company, currentUser?.companyName]);
 
   useEffect(() => {
     const onDoc = (e) => {
@@ -301,73 +566,31 @@ const Layout = ({ children, onLogout }) => {
   }, []);
 
   useEffect(() => {
-    const onClick = (e) => {
-      const btn = e?.target?.closest?.('button');
-      if (!btn) return;
-      if (btn.disabled) return;
-      if (btn.getAttribute('data-no-loading') === 'true') return;
-      btn.setAttribute('data-click-loading', 'true');
-      setTimeout(() => {
-        try {
-          btn.removeAttribute('data-click-loading');
-        } catch {}
-      }, 5000);
-    };
-    document.addEventListener('click', onClick, true);
-    return () => document.removeEventListener('click', onClick, true);
-  }, []);
-
-  useEffect(() => {
-    const getDefaultMin = () => {
-      try {
-        const role = String(currentUser?.role || '').toLowerCase();
-        const businessId = role === 'staff' ? String(currentUser?.businessId || '') : String(currentUser?.id || '');
-        const prefs = JSON.parse(localStorage.getItem(`systemPreferences:${businessId || 'default'}`) || 'null');
-        const raw = String(prefs?.inventory?.defaultReorderLevel || '10').trim();
-        const n = parseInt(raw, 10);
-        return Number.isFinite(n) && n > 0 ? n : 10;
-      } catch {
-        return 10;
-      }
-    };
-    const computeSets = () => {
-      const defaultMin = getDefaultMin();
-      const qtyByName = new Map();
+    if (!currentUser) return;
+    const shouldRun = false;
+    if (!shouldRun) return;
+    const ref = { timer: null, lastAt: 0, inFlight: false };
+    const computeSets = async () => {
+      const businessIdForPrefs = String(currentUser?.id || '');
+      const prefs = await localStore.get(`systemPreferences:${businessIdForPrefs || 'default'}`, null);
+      const rawMin = String(prefs?.inventory?.defaultReorderLevel || '10').trim();
+      const parsedMin = parseInt(rawMin, 10);
+      const defaultMin = Number.isFinite(parsedMin) && parsedMin > 0 ? parsedMin : 10;
       const minByName = new Map();
-      try {
-        const items = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        (Array.isArray(items) ? items : []).forEach((it) => {
-          const name = String(it?.name || '').trim();
-          if (!name) return;
-          const minRaw = parseInt(String(it?.reorderLevel || '').trim(), 10);
-          if (Number.isFinite(minRaw) && minRaw > 0) minByName.set(name, minRaw);
-        });
-      } catch {}
-      try {
-        Object.keys(localStorage || {}).forEach((k) => {
-          if (!/^stockIn_/.test(k)) return;
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = String(r?.itemName || r?.name || '').trim();
-            if (!name) return;
-            const qty = parseFloat(String(r?.quantity || 0)) || 0;
-            qtyByName.set(name, (qtyByName.get(name) || 0) + qty);
-          });
-        });
-        Object.keys(localStorage || {}).forEach((k) => {
-          if (!/^stockOut_/.test(k)) return;
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = String(r?.itemName || r?.name || '').trim();
-            if (!name) return;
-            const qty = parseFloat(String(r?.quantity || 0)) || 0;
-            qtyByName.set(name, (qtyByName.get(name) || 0) - qty);
-          });
-        });
-      } catch {}
+      const items = await localStore.get('inventoryItems', []);
+      (Array.isArray(items) ? items : []).forEach((it) => {
+        const name = String(it?.name || '').trim();
+        if (!name) return;
+        const minRaw = parseInt(String(it?.reorderLevel || '').trim(), 10);
+        if (Number.isFinite(minRaw) && minRaw > 0) minByName.set(name, minRaw);
+      });
+      const snapshot = await productsApi.loadInventorySnapshot().catch(() => []);
       const critical = [];
       const warning = [];
-      Array.from(qtyByName.entries()).forEach(([name, qty]) => {
+      (Array.isArray(snapshot) ? snapshot : []).forEach((entry) => {
+        const name = String(entry?.name || entry?.itemName || '').trim();
+        const qty = Number(entry?.stockQuantity || 0);
+        if (!name) return;
         const minLevel = minByName.get(name) || defaultMin;
         const status = qty <= minLevel ? 'critical' : qty <= Math.ceil(minLevel * 1.5) ? 'warning' : 'ok';
         if (status === 'critical') critical.push(name);
@@ -375,42 +598,48 @@ const Layout = ({ children, onLogout }) => {
       });
       return { critical: Array.from(new Set(critical)).sort(), warning: Array.from(new Set(warning)).sort() };
     };
-    const checkAndNotify = () => {
-      const { critical, warning } = computeSets();
-      let prevC = [];
-      let prevW = [];
+    const checkAndNotify = async () => {
+      if (ref.inFlight) return;
+      const now = Date.now();
+      if (now - ref.lastAt < 5000) return;
+      ref.lastAt = now;
+      ref.inFlight = true;
       try {
-        prevC = JSON.parse(localStorage.getItem('lowStockPrevCritical') || '[]') || [];
-        prevW = JSON.parse(localStorage.getItem('lowStockPrevWarning') || '[]') || [];
-      } catch {}
-      const first = !(localStorage.getItem('lowStockPrevCritical') || localStorage.getItem('lowStockPrevWarning'));
-      if (!first) {
-        const newC = critical.filter((n) => !prevC.includes(n));
-        const newW = warning.filter((n) => !prevW.includes(n));
-        if (newC.length) {
-          const names = newC.slice(0, 3).join(', ');
-          const more = newC.length > 3 ? ` +${newC.length - 3}` : '';
-          showToast(`${newC.length} item(s) critical: ${names}${more}`, 'critical', 'ripples');
-        } else if (newW.length) {
-          const names = newW.slice(0, 3).join(', ');
-          const more = newW.length > 3 ? ` +${newW.length - 3}` : '';
-          showToast(`${newW.length} item(s) low: ${names}${more}`, 'warning', 'ripples');
+        const { critical, warning } = await computeSets();
+        const prevC = await localStore.get(`lowStockPrevCritical:${businessId || 'default'}`, []);
+        const prevW = await localStore.get(`lowStockPrevWarning:${businessId || 'default'}`, []);
+        const first = prevC == null && prevW == null;
+        if (!first) {
+          const prevCList = Array.isArray(prevC) ? prevC : [];
+          const prevWList = Array.isArray(prevW) ? prevW : [];
+          const newC = critical.filter((n) => !prevCList.includes(n));
+          const newW = warning.filter((n) => !prevWList.includes(n));
+          if (newC.length) {
+            const names = newC.slice(0, 3).join(', ');
+            const more = newC.length > 3 ? ` +${newC.length - 3}` : '';
+            showToast(`${newC.length} item(s) critical: ${names}${more}`, 'critical', 'ripples');
+          } else if (newW.length) {
+            const names = newW.slice(0, 3).join(', ');
+            const more = newW.length > 3 ? ` +${newW.length - 3}` : '';
+            showToast(`${newW.length} item(s) low: ${names}${more}`, 'warning', 'ripples');
+          }
         }
-      }
-      try {
-        localStorage.setItem('lowStockPrevCritical', JSON.stringify(critical));
-        localStorage.setItem('lowStockPrevWarning', JSON.stringify(warning));
+        void Promise.resolve(localStore.set(`lowStockPrevCritical:${businessId || 'default'}`, critical)).catch(() => {});
+        void Promise.resolve(localStore.set(`lowStockPrevWarning:${businessId || 'default'}`, warning)).catch(() => {});
       } catch {}
+      ref.inFlight = false;
     };
-    const onEvent = () => checkAndNotify();
-    checkAndNotify();
+    const onEvent = () => {
+      if (ref.timer) window.clearTimeout(ref.timer);
+      ref.timer = window.setTimeout(() => void checkAndNotify(), 400);
+    };
+    void checkAndNotify();
     window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
     return () => {
+      if (ref.timer) window.clearTimeout(ref.timer);
       window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
     };
-  }, [currentUser, showToast]);
+  }, [businessId, currentUser, location.pathname, notificationOpen, showToast]);
 
   const sidebarItems = useMemo(
     () => [
@@ -419,17 +648,17 @@ const Layout = ({ children, onLogout }) => {
       { path: '/stocks', label: t('nav.stocks'), icon: RiStackLine },
       { path: '/purchases', label: t('nav.purchases'), icon: RiShoppingBag3Line },
       { path: '/expenses', label: t('nav.expenses'), icon: RiWallet3Line },
-      { path: '/reports', label: t('nav.reports'), icon: RiBarChart2Line, locked: !isAdmin },
-      { path: '/users', label: t('nav.staff'), icon: RiGroupLine, locked: !isAdmin },
-      { path: '/placeholder/accounting', label: t('nav.accounting'), icon: RiCalculatorLine },
-      { path: '/placeholder/banking', label: t('nav.banking'), icon: RiBankLine },
-      { path: '/placeholder/planning', label: t('nav.planning'), icon: RiApps2Line },
+      { path: '/placeholder/damage-stocks', label: t('nav.damageStocks'), icon: RiErrorWarningLine },
+      { path: '/reports', label: t('nav.reports'), icon: RiBarChart2Line },
       { path: '/placeholder/notifications', label: t('nav.activity'), icon: RiPulseLine },
-      { path: '/placeholder/integrations', label: t('nav.integrations'), icon: RiPlug2Line },
-      { path: '/settings', label: t('nav.settings'), icon: RiSettings3Line, locked: !isAdmin }
+      { path: '/settings', label: t('nav.settings'), icon: RiSettings3Line }
     ],
-    [isAdmin, t]
+    [t]
   );
+
+  const visibleSidebarItems = useMemo(() => {
+    return (sidebarItems || []).filter((i) => !i?.locked);
+  }, [sidebarItems]);
 
   
 
@@ -441,8 +670,7 @@ const Layout = ({ children, onLogout }) => {
           { label: t('submenu.salesOrder'), to: '/placeholder/sales-order' },
           { label: t('submenu.salesHistory'), to: '/placeholder/sales-history' },
           { label: t('submenu.customers'), to: '/placeholder/sales-customers' },
-          { label: t('submenu.creditSales'), to: '/placeholder/sales-credit' },
-          { label: t('submenu.returnsRefunds'), to: '/placeholder/sales-returns' }
+          { label: t('submenu.creditSales'), to: '/placeholder/sales-credit' }
         ]
       }
     ],
@@ -475,103 +703,64 @@ const Layout = ({ children, onLogout }) => {
         ]
       }
     ],
-    ...(isAdmin
-      ? {
-          '/reports': [
-            {
-              title: t('nav.reports'),
-              items: [
-                { label: t('submenu.salesReports'), to: '/placeholder/reports-sales' },
-                { label: t('submenu.inventoryReports'), to: '/placeholder/reports-inventory', locked: true },
-                { label: t('submenu.productionReports'), to: '/placeholder/reports-production' },
-                { label: t('submenu.expenseReports'), to: '/placeholder/reports-expenses' },
-                { label: t('submenu.profitLoss'), to: '/reports' },
-                { label: t('submenu.performanceKpis'), to: '/placeholder/reports-kpis', locked: true }
-              ]
-            }
-          ]
-        }
-      : {}),
-    '/users': [
+    '/reports': [
       {
-        title: t('nav.staff'),
+        title: t('nav.reports'),
         items: [
-          { label: t('submenu.staffRegister'), to: '/users' },
-          { label: t('submenu.staffList'), to: '/users/list' },
-          { label: t('submenu.rolesPermissions'), to: '/roles-permissions' }
+          { label: t('submenu.salesReports'), to: '/placeholder/reports-sales' },
+          { label: t('submenu.inventoryReports'), to: '/placeholder/reports-inventory' },
+          { label: t('submenu.productionReports'), to: '/placeholder/reports-production' },
+          { label: t('submenu.expenseReports'), to: '/placeholder/reports-expenses' },
+          { label: t('submenu.profitLoss'), to: '/reports' }
         ]
       }
     ],
-    '/placeholder/planning': [
+    '/settings': [
       {
-        title: t('nav.planning'),
-        items: [
-          { label: t('submenu.purchasePlanning'), to: '/placeholder/purchase-planning' }
-        ]
+        title: t('nav.settings'),
+        items: [{ label: t('submenu.systemPreferences'), to: '/placeholder/settings-preferences' }]
       }
-    ],
-    '/placeholder/notifications': [
-      {
-        title: t('nav.activity'),
-        items: [
-          { label: t('submenu.lowStockAlerts'), to: '/placeholder/alerts-low-stock' },
-          { label: t('submenu.expiryAlerts'), to: '/placeholder/alerts-expiry', locked: true },
-          { label: t('submenu.paymentDueAlerts'), to: '/placeholder/alerts-payment-due' },
-          { label: t('submenu.systemLogs'), to: '/placeholder/system-logs' }
-        ]
-      }
-    ],
-    '/placeholder/accounting': [
-      {
-        title: t('nav.accounting'),
-        items: [
-          { label: t('submenu.incomeOverview'), to: '/placeholder/income-overview', locked: true },
-          { label: t('submenu.expenseOverview'), to: '/placeholder/expense-overview', locked: true },
-          { label: t('submenu.stockValue'), to: '/placeholder/stock-value', locked: true },
-          { label: t('submenu.periodClosing'), to: '/placeholder/period-closing', locked: true },
-          { label: t('submenu.auditTrail'), to: '/placeholder/audit-trail', locked: true }
-        ]
-      }
-    ],
-    '/placeholder/banking': [
-      {
-        title: t('nav.banking'),
-        items: [
-          { label: t('submenu.bankAccounts'), to: '/placeholder/banking-accounts', locked: true },
-          { label: t('submenu.bankTransfers'), to: '/placeholder/banking-transfers', locked: true },
-          { label: t('submenu.bankReconciliation'), to: '/placeholder/banking-reconciliation', locked: true }
-        ]
-      }
-    ],
-    '/placeholder/integrations': [
-      {
-        title: t('nav.integrations'),
-        items: [
-          { label: t('submenu.mobileMoney'), to: '/placeholder/integration-mobile-money', locked: true },
-          { label: t('submenu.smsWhatsapp'), to: '/placeholder/integration-sms', locked: true },
-          { label: t('submenu.exportIntegration'), to: '/placeholder/integration-export', locked: true }
-        ]
-      }
-    ],
-    ...(isAdmin
-      ? {
-          '/settings': [
-            {
-              title: t('nav.settings'),
-              items: [
-                { label: t('top.profile'), to: '/settings' },
-                { label: t('submenu.systemPreferences'), to: '/placeholder/settings-preferences' }
-              ]
-            }
-          ]
-        }
-      : {})
-  }), [isAdmin, t]);
+    ]
+  }), [t]);
+
+  const visibleSubmenu = useMemo(() => {
+    const out = {};
+    Object.entries(submenu || {}).forEach(([k, groups]) => {
+      const nextGroups = (groups || [])
+        .map((g) => ({
+          ...g,
+          items: (g?.items || []).filter((it) => !it?.locked)
+        }))
+        .filter((g) => (g?.items || []).length > 0);
+      if (nextGroups.length) out[k] = nextGroups;
+    });
+    return out;
+  }, [submenu]);
+
+  const openSubmenuRef = useRef(null);
+  useEffect(() => {
+    openSubmenuRef.current = openSubmenu;
+  }, [openSubmenu]);
+
+  useEffect(() => {
+    if (sidebarCollapsed) {
+      setOpenSubmenu(null);
+      return;
+    }
+    const currentOpen = openSubmenuRef.current;
+    if (!currentOpen) return;
+    const p = String(location.pathname || '');
+    const groupLinks = visibleSubmenu[currentOpen]
+      ? visibleSubmenu[currentOpen].flatMap((g) => (g?.items ? g.items : []))
+      : [];
+    const stillWithinGroup = p === currentOpen || groupLinks.some((l) => String(l?.to || '') === p);
+    if (!stillWithinGroup) setOpenSubmenu(null);
+  }, [location.pathname, sidebarCollapsed, visibleSubmenu]);
 
   const searchItems = useMemo(() => {
     const out = [];
-    sidebarItems.forEach((i) => out.push({ label: i.label, to: i.path, group: t('common.menu') }));
-    Object.values(submenu).forEach((groups) => {
+    visibleSidebarItems.forEach((i) => out.push({ label: i.label, to: i.path, group: t('common.menu') }));
+    Object.values(visibleSubmenu).forEach((groups) => {
       (groups || []).forEach((g) => {
         (g.items || []).forEach((it) => out.push({ label: it.label, to: it.to, group: g.title || t('common.menu') }));
       });
@@ -583,7 +772,7 @@ const Layout = ({ children, onLogout }) => {
       seen.add(key);
       return true;
     });
-  }, [sidebarItems, submenu, t]);
+  }, [t, visibleSidebarItems, visibleSubmenu]);
 
   const headerResults = useMemo(() => {
     const q = (headerSearch || '').trim().toLowerCase();
@@ -594,176 +783,27 @@ const Layout = ({ children, onLogout }) => {
   }, [headerSearch, searchItems]);
 
   const goTo = (to) => {
-    if (subscriptionLock.locked && String(to || '') !== '/plans' && String(to || '') !== '/dashboard') {
-      setHeaderSearch('');
-      setProfileOpen(false);
-      return;
-    }
-    const lockedReports =
-      String(to || '') === '/placeholder/reports-inventory' || String(to || '') === '/placeholder/reports-kpis';
-    const lockedIntegrations =
-      String(to || '') === '/placeholder/integrations' ||
-      String(to || '') === '/placeholder/integration-mobile-money' ||
-      String(to || '') === '/placeholder/integration-sms' ||
-      String(to || '') === '/placeholder/integration-export';
-    const lockedBanking =
-      String(to || '') === '/placeholder/banking' ||
-      String(to || '') === '/placeholder/banking-accounts' ||
-      String(to || '') === '/placeholder/banking-transfers' ||
-      String(to || '') === '/placeholder/banking-reconciliation';
     const lockedAccounting =
       String(to || '') === '/placeholder/accounting' ||
       String(to || '').startsWith('/placeholder/income-overview') ||
       String(to || '').startsWith('/placeholder/expense-overview') ||
       String(to || '').startsWith('/placeholder/stock-value') ||
       String(to || '').startsWith('/placeholder/period-closing') ||
-      String(to || '').startsWith('/placeholder/audit-trail') ||
-      String(to || '') === '/placeholder/alerts-expiry';
-    const lockedForStaff =
-      !isAdmin &&
-      (String(to || '') === '/reports' ||
-        String(to || '') === '/settings' ||
-        String(to || '') === '/users' ||
-        String(to || '') === '/users/list' ||
-        String(to || '') === '/roles-permissions' ||
-        String(to || '') === '/placeholder/system-logs');
-    if (lockedReports || lockedIntegrations || lockedBanking || lockedAccounting || lockedForStaff) {
+      String(to || '').startsWith('/placeholder/audit-trail');
+    if (lockedAccounting) {
       setHeaderSearch('');
       setProfileOpen(false);
       return;
     }
     setHeaderSearch('');
     setProfileOpen(false);
+    setSidebarOpen(false);
     navigate(to);
   };
-
-  const subscriptionLock = useMemo(() => {
-    if (!currentUser) return { locked: false, reason: '' };
-
-    const explicitLocked = Boolean(currentUser?.subscriptionLocked || companyInfo?.subscriptionLocked);
-    const explicitReason = String(currentUser?.subscriptionLockReason || companyInfo?.subscriptionLockReason || '').trim().toLowerCase();
-    if (explicitLocked) {
-      const reasonKey =
-        explicitReason === 'expired'
-          ? 'lock.expired'
-          : explicitReason === 'payment_pending' || explicitReason === 'pending'
-            ? 'lock.paymentPending'
-            : explicitReason === 'cancelled'
-              ? 'lock.inactive'
-              : 'lock.inactive';
-      return { locked: true, reason: reasonKey };
-    }
-
-    const status = String(currentUser?.subscriptionPaymentStatus || companyInfo?.subscriptionPaymentStatus || '').toLowerCase();
-    const endsAtRaw = String(currentUser?.subscriptionEndsAt || companyInfo?.subscriptionEndsAt || '').trim();
-    const trialEndsAtRaw = String(currentUser?.subscriptionTrialEndsAt || companyInfo?.subscriptionTrialEndsAt || '').trim();
-    const now = clock;
-
-    const parseTime = (s) => {
-      const t = Date.parse(String(s || ''));
-      return Number.isFinite(t) ? t : 0;
-    };
-
-    if (status === 'paid') {
-      const end = parseTime(endsAtRaw);
-      if (!end) return { locked: true, reason: 'lock.notActive' };
-      if (now > end) return { locked: true, reason: 'lock.expired' };
-      return { locked: false, reason: '' };
-    }
-
-    if (status === 'trial') {
-      const end = parseTime(trialEndsAtRaw || endsAtRaw);
-      if (!end) return { locked: true, reason: 'lock.trialNotActive' };
-      if (now > end) return { locked: true, reason: 'lock.trialEnded' };
-      return { locked: false, reason: '' };
-    }
-
-    if (status === 'pending') return { locked: true, reason: 'lock.paymentPending' };
-
-    const hasPlan = Boolean(String(currentUser?.subscriptionPlan || companyInfo?.subscriptionPlan || '').trim());
-    if (hasPlan) return { locked: true, reason: 'lock.inactive' };
-    return { locked: false, reason: '' };
-  }, [clock, companyInfo?.subscriptionEndsAt, companyInfo?.subscriptionLocked, companyInfo?.subscriptionLockReason, companyInfo?.subscriptionPaymentStatus, companyInfo?.subscriptionPlan, companyInfo?.subscriptionTrialEndsAt, currentUser]);
-
-  const visibleSidebarItems = useMemo(() => {
-    if (!subscriptionLock.locked) return sidebarItems;
-    return [
-      sidebarItems.find((i) => i.path === '/dashboard') || { path: '/dashboard', label: t('nav.dashboard'), icon: RiBarChart2Line },
-      { path: '/plans', label: t('nav.plans'), icon: RiLock2Line }
-    ];
-  }, [sidebarItems, subscriptionLock.locked, t]);
-
-  useEffect(() => {
-    if (!subscriptionLock.locked) return;
-    const path = String(location.pathname || '');
-    if (path === '/plans' || path === '/dashboard') return;
-    navigate('/dashboard', { replace: true });
-  }, [location.pathname, navigate, subscriptionLock.locked]);
-
-  useEffect(() => {
-    if (subscriptionLock.locked) return;
-    const path = String(location.pathname || '');
-    if (path !== '/plans') return;
-    navigate('/dashboard', { replace: true });
-  }, [location.pathname, navigate, subscriptionLock.locked]);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    if (!subscriptionLock.locked) return;
-    let mounted = true;
-    const rememberMe = Boolean(localStorage.getItem('rememberMe') === 'true');
-    const refresh = async () => {
-      if (!mounted) return;
-      const now = Date.now();
-      if (meRefreshRef.current.inFlight) return;
-      if (now - meRefreshRef.current.lastAt < 8000) return;
-      meRefreshRef.current.inFlight = true;
-      meRefreshRef.current.lastAt = now;
-      try {
-        const me = await authApi.me();
-        if (!mounted) return;
-        syncLocalAuthStateFromBackendMe(me, rememberMe);
-      } catch {} finally {
-        meRefreshRef.current.inFlight = false;
-      }
-    };
-
-    const onFocus = () => refresh();
-    refresh();
-    const id = setInterval(refresh, 15000);
-    window.addEventListener('focus', onFocus);
-    return () => {
-      mounted = false;
-      clearInterval(id);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [currentUser, subscriptionLock.locked]);
 
   return (
     <div className="flex h-screen bg-white relative overflow-x-hidden">
       <style>{`
-        button[data-click-loading="true"] {
-          position: relative;
-          pointer-events: none;
-        }
-        button[data-click-loading="true"]::after {
-          content: '';
-          position: absolute;
-          right: 10px;
-          top: 50%;
-          width: 14px;
-          height: 14px;
-          margin-top: -7px;
-          border-radius: 9999px;
-          border: 2px solid currentColor;
-          border-top-color: rgba(0,0,0,0);
-          opacity: 0.8;
-          animation: btnSpin 0.55s linear infinite;
-        }
-        @keyframes btnSpin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
         @keyframes toastLife {
           0% { opacity: 0; transform: translateY(-14px) scale(0.97); }
           26% { opacity: 1; transform: translateY(0) scale(1); }
@@ -774,18 +814,33 @@ const Layout = ({ children, onLogout }) => {
           animation: toastLife 5.2s cubic-bezier(0.16, 1, 0.3, 1) both;
           will-change: transform, opacity;
         }
+        @keyframes submenuSlideDown {
+          0% { opacity: 0; transform: translateY(-6px) scaleY(0.98); }
+          100% { opacity: 1; transform: translateY(0) scaleY(1); }
+        }
+        .submenu-slide-down {
+          transform-origin: top;
+          animation: submenuSlideDown 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+          will-change: transform, opacity;
+        }
       `}</style>
-      <div className={`${sidebarCollapsed ? 'w-16' : 'w-64'} bg-slate-900 border-r border-slate-800 flex flex-col h-screen fixed left-0 top-0 overflow-hidden z-40`}>
+      {!isDesktop && sidebarOpen ? (
+        <button
+          type="button"
+          aria-label="Close menu"
+          className="fixed inset-0 bg-black/40 z-40 lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      ) : null}
+      <div
+        className={`${sidebarCollapsed ? 'w-16' : 'w-64'} bg-slate-900 border-r border-slate-800 flex flex-col h-screen fixed left-0 top-0 overflow-hidden z-50 transform transition-transform duration-200 ease-out ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        } lg:translate-x-0`}
+      >
         <div className="p-4 border-b border-slate-800 flex-shrink-0">
           <div className="flex justify-center">
-            <div className={`${sidebarCollapsed ? 'p-0.5' : 'p-1'} rounded-full bg-slate-800`}>
-              {companyInfo.logo ? (
-                <img src={companyInfo.logo} alt="Company Logo" className={`${sidebarCollapsed ? 'w-10 h-10' : 'w-24 h-24'} object-cover rounded-full`} />
-              ) : (
-                <div className={`${sidebarCollapsed ? 'w-10 h-10' : 'w-24 h-24'} rounded-full bg-green-600 flex items-center justify-center`}>
-                  <RiShoppingCart2Line size={sidebarCollapsed ? 18 : 44} className="text-white" />
-                </div>
-              )}
+            <div className={`${sidebarCollapsed ? 'w-12 h-12' : 'w-28 h-28'} rounded-full bg-green-600 flex items-center justify-center`}>
+              <RiShoppingCart2Line size={sidebarCollapsed ? 22 : 56} className="text-white" />
             </div>
           </div>
         </div>
@@ -794,61 +849,104 @@ const Layout = ({ children, onLogout }) => {
             {visibleSidebarItems.map((item) => {
               const IconComponent = item.icon;
               const isLocked = Boolean(item.locked);
-              const isActive =
-                location.pathname === item.path ||
-                (item.path.startsWith('/placeholder/') && location.pathname.startsWith(item.path));
+              const hasSubmenu = Boolean(visibleSubmenu[item.path]);
+              const isOpen = !sidebarCollapsed && hasSubmenu && openSubmenu === item.path;
+              const isActive = (() => {
+                const p = String(location.pathname || '');
+                if (p === item.path) return true;
+                if (item.path === '/sales' && p.startsWith('/placeholder/sales-')) return true;
+                if (item.path === '/stocks' && (p.startsWith('/placeholder/products') || p.startsWith('/placeholder/store'))) return true;
+                if (item.path === '/expenses' && p.startsWith('/placeholder/expenses-')) return true;
+                if (item.path === '/reports' && p.startsWith('/placeholder/reports-')) return true;
+                if (item.path === '/settings' && p.startsWith('/placeholder/settings-')) return true;
+                if (item.path.startsWith('/placeholder/') && p.startsWith(item.path)) return true;
+                return false;
+              })();
+              const rowClassName = `relative flex items-center ${sidebarCollapsed ? 'justify-center' : 'justify-between'} w-full text-left px-4 py-2.5 rounded-xl transition-colors ${
+                isActive
+                  ? 'bg-slate-800 text-white border border-green-400 shadow-sm'
+                  : isLocked
+                    ? 'text-slate-200 opacity-60'
+                    : isOpen
+                      ? 'bg-slate-800/70 text-white'
+                      : 'text-slate-200 hover:bg-slate-800 hover:text-white'
+              }`;
               return (
                 <div key={item.path} className="mb-1">
-                  <Link
-                    to={item.path}
-                    onClick={(e) => {
-                      if (isLocked) {
-                        e.preventDefault();
-                        return;
-                      }
-                      if (!sidebarCollapsed && submenu[item.path]) {
-                        e.preventDefault();
-                        setOpenSubmenu(openSubmenu === item.path ? null : item.path);
-                      }
-                    }}
-                    className={`relative flex items-center ${sidebarCollapsed ? 'justify-center' : 'justify-between'} w-full text-left px-4 py-2.5 rounded-xl transition-colors ${
-                      isActive ? 'bg-slate-800 text-white border border-green-400 shadow-sm' : isLocked ? 'text-slate-200 opacity-60 cursor-not-allowed' : 'text-slate-200 hover:bg-slate-800 hover:text-white'
-                    }`}
-                  >
-                    {isActive && <span className="absolute left-0 top-1 bottom-1 w-1 bg-green-600 rounded-r"></span>}
-                    <span className="flex items-center">
-                      <IconComponent size={20} className={sidebarCollapsed ? '' : 'mr-3'} />
-                      {!sidebarCollapsed && item.label}
-                    </span>
-                    {!sidebarCollapsed && isLocked ? (
-                      <span className="ml-2">
-                        <RiLock2Line size={16} className={isActive ? 'text-white' : 'text-slate-300'} />
+                  {hasSubmenu ? (
+                    <button
+                      type="button"
+                      data-no-loading="true"
+                      disabled={isLocked}
+                      aria-expanded={isOpen}
+                      aria-controls={`submenu_${item.path.replace(/[^a-z0-9]+/gi, '_')}`}
+                      onClick={() => {
+                        if (isLocked) return;
+                        setOpenSubmenu((prev) => (prev === item.path ? null : item.path));
+                      }}
+                      className={rowClassName}
+                    >
+                      {isActive && <span className="absolute left-0 top-1 bottom-1 w-1 bg-green-600 rounded-r"></span>}
+                      <span className={`flex items-center min-w-0 ${sidebarCollapsed ? 'justify-center' : ''} flex-1`}>
+                        <IconComponent size={20} className={sidebarCollapsed ? '' : 'mr-3'} />
+                        {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
                       </span>
-                    ) : !sidebarCollapsed && submenu[item.path] ? (
-                      <span className="ml-2">
-                        {openSubmenu === item.path ? (
+                      {!sidebarCollapsed ? (
+                        isLocked ? (
+                          <span className="ml-2">
+                            <RiLock2Line size={16} className={isActive ? 'text-white' : 'text-slate-300'} />
+                          </span>
+                        ) : isOpen ? (
                           <RiArrowDownSLine size={16} className={isActive ? 'text-white' : 'text-slate-300'} />
                         ) : (
                           <RiArrowRightSLine size={16} className={isActive ? 'text-white' : 'text-slate-300'} />
-                        )}
+                        )
+                      ) : null}
+                    </button>
+                  ) : (
+                    <NavLink
+                      to={item.path}
+                      onClick={(e) => {
+                        if (isLocked) {
+                          e.preventDefault();
+                          return;
+                        }
+                        setOpenSubmenu(null);
+                        if (!isDesktop) setSidebarOpen(false);
+                      }}
+                      className={rowClassName}
+                    >
+                      {isActive && <span className="absolute left-0 top-1 bottom-1 w-1 bg-green-600 rounded-r"></span>}
+                      <span className={`flex items-center min-w-0 ${sidebarCollapsed ? 'justify-center' : ''} flex-1`}>
+                        <IconComponent size={20} className={sidebarCollapsed ? '' : 'mr-3'} />
+                        {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
                       </span>
-                    ) : null}
-                  </Link>
-                  {!sidebarCollapsed && submenu[item.path] && openSubmenu === item.path && (
-                    <div className="mt-2 ml-4 rounded-xl bg-slate-800/40 text-white border border-green-400/40 p-2 max-h-64 overflow-auto">
+                      {!sidebarCollapsed && isLocked ? (
+                        <span className="ml-2">
+                          <RiLock2Line size={16} className={isActive ? 'text-white' : 'text-slate-300'} />
+                        </span>
+                      ) : null}
+                    </NavLink>
+                  )}
+                  {!sidebarCollapsed && visibleSubmenu[item.path] && openSubmenu === item.path && (
+                    <div
+                      id={`submenu_${item.path.replace(/[^a-z0-9]+/gi, '_')}`}
+                      className="submenu-slide-down mt-2 ml-4 rounded-xl bg-slate-800/40 text-white border border-green-400/40 p-2 max-h-64 overflow-auto"
+                    >
                       <ul className="divide-y divide-slate-700">
-                        {submenu[item.path].flatMap((group) => group.items).map((link) => {
+                        {visibleSubmenu[item.path].flatMap((group) => group.items).map((link) => {
                           const childActive = location.pathname === link.to;
                           const lockedChild = Boolean(link.locked);
                           return (
                             <li key={link.label}>
-                              <Link
+                              <NavLink
                                 to={link.to}
                                 onClick={(e) => {
                                   if (lockedChild) {
                                     e.preventDefault();
                                     return;
                                   }
+                                  if (!isDesktop) setSidebarOpen(false);
                                 }}
                                 className={`flex items-center justify-between text-sm px-3 py-2 rounded transition-colors ${
                                   lockedChild
@@ -863,7 +961,7 @@ const Layout = ({ children, onLogout }) => {
                                   {lockedChild ? <RiLock2Line size={14} className="text-white/80" /> : null}
                                 </span>
                                 <span className={childActive ? 'text-white' : 'text-white/60'}>{lockedChild ? '' : '›'}</span>
-                              </Link>
+                              </NavLink>
                             </li>
                           );
                         })}
@@ -876,33 +974,39 @@ const Layout = ({ children, onLogout }) => {
           </div>
         </nav>
       </div>
-      <div data-theme-scope="app" className={`flex-1 flex flex-col ${sidebarCollapsed ? 'ml-16' : 'ml-64'}`}>
+      <div data-theme-scope="app" className={`flex-1 flex flex-col ml-0 ${sidebarCollapsed ? 'lg:ml-16' : 'lg:ml-64'}`}>
         <header className="bg-white border-b border-gray-200 px-4 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
-              <div className="w-9 h-9 rounded-lg bg-green-600 text-white flex items-center justify-center">
-                <RiShoppingCart2Line size={18} />
-              </div>
-              <span className="text-sm font-semibold text-gray-900">{companyInfo.companyName || companyInfo.name || 'Duka Hubnow'}</span>
-              <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-700">{companyInfo?.branch || 'HQ'}</span>
+              <button
+                type="button"
+                className="lg:hidden w-9 h-9 rounded-lg bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200 flex items-center justify-center"
+                aria-label={sidebarOpen ? 'Close menu' : 'Open menu'}
+                onClick={() => setSidebarOpen((v) => !v)}
+              >
+                {sidebarOpen ? <RiCloseLine size={18} /> : <RiMenuLine size={18} />}
+              </button>
+              <span className="text-sm font-medium font-serif tracking-wide text-gray-900">{topbarTitle}</span>
               
             </div>
           </div>
-          <div className="flex-1 px-4">
+          <div className="hidden md:block flex-1 px-4">
             <div className="max-w-xl mx-auto relative">
               <div className="flex items-center bg-gray-100 text-gray-700 rounded-full px-3 py-2 border border-gray-200">
                 <RiSearchLine size={18} className="mr-2 text-gray-500" />
                 <input
                   type="text"
-                  placeholder={t('top.searchPlaceholder')}
-                  className="flex-1 bg-transparent outline-none text-sm placeholder-gray-500"
-                  value={headerSearch}
-                  onChange={(e) => setHeaderSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && headerResults.length > 0) {
-                      goTo(headerResults[0].to);
-                    }
-                  }}
+                  name="app_search"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  inputMode="search"
+                  enterKeyHint="search"
+                  placeholder=""
+                  className="flex-1 bg-transparent outline-none text-sm placeholder-gray-500 opacity-60 cursor-not-allowed"
+                  value=""
+                  disabled
                 />
               </div>
               {(headerSearch || '').trim() ? (
@@ -935,7 +1039,7 @@ const Layout = ({ children, onLogout }) => {
           <div className="flex items-center gap-2">
             <button className="px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm hover:bg-green-700 flex items-center gap-2">
               <RiDownload2Line size={16} />
-              {t('common.export')}
+              <span className="hidden sm:inline">{t('common.export')}</span>
             </button>
             <button className="w-9 h-9 rounded-lg bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200 flex items-center justify-center">
               <RiApps2Line size={18} />
@@ -967,9 +1071,9 @@ const Layout = ({ children, onLogout }) => {
                         className="px-2.5 py-1.5 rounded-lg border border-gray-200 text-xs font-semibold text-gray-700 hover:bg-gray-50"
                         onClick={() => {
                           const next = (notifications || []).map((n) => ({ ...n, read: true }));
+                          void Promise.resolve(localStore.set(notificationKey, next)).catch(() => {});
+                          setNotifications(next);
                           try {
-                            localStorage.setItem(notificationKey, JSON.stringify(next));
-                            setNotifications(next);
                             window.dispatchEvent(new CustomEvent('notificationsUpdated'));
                           } catch {}
                         }}
@@ -987,9 +1091,9 @@ const Layout = ({ children, onLogout }) => {
                           className={n.read ? 'w-full text-left px-4 py-3 border-b border-gray-100 hover:bg-gray-50' : 'w-full text-left px-4 py-3 border-b border-gray-100 hover:bg-gray-50 bg-green-50/40'}
                           onClick={() => {
                             const next = (notifications || []).map((x) => (x.id === n.id ? { ...x, read: true } : x));
+                            void Promise.resolve(localStore.set(notificationKey, next)).catch(() => {});
+                            setNotifications(next);
                             try {
-                              localStorage.setItem(notificationKey, JSON.stringify(next));
-                              setNotifications(next);
                               window.dispatchEvent(new CustomEvent('notificationsUpdated'));
                             } catch {}
                             setNotificationOpen(false);
@@ -1012,7 +1116,7 @@ const Layout = ({ children, onLogout }) => {
               ) : null}
             </div>
             {isAdmin ? (
-              <button type="button" className="w-9 h-9 rounded-lg bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200 flex items-center justify-center" onClick={() => goTo('/settings')}>
+              <button type="button" className="w-9 h-9 rounded-lg bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200 flex items-center justify-center" onClick={() => goTo('/placeholder/settings-preferences?tab=profile')}>
                 <RiSettings3Line size={18} />
               </button>
             ) : null}
@@ -1025,7 +1129,7 @@ const Layout = ({ children, onLogout }) => {
               </div>
               <div className={`absolute right-0 mt-2 w-44 bg-white rounded-lg shadow-lg border border-gray-200 ${profileOpen ? 'block' : 'hidden'} z-50`}>
                 {isAdmin ? (
-                  <button type="button" className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100" onClick={() => goTo('/settings')}>
+                  <button type="button" className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100" onClick={() => goTo('/placeholder/settings-preferences?tab=profile')}>
                     {t('top.profile')}
                   </button>
                 ) : null}
@@ -1043,48 +1147,9 @@ const Layout = ({ children, onLogout }) => {
             </div>
           </div>
         </header>
-        <main className="flex-1 p-5 bg-gray-50 overflow-y-auto overflow-x-hidden">
-          {children}
+        <main className="flex-1 p-4 md:p-5 bg-gray-50 overflow-y-auto overflow-x-hidden">
+          <Outlet />
         </main>
-        {subscriptionLock.locked && String(location.pathname || '') !== '/plans' ? (
-          <div className="fixed inset-0 z-[60] flex items-center justify-center">
-            <div className="absolute inset-0 bg-black/40" />
-            <div className="relative w-[94vw] max-w-[520px] bg-white rounded-2xl border border-gray-200 shadow-2xl overflow-hidden">
-              <div className="px-5 py-4 border-b border-gray-200 flex items-start justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-gray-900">{t('lock.title')}</div>
-                  <div className="mt-1 text-xs text-gray-600">{subscriptionLock.reason ? t(subscriptionLock.reason) : t('lock.title')}</div>
-                </div>
-                <button
-                  type="button"
-                  className="px-3 py-2 rounded-lg border border-gray-200 text-sm hover:bg-gray-50"
-                  onClick={onLogout}
-                >
-                  {t('lock.close')}
-                </button>
-              </div>
-              <div className="p-5">
-                <div className="text-sm text-gray-700">{t('lock.body')}</div>
-                <div className="mt-5 flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    className="px-4 py-2 rounded-lg border border-gray-200 text-sm font-semibold text-gray-800 hover:bg-gray-50"
-                    onClick={onLogout}
-                  >
-                    {t('lock.close')}
-                  </button>
-                  <button
-                    type="button"
-                    className="px-4 py-2 rounded-lg bg-green-600 text-white text-sm font-semibold hover:bg-green-700"
-                    onClick={() => goTo('/plans')}
-                  >
-                    {t('lock.choosePlan')}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : null}
       </div>
       {toast.open ? (
         <div key={toast.id} className="fixed top-4 left-1/2 -translate-x-1/2 z-[70] toast-life">

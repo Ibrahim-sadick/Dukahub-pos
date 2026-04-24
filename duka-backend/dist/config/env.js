@@ -1,32 +1,36 @@
 "use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.env = void 0;
-const dotenv_1 = __importDefault(require("dotenv"));
+exports.isProduction = exports.env = void 0;
+const dotenv_1 = require("dotenv");
 const zod_1 = require("zod");
-dotenv_1.default.config();
+(0, dotenv_1.config)();
 const envSchema = zod_1.z.object({
     NODE_ENV: zod_1.z.enum(['development', 'test', 'production']).default('development'),
     PORT: zod_1.z.coerce.number().int().positive().default(4000),
     DATABASE_URL: zod_1.z.string().min(1),
+    APP_NAME: zod_1.z.string().default('DukaHub Backend'),
     JWT_ACCESS_SECRET: zod_1.z.string().min(16),
     JWT_REFRESH_SECRET: zod_1.z.string().min(16),
-    JWT_ACCESS_TTL_SECONDS: zod_1.z.coerce.number().int().positive().default(900),
-    JWT_REFRESH_TTL_DAYS: zod_1.z.coerce.number().int().positive().default(30),
-    CORS_ORIGIN: zod_1.z.string().min(1).default('http://localhost:3000'),
-    MINIO_ENDPOINT: zod_1.z.string().min(1).default('localhost'),
-    MINIO_PORT: zod_1.z.coerce.number().int().positive().default(9000),
-    MINIO_USE_SSL: zod_1.z.coerce.boolean().default(false),
-    MINIO_ACCESS_KEY: zod_1.z.string().min(1).default('minioadmin'),
-    MINIO_SECRET_KEY: zod_1.z.string().min(1).default('minioadmin'),
-    MINIO_BUCKET: zod_1.z.string().min(1).default('duka-files')
+    JWT_ACCESS_EXPIRES_IN: zod_1.z.string().default('15m'),
+    JWT_REFRESH_EXPIRES_IN: zod_1.z.string().default('7d'),
+    BCRYPT_SALT_ROUNDS: zod_1.z.coerce.number().int().min(8).max(15).default(12),
+    CORS_ORIGIN: zod_1.z.string().default(''),
+    FRONTEND_ORIGINS: zod_1.z
+        .string()
+        .default('http://localhost:3000,http://127.0.0.1:3000,https://dukahub.co.tz,https://www.dukahub.co.tz'),
+    TRUST_PROXY: zod_1.z.coerce.number().int().min(0).default(1),
+    COOKIE_DOMAIN: zod_1.z.string().trim().optional(),
+    COOKIE_SECURE: zod_1.z.coerce.boolean().default(true)
 });
 const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
-    process.stderr.write(`Invalid environment variables. Create .env from .env.example\n`);
-    process.stderr.write(`${JSON.stringify(parsed.error.format(), null, 2)}\n`);
-    process.exit(1);
+    console.error('Invalid environment configuration', parsed.error.flatten().fieldErrors);
+    throw new Error('Invalid environment configuration');
 }
-exports.env = parsed.data;
+const cookieSecure = process.env.COOKIE_SECURE == null ? parsed.data.NODE_ENV === 'production' : parsed.data.COOKIE_SECURE;
+exports.env = {
+    ...parsed.data,
+    COOKIE_SECURE: cookieSecure
+};
+exports.isProduction = exports.env.NODE_ENV === 'production';
+//# sourceMappingURL=env.js.map

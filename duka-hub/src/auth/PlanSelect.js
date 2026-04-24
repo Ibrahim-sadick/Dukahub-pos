@@ -1,10 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { ArrowLeft, BadgeCheck, Crown, Gem, Rocket, X } from 'lucide-react';
-import Layout from '../shared/Layout';
-import Dashboard from '../pages/Dashboard';
 import { initiatePayment, verifyPayment } from '../services/paymentService';
-import { authApi, subscriptionsApi, syncLocalAuthStateFromBackendMe } from '../services/backendApi';
+import { clearSignupDraft, getSignupDraft, setSignupDraft } from '../services/signupDraft';
+import { getCurrentUserSync, registerOwner } from '../services/authApi';
+import { businessApi } from '../services/businessApi';
+import { normalizeTzPhone255, setCurrentUserSync } from '../services/localAuth';
+
+const DEFAULT_SIGNUP_MODULE = 'retail_supermarket';
+
+const setLocalJson = (key, value) => {
+  try {
+    window.localStorage.setItem(String(key || ''), JSON.stringify(value));
+  } catch {}
+};
 
 const PlanSelect = ({ onSignUp }) => {
   const navigate = useNavigate();
@@ -21,8 +30,8 @@ const PlanSelect = ({ onSignUp }) => {
   const [paymentReference, setPaymentReference] = useState('');
   const [paymentFlow, setPaymentFlow] = useState('idle');
   const [paymentSecondsLeft, setPaymentSecondsLeft] = useState(60);
-  const [isWebhookSubmitting, setIsWebhookSubmitting] = useState(false);
   const [renewalMode, setRenewalMode] = useState(false);
+  const [phoneExists, setPhoneExists] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loadingKey, setLoadingKey] = useState('');
   const paymentPollTimerRef = useRef(null);
@@ -62,59 +71,15 @@ const PlanSelect = ({ onSignUp }) => {
     setLoadingKey('');
   };
 
-  const simulatePaymentWebhook = async ({ reference, phoneNumber, amount, provider }) => {
-    const ref = String(reference || '').trim();
-    if (!ref) return;
-    if (isWebhookSubmitting) return;
-    setIsWebhookSubmitting(true);
-    try {
-      const payload = {
-        id: `evt_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-        type: 'payment.completed',
-        api_version: '2026-01-25',
-        created_at: new Date().toISOString(),
-        data: {
-          reference: ref,
-          external_reference: `S${Date.now()}`,
-          status: 'completed',
-          amount: { value: Number(amount || 0), currency: 'TZS' },
-          channel: { type: 'mobile_money', provider: String(provider || '').trim() || 'airtel' },
-          customer: { phone: String(phoneNumber || '').trim() || '' }
-        }
-      };
-      const res = await fetch('https://mpira.online/api/payment/webhook', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) {
-        let data = null;
-        try {
-          data = await res.json();
-        } catch {}
-        const message = (data && (data.message || data.error)) || `Webhook failed (${res.status})`;
-        throw new Error(message);
-      }
-    } finally {
-      setIsWebhookSubmitting(false);
-    }
-  };
-
-  const delayToFiveSeconds = async (startedAt) => {
-    const elapsed = Date.now() - startedAt;
-    const remaining = 5000 - elapsed;
-    if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
-  };
-
-  const plans = useMemo(
-    () => [
+  const plans = useMemo(() => {
+    return [
       {
         id: 'starter',
         title: 'Starter',
-        price: 20000,
+        pricePerMonth: 15000,
         Icon: Rocket,
         highlight: false,
-        trialDays: 0,
+        durationDays: 30,
         userLimit: 3,
         caption: 'Perfect to start',
         features: ['1 module', 'Basic reports', 'Inventory & sales', 'Standard support']
@@ -122,10 +87,10 @@ const PlanSelect = ({ onSignUp }) => {
       {
         id: 'professional',
         title: 'Professional',
-        price: 40000,
+        pricePerMonth: 35000,
         Icon: Gem,
         highlight: true,
-        trialDays: 0,
+        durationDays: 30,
         userLimit: 6,
         caption: 'Best for growing teams',
         features: ['1 module', 'Advanced reports', 'User roles', 'Priority support']
@@ -133,97 +98,113 @@ const PlanSelect = ({ onSignUp }) => {
       {
         id: 'enterprise',
         title: 'Enterprise',
-        price: 60000,
+        pricePerMonth: 60000,
         Icon: Crown,
         highlight: false,
-        trialDays: 0,
+        durationDays: 30,
         userLimit: 12,
         caption: 'For large operations',
         features: ['1 module', 'All reports', 'Multi-user access', 'Dedicated support']
       }
-    ],
-    []
-  );
+    ];
+  }, []);
 
   const billingOptions = useMemo(
     () => [
-      { id: '1m', label: '30 Days', months: 1, discountPercent: 0 }
+      { id: '1m', label: '1 Month', months: 1, discountPercent: 0 },
+      { id: '3m', label: '3 Months', months: 3, discountPercent: 0 },
+      { id: '6m', label: '6 Months', months: 6, discountPercent: 0 },
+      { id: '1y', label: '1 Year', months: 12, discountPercent: 0 }
     ],
     []
   );
 
+  const visibleBillingOptions = useMemo(() => billingOptions, [billingOptions]);
+
   useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem('signupDraft');
-      if (!raw) {
-        const currentUser =
-          JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
-        if (currentUser) {
-          let companyInfo = {};
-          try {
-            const ci = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-            companyInfo = ci && typeof ci === 'object' ? ci : {};
-          } catch {}
-          const nextDraft = {
-            otpVerified: true,
-            selectedModule: String(companyInfo.businessModule || currentUser.businessModule || '').trim() || 'module',
-            billingCycle: '1m',
-            selectedPlan: String(currentUser.subscriptionPlan || '').trim() || '',
-            logoPreview: String(companyInfo.logo || '').trim(),
-            formData: {
-              companyName: String(companyInfo.companyName || currentUser.companyName || '').trim(),
-              taxId: String(companyInfo.taxId || currentUser.taxId || '').trim(),
-              location: String(companyInfo.location || currentUser.location || '').trim(),
-              website: String(companyInfo.website || currentUser.website || '').trim(),
-              businessDescription: String(companyInfo.businessDescription || currentUser.businessDescription || '').trim(),
-              fullName: String(currentUser.fullName || '').trim(),
-              email: String(currentUser.email || '').trim(),
-              phone: String(currentUser.phone || '').trim(),
-              password: String(currentUser.password || '').trim()
-            }
-          };
-          setRenewalMode(true);
-          setDraft(nextDraft);
-          setSelectedPlan(String(nextDraft.selectedPlan || '').trim() || 'starter');
-          setBillingCycle('1m');
-          setPaymentPhone(String(currentUser?.paymentPhone || '').replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, ''));
-          setPaymentProvider(String(currentUser?.paymentProvider || '').trim());
-          return;
-        }
+    const parsed = getSignupDraft();
+    if (parsed?.otpVerified && parsed?.formData) {
+      if (!String(parsed?.formData?.password || '').trim()) {
+        clearSignupDraft();
         navigate('/signup', { replace: true });
         return;
       }
-      const parsed = JSON.parse(raw);
-      if (!parsed?.otpVerified || !parsed?.formData) {
-        navigate('/signup', { replace: true });
-        return;
-      }
-      if (!String(parsed?.selectedModule || '').trim()) {
-        navigate('/signup/modules', { replace: true });
-        return;
+      const selectedModule = String(parsed?.selectedModule || '').trim() || DEFAULT_SIGNUP_MODULE;
+      const nextParsed = selectedModule === String(parsed?.selectedModule || '').trim() ? parsed : { ...parsed, selectedModule };
+      if (nextParsed !== parsed) {
+        try {
+          setSignupDraft(nextParsed);
+        } catch {}
       }
       setRenewalMode(false);
-      setDraft(parsed);
-      setSelectedPlan(String(parsed?.selectedPlan || '').trim());
-      setBillingCycle(String(parsed?.billingCycle || '').trim() || '1m');
+      setPhoneExists(false);
+      setDraft(nextParsed);
+      setSelectedPlan(String(nextParsed?.selectedPlan || '').trim() || 'starter');
+      setBillingCycle(String(nextParsed?.billingCycle || '').trim() || '1m');
       setPaymentPhone('');
-    } catch {
-      navigate('/signup', { replace: true });
+      return;
     }
+
+    const currentUser = getCurrentUserSync();
+    if (currentUser) {
+      const billingFromUserRaw = String(currentUser.subscriptionBillingCycle || '').trim() || '1m';
+      const billingFromUser = ['1m', '3m', '6m', '1y'].includes(billingFromUserRaw) ? billingFromUserRaw : '1m';
+      const nextDraft = {
+        otpVerified: true,
+        selectedModule: String(currentUser.businessModule || '').trim() || DEFAULT_SIGNUP_MODULE,
+        billingCycle: billingFromUser,
+        selectedPlan: String(currentUser.subscriptionPlan || '').trim() || '',
+        logoPreview: '',
+        formData: {
+          companyName: String(currentUser.businessName || '').trim(),
+          taxId: '',
+          location: '',
+          website: '',
+          businessDescription: '',
+          fullName: String(currentUser.fullName || '').trim(),
+          email: String(currentUser.email || '').trim(),
+          phone: String(currentUser.phone || '').trim(),
+          password: ''
+        }
+      };
+      setRenewalMode(true);
+      setPhoneExists(false);
+      setDraft(nextDraft);
+      setSelectedPlan(String(nextDraft.selectedPlan || '').trim() || 'starter');
+      setBillingCycle(billingFromUser);
+      setPaymentPhone(String(currentUser?.paymentPhone || '').replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, ''));
+      setPaymentProvider(String(currentUser?.paymentProvider || '').trim());
+      return;
+    }
+    navigate('/signup', { replace: true });
   }, [navigate]);
 
-  const activeBilling = billingOptions.find((b) => b.id === billingCycle) || billingOptions[0];
+  useEffect(() => {
+    if (renewalMode) return;
+    setPhoneExists(false);
+  }, [renewalMode, draft?.formData?.phone]);
+
+  const activeBilling = visibleBillingOptions.find((b) => b.id === billingCycle) || visibleBillingOptions[0];
+  // eslint-disable-next-line no-unused-vars
+  const isStarterTrial = !renewalMode && String(selectedPlan || '').trim() === 'starter';
 
   const getPricing = (plan) => {
-    const rawMonthly = Number(plan?.price || 0);
-    const months = 1;
+    const rawMonthly = Number(plan?.pricePerMonth ?? plan?.price ?? 0);
+    const monthsRaw = Number(activeBilling?.months ?? 1);
+    const months = Number.isFinite(monthsRaw) ? Math.max(0, monthsRaw) : 1;
     const discountPercent = 0;
     const discountedMonthly = rawMonthly;
-    const total = rawMonthly;
+    const total = months > 0 ? Math.round(rawMonthly * months) : 0;
     return { months, discountPercent, rawMonthly, discountedMonthly, total };
   };
 
-  const handleCreateAccount = async (planId, payment) => {
+  const delayToFiveSeconds = async (startedAt) => {
+    const elapsed = Date.now() - startedAt;
+    const remaining = 5000 - elapsed;
+    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+  };
+
+  const handleCreateAccount = async (planId, payment, options = {}) => {
     const pickedPlan = String(planId || selectedPlan || '').trim();
     if (!pickedPlan) {
       setError('Please choose a monthly plan');
@@ -234,11 +215,7 @@ const PlanSelect = ({ onSignUp }) => {
       return;
     }
 
-    const pickedModule = String(draft?.selectedModule || '').trim();
-    if (!pickedModule) {
-      setError('Please choose the suites first');
-      return;
-    }
+    const pickedModule = String(draft?.selectedModule || '').trim() || DEFAULT_SIGNUP_MODULE;
 
     const plan = plans.find((p) => p.id === pickedPlan);
     if (!plan) {
@@ -247,325 +224,160 @@ const PlanSelect = ({ onSignUp }) => {
     }
 
     const pricing = getPricing(plan);
-    const trialDays = activeBilling?.id === '1m' ? Number(plan.trialDays || 0) : 0;
     const now = Date.now();
     const subscriptionStartedAt = new Date(now).toISOString();
-    const subscriptionTrialEndsAt = trialDays ? new Date(now + trialDays * 24 * 60 * 60 * 1000).toISOString() : '';
-    const paidEndsAt = new Date(now + 30 * 24 * 60 * 60 * 1000).toISOString();
-    const subscriptionEndsAt = trialDays ? subscriptionTrialEndsAt : paidEndsAt;
-    const hasTrial = Boolean(trialDays);
+    const hasTrial = !renewalMode && String(plan.id || '') === 'starter';
+    const trialDays = hasTrial ? 7 : 0;
+    const paidDurationDays = (Number(plan.durationDays || 30) || 30) * (Number(pricing.months || 0) || 0);
+    const subscriptionDurationDays = hasTrial ? 7 : paidDurationDays;
+    const paidEndsAt = new Date(now + paidDurationDays * 24 * 60 * 60 * 1000).toISOString();
+    const subscriptionTrialEndsAt = hasTrial ? new Date(now + trialDays * 24 * 60 * 60 * 1000).toISOString() : '';
+    const subscriptionEndsAt = hasTrial ? subscriptionTrialEndsAt : paidEndsAt;
     const paymentProviderValue = String(payment?.provider || '').trim();
     const paymentPhoneValue = String(payment?.phone || '').trim();
     const paymentReferenceValue = String(payment?.reference || '').trim();
     const paymentStatus = hasTrial ? 'trial' : 'paid';
-    const amountPaid = paymentStatus === 'paid' ? pricing.total : 0;
+    const amountPaid = hasTrial ? 0 : pricing.total;
 
     const formData = draft.formData;
     // eslint-disable-next-line no-unused-vars
     const phone = String(formData.phone || '').trim();
-
     if (renewalMode) {
-      const currentUser =
-        JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
-      if (!currentUser) {
-        setError('Please login again');
-        navigate('/login', { replace: true });
-        return;
-      }
-      const nextUser = {
-        ...currentUser,
-        profilePhoto: String(draft?.profilePreview || currentUser?.profilePhoto || ''),
-        subscriptionPlan: plan.id,
-        subscriptionUserLimit: Number(plan.userLimit || 0),
-        subscriptionPrice: pricing.total,
-        subscriptionPricePerMonth: pricing.discountedMonthly,
-        subscriptionPeriod: activeBilling.id,
-        subscriptionMonths: pricing.months,
-        subscriptionDiscountPercent: pricing.discountPercent,
-        subscriptionTrialDays: trialDays,
+      const user = getCurrentUserSync() || {};
+      const next = {
+        ...user,
+        subscriptionPlan: String(plan.id || ''),
+        subscriptionPaymentStatus: paymentStatus,
         subscriptionStartedAt,
         subscriptionEndsAt,
-        subscriptionTrialEndsAt,
-        subscriptionPaymentStatus: paymentStatus,
+        subscriptionTrialEndsAt: subscriptionTrialEndsAt ? subscriptionTrialEndsAt : '',
+        subscriptionDurationDays,
+        subscriptionMonths: pricing.months,
+        subscriptionDiscountPercent: pricing.discountPercent,
+        subscriptionRawMonthlyPrice: Number(plan.pricePerMonth ?? 0),
+        subscriptionAmountPaid: amountPaid,
+        subscriptionBillingCycle: String(activeBilling?.id || ''),
         paymentProvider: paymentProviderValue,
         paymentPhone: paymentPhoneValue
       };
-
-      try {
-        const stored = JSON.parse(localStorage.getItem('currentUser') || 'null');
-        const useLocal = Boolean(stored);
-        if (useLocal) localStorage.setItem('currentUser', JSON.stringify(nextUser));
-        else sessionStorage.setItem('currentUser', JSON.stringify(nextUser));
-      } catch {}
-
-      try {
-        const all = JSON.parse(localStorage.getItem('users') || '[]');
-        const list = Array.isArray(all) ? all : [];
-        const idx = list.findIndex((u) => String(u?.id || '') === String(nextUser.id || '') && String(u?.role || '').toLowerCase() === 'admin');
-        if (idx >= 0) {
-          list[idx] = { ...list[idx], ...nextUser };
-          localStorage.setItem('users', JSON.stringify(list));
-        }
-      } catch {}
-
-      try {
-        const existingCompany = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-        const updatedCompany = {
-          ...existingCompany,
-          subscriptionPlan: plan.id || existingCompany.subscriptionPlan || '',
-          subscriptionUserLimit: Number(plan.userLimit || 0),
-          subscriptionPrice: pricing.total || existingCompany.subscriptionPrice || 0,
-          subscriptionPricePerMonth: pricing.discountedMonthly || existingCompany.subscriptionPricePerMonth || 0,
-          subscriptionPeriod: activeBilling.id,
-          subscriptionMonths: pricing.months,
-          subscriptionDiscountPercent: pricing.discountPercent,
-          subscriptionTrialDays: trialDays,
-          subscriptionStartedAt,
-          subscriptionEndsAt,
-          subscriptionTrialEndsAt,
-          subscriptionPaymentStatus: paymentStatus,
-          paymentProvider: paymentProviderValue,
-          paymentPhone: paymentPhoneValue
-        };
-        localStorage.setItem('companyInfo', JSON.stringify(updatedCompany));
-        try {
-          window.dispatchEvent(new CustomEvent('companyInfoUpdated'));
-        } catch {}
-      } catch {}
-      try {
-        const businessId = String(nextUser.id || currentUser.id || '');
-        const key = `billingHistory:${businessId}`;
-        const existing = JSON.parse(localStorage.getItem(key) || '[]');
-        const list = Array.isArray(existing) ? existing : [];
-        list.unshift({
-          id: `BILL-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          businessId,
-          planId: plan.id,
-          planTitle: plan.title,
-          amount: pricing.total,
-          paidAt: new Date().toISOString(),
-          endsAt: subscriptionEndsAt,
-          period: activeBilling.id,
-          months: pricing.months,
-          provider: paymentProviderValue,
-          phone: paymentPhoneValue
-        });
-        localStorage.setItem(key, JSON.stringify(list.slice(0, 200)));
-      } catch {}
-
-      try {
-        const businessId = String(nextUser.id || currentUser.id || '');
-        const nKey = `notifications:${businessId || 'default'}`;
-        const raw = JSON.parse(localStorage.getItem(nKey) || '[]');
-        const list = Array.isArray(raw) ? raw : [];
-        list.unshift({
-          id: `NTF-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          ts: new Date().toISOString(),
-          title: 'Payment received',
-          message: `Your ${plan.title} plan is active until ${String(subscriptionEndsAt).slice(0, 10)}.`,
-          type: 'plan',
-          read: false
-        });
-        localStorage.setItem(nKey, JSON.stringify(list.slice(0, 200)));
-        window.dispatchEvent(new CustomEvent('notificationsUpdated'));
-        window.dispatchEvent(new CustomEvent('billingHistoryUpdated'));
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
-
-      try {
-        if (paymentStatus === 'paid') {
-          await subscriptionsApi.confirmPayment({
-            planId: plan.id,
-            reference: paymentReferenceValue,
-            amount: amountPaid,
-            provider: paymentProviderValue || undefined,
-            phoneNumber: paymentPhoneValue || undefined,
-            months: pricing.months,
-            discountPercent: pricing.discountPercent
-          });
-        } else {
-          await subscriptionsApi.selectPlan({
-            planName: plan.id,
-            months: pricing.months,
-            discountPercent: pricing.discountPercent,
-            status: paymentStatus,
-            startedAt: subscriptionStartedAt,
-            endsAt: subscriptionEndsAt,
-            trialEndsAt: subscriptionTrialEndsAt ? subscriptionTrialEndsAt : null,
-            amountPaid,
-            paymentProvider: paymentProviderValue || undefined,
-            paymentPhone: paymentPhoneValue || undefined
-          });
-        }
-        const me = await authApi.me();
-        syncLocalAuthStateFromBackendMe(me, Boolean(localStorage.getItem('rememberMe') === 'true'));
-      } catch (err) {
-        setCheckoutError(String(err?.message || 'Unable to update subscription. Try again.'));
-        return;
-      }
-
-      closeCheckout();
-      navigate('/dashboard', { replace: true });
-      return;
-    }
-
-    const existingCompany = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-    const updatedCompany = {
-      ...existingCompany,
-      companyName: formData.companyName || existingCompany.companyName || '',
-      tin: formData.taxId || existingCompany.tin || existingCompany.taxId || '',
-      taxId: formData.taxId || existingCompany.taxId || '',
-      location: formData.location || existingCompany.location || '',
-      phone: formData.phone || existingCompany.phone || '',
-      email: formData.email || existingCompany.email || '',
-      website: formData.website || existingCompany.website || '',
-      businessDescription: formData.businessDescription || existingCompany.businessDescription || '',
-      logo: (draft.logoPreview || '') || existingCompany.logo || '',
-      businessModule: pickedModule || existingCompany.businessModule || '',
-      subscriptionPlan: plan.id || existingCompany.subscriptionPlan || '',
-      subscriptionUserLimit: Number(plan.userLimit || 0),
-      subscriptionPrice: pricing.total || existingCompany.subscriptionPrice || 0,
-      subscriptionPricePerMonth: pricing.discountedMonthly || existingCompany.subscriptionPricePerMonth || 0,
-      subscriptionPeriod: activeBilling.id,
-      subscriptionMonths: pricing.months,
-      subscriptionDiscountPercent: pricing.discountPercent,
-      subscriptionTrialDays: trialDays,
-      subscriptionStartedAt,
-      subscriptionEndsAt,
-      subscriptionTrialEndsAt,
-      subscriptionPaymentStatus: paymentStatus,
-      paymentProvider: paymentProviderValue,
-      paymentPhone: paymentPhoneValue
-    };
-    localStorage.setItem('companyInfo', JSON.stringify(updatedCompany));
-
-    let businessId = '';
-    try {
-      const res = await authApi.signup(
-        {
-          businessName: String(formData.companyName || '').trim(),
-          ownerFullName: String(formData.fullName || '').trim(),
-          ownerPhone: String(formData.phone || '').trim(),
-          ownerEmail: formData.email ? String(formData.email || '').trim() : undefined,
-          password: String(formData.password || ''),
-          address: String(formData.location || '').trim() || undefined,
-          moduleKey: pickedModule,
-          planName: plan.id,
-          subscription: {
-            status: paymentStatus,
-            months: pricing.months,
-            discountPercent: pricing.discountPercent,
-            amountPaid,
-            paymentReference: paymentReferenceValue || undefined,
-            paymentProvider: paymentProviderValue || undefined,
-            paymentPhone: paymentPhoneValue || undefined,
-            startedAt: subscriptionStartedAt,
-            endsAt: subscriptionEndsAt,
-            trialEndsAt: subscriptionTrialEndsAt ? subscriptionTrialEndsAt : null
-          }
-        },
-        true
-      );
-      businessId = String(res?.business?.id || '');
-      try {
-        localStorage.setItem('rememberMe', 'true');
-        localStorage.setItem('lastLoginPhone', formData.phone);
-        localStorage.setItem('lastLoginEmail', formData.email);
-        sessionStorage.setItem('prefillLoginPhone', String(formData.phone || '').trim());
-      } catch {}
-    } catch (err) {
-      const code = String(err?.code || '');
-      if (code === 'PHONE_EXISTS') {
-        setCheckoutError('Phone number already exists. Please login instead.');
-      } else {
-        setCheckoutError(String(err?.message || 'Unable to create account. Try again.'));
-      }
-      return;
-    }
-
-    try {
-      const existingBusinesses = JSON.parse(localStorage.getItem('businesses') || '[]');
-      const list = Array.isArray(existingBusinesses) ? existingBusinesses : [];
-      const next = list.filter((b) => String(b?.businessId) !== String(businessId));
-      next.push({
-        businessId,
-        companyName: formData.companyName || '',
-        taxId: formData.taxId || '',
-        location: formData.location || '',
-        website: formData.website || '',
-        businessDescription: formData.businessDescription || '',
-        businessModule: pickedModule || '',
-        subscriptionPlan: plan.id,
-        subscriptionUserLimit: Number(plan.userLimit || 0),
-        subscriptionPrice: pricing.total,
-        subscriptionPricePerMonth: pricing.discountedMonthly,
-        subscriptionPeriod: activeBilling.id,
-        subscriptionMonths: pricing.months,
-        subscriptionDiscountPercent: pricing.discountPercent,
-        subscriptionTrialDays: trialDays,
-        subscriptionStartedAt,
-        subscriptionEndsAt,
-        subscriptionTrialEndsAt,
-        subscriptionPaymentStatus: paymentStatus,
-        paymentProvider: paymentProviderValue,
-        paymentPhone: paymentPhoneValue,
-        logo: (draft.logoPreview || '') || ''
+      setCurrentUserSync(next);
+      const subscriptionSnapshot = {
+        subscriptionPlan: String(next.subscriptionPlan || ''),
+        subscriptionPaymentStatus: String(next.subscriptionPaymentStatus || ''),
+        subscriptionStartedAt: String(next.subscriptionStartedAt || ''),
+        subscriptionEndsAt: String(next.subscriptionEndsAt || ''),
+        subscriptionTrialEndsAt: String(next.subscriptionTrialEndsAt || ''),
+        subscriptionDurationDays: Number(next.subscriptionDurationDays || 0) || 0,
+        subscriptionMonths: Number(next.subscriptionMonths || 0) || 0,
+        subscriptionDiscountPercent: Number(next.subscriptionDiscountPercent || 0) || 0,
+        subscriptionRawMonthlyPrice: Number(next.subscriptionRawMonthlyPrice || 0) || 0,
+        subscriptionAmountPaid: Number(next.subscriptionAmountPaid || 0) || 0,
+        subscriptionBillingCycle: String(next.subscriptionBillingCycle || ''),
+        paymentProvider: String(paymentProviderValue || ''),
+        paymentPhone: String(paymentPhoneValue || ''),
+        paymentReference: String(paymentReferenceValue || '')
+      };
+      setLocalJson('companyInfo', {
+        companyName: String(next.businessName || ''),
+        phone: String(next.phone || ''),
+        email: String(next.email || ''),
+        location: String(next.location || ''),
+        subscriptionPlan: next.subscriptionPlan,
+        subscriptionPaymentStatus: next.subscriptionPaymentStatus,
+        subscriptionStartedAt: next.subscriptionStartedAt,
+        subscriptionEndsAt: next.subscriptionEndsAt,
+        subscriptionTrialEndsAt: next.subscriptionTrialEndsAt
+        ,
+        subscriptionDurationDays: next.subscriptionDurationDays
       });
-      localStorage.setItem('businesses', JSON.stringify(next));
-    } catch {}
-    try {
-      const key = `billingHistory:${businessId}`;
-      const existing = JSON.parse(localStorage.getItem(key) || '[]');
-      const list = Array.isArray(existing) ? existing : [];
-      list.unshift({
-        id: `BILL-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        businessId,
-        planId: plan.id,
-        planTitle: plan.title,
-        amount: pricing.total,
-        paidAt: new Date().toISOString(),
-        endsAt: subscriptionEndsAt,
-        period: activeBilling.id,
-        months: pricing.months,
-        provider: paymentProviderValue,
-        phone: paymentPhoneValue
-      });
-      localStorage.setItem(key, JSON.stringify(list.slice(0, 200)));
-    } catch {}
+      await businessApi.updateSubscription(subscriptionSnapshot).catch(() => null);
+      clearSignupDraft();
 
-    try {
-      sessionStorage.removeItem('signupDraft');
-    } catch {}
-
-    try {
-      sessionStorage.setItem('postAuthRedirect', '/dashboard');
-    } catch {}
-
-    try {
-      const nKey = `notifications:${businessId || 'default'}`;
-      const raw = JSON.parse(localStorage.getItem(nKey) || '[]');
-      const list = Array.isArray(raw) ? raw : [];
-      list.unshift({
-        id: `NTF-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        ts: new Date().toISOString(),
-        title: 'Plan activated',
-        message: `Your ${plan.title} plan is active until ${String(subscriptionEndsAt).slice(0, 10)}.`,
-        type: 'plan',
-        read: false
-      });
-      localStorage.setItem(nKey, JSON.stringify(list.slice(0, 200)));
-      window.dispatchEvent(new CustomEvent('notificationsUpdated'));
-    } catch {}
-
-    try {
-      onSignUp();
-    } catch {}
-    try {
-      window.dispatchEvent(new CustomEvent('billingHistoryUpdated'));
-      window.dispatchEvent(new CustomEvent('dataUpdated'));
-    } catch {}
+    setIsSubmitting(true);
+    setLoadingKey('checkout:finalizing');
     closeCheckout();
     navigate('/dashboard', { replace: true });
+    setIsSubmitting(false);
+    setLoadingKey('');
+      return;
+    }
+
+    try {
+      const businessName = String(formData.companyName || '').trim();
+      const ownerFullName = String(formData.fullName || '').trim();
+      const ownerPhone = String(formData.phone || '').trim();
+      const ownerEmail = formData.email ? String(formData.email || '').trim() : '';
+      const ownerPassword = String(formData.password || '');
+      if (!ownerFullName) throw new Error('Full name is required');
+      if (!ownerPhone || !ownerPassword) throw new Error('Phone and password are required');
+      if (ownerPassword.length < 8) throw new Error('Password must be at least 8 characters');
+      const phone255 = normalizeTzPhone255(ownerPhone);
+      if (!phone255) throw new Error('Phone number is invalid');
+      const registeredUser = await registerOwner({
+        fullName: ownerFullName,
+        email: ownerEmail,
+        phone: phone255,
+        password: ownerPassword,
+        businessName,
+        businessModule: String(pickedModule || '').trim(),
+        subscriptionPlan: String(plan.id || ''),
+        subscriptionPaymentStatus: paymentStatus,
+        subscriptionStartedAt,
+        subscriptionEndsAt,
+        subscriptionTrialEndsAt: subscriptionTrialEndsAt || undefined,
+        subscriptionBillingCycle: String(activeBilling?.id || ''),
+        subscriptionDurationDays,
+        subscriptionMonths: pricing.months,
+        subscriptionDiscountPercent: pricing.discountPercent,
+        subscriptionRawMonthlyPrice: Number(plan.pricePerMonth ?? 0),
+        subscriptionAmountPaid: amountPaid,
+        paymentProvider: paymentProviderValue || undefined,
+        paymentPhone: paymentPhoneValue || undefined,
+        paymentReference: paymentReferenceValue || undefined
+      });
+      const nextUser = {
+        ...registeredUser,
+        profilePhoto: String(draft?.profilePreview || registeredUser?.profilePhoto || '').trim()
+      };
+      setCurrentUserSync(nextUser);
+      setLocalJson('companyInfo', {
+        companyName: businessName,
+        email: ownerEmail,
+        phone: phone255,
+        businessAddress: String(formData.businessAddress || '').trim(),
+        location: String(formData.location || '').trim(),
+        locationCity: String(formData.locationCity || '').trim(),
+        tin: String(formData.taxId || '').trim(),
+        taxId: String(formData.taxId || '').trim(),
+        vrn: String(formData.vatRegistration || '').trim(),
+        vatRegistration: String(formData.vatRegistration || '').trim(),
+        website: String(formData.website || '').trim(),
+        businessDescription: String(formData.businessDescription || '').trim(),
+        logo: String(draft?.logoPreview || '').trim(),
+        subscriptionPlan: nextUser.subscriptionPlan,
+        subscriptionPaymentStatus: nextUser.subscriptionPaymentStatus,
+        subscriptionStartedAt: nextUser.subscriptionStartedAt,
+        subscriptionEndsAt: nextUser.subscriptionEndsAt,
+        subscriptionTrialEndsAt: nextUser.subscriptionTrialEndsAt
+        ,
+        subscriptionDurationDays: nextUser.subscriptionDurationDays
+      });
+      clearSignupDraft();
+      if (options?.minDelayStartedAt) {
+        await delayToFiveSeconds(options.minDelayStartedAt);
+      }
+      onSignUp && onSignUp();
+      closeCheckout();
+      navigate('/dashboard', { replace: true });
+    } catch (err) {
+      const code = String(err?.code || '');
+      if (code === 'PHONE_ALREADY_EXISTS' || code === 'PHONE_EXISTS') {
+        setPhoneExists(true);
+        setCheckoutError('Phone number already exists. Please login instead.');
+      } else setCheckoutError(String(err?.message || 'Unable to create account. Try again.'));
+      return;
+    }
+
   };
 
   const openCheckout = (planId) => {
@@ -582,21 +394,18 @@ const PlanSelect = ({ onSignUp }) => {
 
   const handleConfirmCheckout = async () => {
     if (isSubmitting) return;
-    const startedAt = Date.now();
     resetPaymentState();
     const planId = String(checkoutPlanId || '').trim();
     const plan = plans.find((p) => p.id === planId);
     if (!plan) return;
-    const showTrial = Boolean(plan.trialDays) && activeBilling.id === '1m';
+    const showTrial = !renewalMode && String(plan.id || '') === 'starter';
     const pricing = getPricing(plan);
     const totalToPay = showTrial ? 0 : pricing.total;
-    if (totalToPay === 0) {
+    if (showTrial) {
+      const startedAt = Date.now();
       setIsSubmitting(true);
       setLoadingKey('checkout:confirm');
-      await delayToFiveSeconds(startedAt);
-      void handleCreateAccount(planId, {});
-      setIsSubmitting(false);
-      setLoadingKey('');
+      await handleCreateAccount(planId, {}, { minDelayStartedAt: startedAt });
       return;
     }
 
@@ -617,12 +426,11 @@ const PlanSelect = ({ onSignUp }) => {
     setLoadingKey('checkout:confirm');
     setPaymentFlow('initiating');
     logPayment('initiate.start', { planId, amount: totalToPay });
-    await delayToFiveSeconds(startedAt);
 
     const fullPhone = `+255${localDigits}`;
     try {
-      const init = await initiatePayment(fullPhone, totalToPay);
-      const ref = String(init?.data?.reference || '').trim();
+      const init = await initiatePayment(fullPhone, totalToPay, paymentProvider);
+      const ref = String(init?.data?.reference || init?.reference || init?.data?.ref || init?.ref || '').trim();
       if (!ref) {
         throw new Error('Payment initiation failed: missing reference');
       }
@@ -649,22 +457,30 @@ const PlanSelect = ({ onSignUp }) => {
         }
         try {
           const res = await verifyPayment(ref);
-          const st = String(res?.status || '').toLowerCase();
+          const st = String(res?.status || res?.data?.status || res?.data?.data?.status || res?.result?.status || '').toLowerCase();
           logPayment('verify.status', { reference: ref, status: st });
           if (st === 'success') {
             stopPaymentPolling();
             setPaymentFlow('success');
-            setLoadingKey('');
-            void handleCreateAccount(planId, { provider: paymentProvider, phone: `+255 ${localDigits}`, reference: ref });
-            setIsSubmitting(false);
+            setIsSubmitting(true);
+            setLoadingKey('checkout:finalizing');
+            await handleCreateAccount(planId, { provider: paymentProvider, phone: `+255 ${localDigits}`, reference: ref });
             return 'success';
           }
-          if (st === 'payment expired') {
+          if (st === 'payment expired' || st === 'expired') {
             stopPaymentPolling();
             setPaymentFlow('expired');
             setIsSubmitting(false);
             setLoadingKey('');
             return 'expired';
+          }
+          if (st === 'failed' || st === 'cancelled' || st === 'canceled' || st === 'rejected') {
+            stopPaymentPolling();
+            setPaymentFlow('error');
+            setCheckoutError('Payment was not completed. Please try again.');
+            setIsSubmitting(false);
+            setLoadingKey('');
+            return 'error';
           }
           setPaymentFlow('pending');
           return 'pending';
@@ -704,54 +520,54 @@ const PlanSelect = ({ onSignUp }) => {
       {!checkoutOpen ? (
         <div className="min-h-screen w-full">
           <div className="min-h-screen w-full bg-white border border-gray-200 shadow-sm">
-            <div className="px-6 lg:px-12 py-10 lg:py-14">
-              <div className="max-w-6xl mx-auto">
-                <div className="flex items-center justify-start mb-4">
-                  <button
-                    type="button"
-                    onClick={() => navigate('/signup/modules')}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/70 border border-gray-200 hover:bg-white text-gray-900 font-semibold"
-                  >
-                    <ArrowLeft className="w-4 h-4" />
-                    Back
-                  </button>
-                </div>
+            <div className="px-5 lg:px-10 py-4 lg:py-5">
+              <div className="max-w-5xl mx-auto">
+                {!renewalMode ? (
+                  <div className="flex items-center justify-start mb-2">
+                    <button
+                      type="button"
+                      onClick={() => navigate('/signup')}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-white/70 border border-gray-200 hover:bg-white text-gray-900 font-semibold"
+                    >
+                      <ArrowLeft className="w-4 h-4" />
+                      Back
+                    </button>
+                  </div>
+                ) : null}
                 <div className="text-center">
-                  <div className="text-3xl md:text-4xl font-extrabold text-gray-900">Choose your plan</div>
-                  <div className="mt-2 text-base md:text-lg text-gray-700">Complete your business solutions</div>
+                  <div className="text-xl md:text-2xl font-bold text-gray-900">{renewalMode ? 'Choose plan to unlock system' : 'Choose your plan'}</div>
+                  <div className="mt-1 text-sm text-gray-700">{renewalMode ? 'Pay to continue using your system.' : 'Choose the best plan for your business.'}</div>
                 </div>
 
-                {error ? <div className="mt-6 text-red-600 text-base text-center">{error}</div> : null}
+                {error ? <div className="mt-4 text-red-600 text-sm text-center">{error}</div> : null}
+                {!renewalMode && phoneExists ? (
+                  <div className="mt-3 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm text-center">
+                    Phone number already exists. Please login instead.
+                  </div>
+                ) : null}
 
-                <div className="mt-6 flex items-center justify-center">
-                  <div className="flex flex-wrap items-center justify-center gap-2">
-                    {billingOptions.map((opt) => {
+                <div className="mt-4 flex items-center justify-center">
+                  <div className="flex flex-wrap items-center justify-center gap-2 bg-white border border-gray-200 rounded-full p-1 shadow-sm">
+                    {visibleBillingOptions.map((opt) => {
                       const active = opt.id === billingCycle;
                       return (
                         <button
                           key={opt.id}
                           type="button"
+                          data-no-loading="true"
                           onClick={() => {
-                            if (isSubmitting) return;
                             setBillingCycle(opt.id);
                             setError('');
-                            setIsSubmitting(true);
-                            setLoadingKey(`billing:${opt.id}`);
                             try {
-                              const nextDraft = { ...draft, billingCycle: opt.id };
-                              sessionStorage.setItem('signupDraft', JSON.stringify(nextDraft));
+                              const nextDraft = { ...draft, billingCycle: opt.id, selectedPlan };
+                              setSignupDraft(nextDraft);
                               setDraft(nextDraft);
                             } catch {}
-                            setTimeout(() => {
-                              setIsSubmitting(false);
-                              setLoadingKey('');
-                            }, 5000);
                           }}
-                          disabled={isSubmitting && loadingKey !== `billing:${opt.id}`}
                           className={
                             active
                               ? 'relative px-4 py-2 rounded-full bg-green-600 text-white text-sm font-semibold shadow-sm transition-colors'
-                              : 'relative px-4 py-2 rounded-full bg-white text-gray-700 text-sm font-semibold border border-gray-200 hover:bg-gray-50 transition-colors'
+                              : 'relative px-4 py-2 rounded-full bg-transparent text-gray-700 text-sm font-semibold hover:bg-gray-50 transition-colors'
                           }
                         >
                           <span className="inline-flex items-center gap-2">
@@ -768,12 +584,12 @@ const PlanSelect = ({ onSignUp }) => {
                   </div>
                 </div>
 
-                <div className="mt-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <div className="mt-5 grid grid-cols-1 lg:grid-cols-3 gap-4">
                   {plans.map((p) => {
                     const selected = selectedPlan === p.id;
                     const Icon = p.Icon;
                     const pricing = getPricing(p);
-                    const showTrial = Boolean(p.trialDays) && activeBilling.id === '1m';
+                    const showTrial = !renewalMode && p.id === 'starter';
                     const accent =
                       p.id === 'starter'
                         ? { title: 'text-emerald-700', iconBg: 'bg-emerald-50', iconText: 'text-emerald-700', ring: 'ring-emerald-200/70' }
@@ -781,47 +597,52 @@ const PlanSelect = ({ onSignUp }) => {
                         ? { title: 'text-indigo-700', iconBg: 'bg-indigo-50', iconText: 'text-indigo-700', ring: 'ring-indigo-200/70' }
                         : { title: 'text-amber-700', iconBg: 'bg-amber-50', iconText: 'text-amber-700', ring: 'ring-amber-200/70' };
                     return (
-                      <button
+                      <div
                         key={p.id}
-                        type="button"
                         onClick={() => {
-                          if (isSubmitting) return;
                           setSelectedPlan(p.id);
                           setError('');
-                          setIsSubmitting(true);
-                          setLoadingKey(`plan:${p.id}`);
                           try {
                             const nextDraft = { ...draft, selectedPlan: p.id };
-                            sessionStorage.setItem('signupDraft', JSON.stringify(nextDraft));
+                            setSignupDraft(nextDraft);
                             setDraft(nextDraft);
                           } catch {}
-                          setTimeout(() => {
-                            setIsSubmitting(false);
-                            setLoadingKey('');
-                          }, 5000);
                         }}
-                        disabled={isSubmitting && loadingKey !== `plan:${p.id}`}
+                        onKeyDown={(e) => {
+                          if (e.key !== 'Enter' && e.key !== ' ') return;
+                          e.preventDefault();
+                          setSelectedPlan(p.id);
+                          setError('');
+                          try {
+                            const nextDraft = { ...draft, selectedPlan: p.id };
+                            setSignupDraft(nextDraft);
+                            setDraft(nextDraft);
+                          } catch {}
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        aria-disabled={false}
                         className={
                           selected
-                            ? 'relative text-left bg-white border-2 border-green-500 rounded-3xl p-10 shadow-2xl transition-all duration-300 hover:-translate-y-1 hover:scale-[1.02]'
+                            ? 'relative text-left bg-white border-2 border-green-500 rounded-3xl p-5 shadow-2xl transition-all duration-300 hover:-translate-y-1 hover:scale-[1.01]'
                             : p.highlight
-                            ? 'relative text-left bg-white border-2 border-green-200 rounded-3xl p-10 shadow-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-2xl hover:scale-[1.01]'
-                            : 'relative text-left bg-white border border-gray-200 rounded-3xl p-10 shadow-lg transition-all duration-300 hover:border-green-200 hover:-translate-y-1 hover:shadow-xl hover:scale-[1.01]'
+                            ? 'relative text-left bg-white border-2 border-green-200 rounded-3xl p-5 shadow-xl transition-all duration-300 hover:-translate-y-1 hover:shadow-2xl hover:scale-[1.01]'
+                            : 'relative text-left bg-white border border-gray-200 rounded-3xl p-5 shadow-lg transition-all duration-300 hover:border-green-200 hover:-translate-y-1 hover:shadow-xl hover:scale-[1.01]'
                         }
                       >
                         {p.highlight ? (
-                          <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-green-600 text-white text-xs font-semibold shadow">
+                          <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-indigo-600 text-white text-xs font-semibold shadow">
                             MOST POPULAR
                           </div>
                         ) : null}
                         {showTrial ? (
-                          <div className="absolute top-4 right-4 px-3 py-1 rounded-full bg-green-50 border border-green-200 text-green-800 text-xs font-semibold">
-                            {p.trialDays} Days Free
+                          <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-green-50 border border-green-200 text-green-800 text-xs font-semibold">
+                            7 Days Free
                           </div>
                         ) : null}
                         <div className="flex items-start justify-between gap-3">
-                          <div className={`w-14 h-14 rounded-2xl ${accent.iconBg} border border-gray-200 flex items-center justify-center shadow-sm ring-1 ${accent.ring}`}>
-                            <Icon className={`w-6 h-6 ${accent.iconText}`} />
+                          <div className={`w-10 h-10 rounded-2xl ${accent.iconBg} border border-gray-200 flex items-center justify-center shadow-sm ring-1 ${accent.ring}`}>
+                            <Icon className={`w-5 h-5 ${accent.iconText}`} />
                           </div>
                           <div
                             className={
@@ -834,91 +655,92 @@ const PlanSelect = ({ onSignUp }) => {
                           </div>
                         </div>
 
-                        <div className={`mt-7 text-2xl font-bold ${accent.title}`}>{p.title}</div>
-                        <div className="mt-2 text-sm text-gray-600">{p.caption}</div>
+                        <div className={`mt-4 text-lg font-semibold ${accent.title}`}>{p.title}</div>
+                        <div className="mt-1.5 text-sm text-gray-600">{p.caption}</div>
 
-                      {showTrial ? (
-                        <div className="mt-5">
-                          <div className="text-3xl font-extrabold text-gray-900">7 days free</div>
-                          <div className="mt-2 text-sm text-gray-600">
-                            Then <span className="font-semibold text-gray-900">TSh {pricing.discountedMonthly.toLocaleString()}</span> / month
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="mt-5">
-                          <div className="text-3xl font-extrabold text-gray-900">
-                            TSh {pricing.discountedMonthly.toLocaleString()}
-                            <span className="text-sm font-semibold text-gray-500"> / month</span>
-                          </div>
-                          {pricing.discountPercent ? (
-                            <div className="mt-2 text-sm text-gray-600">
+                      <div className="mt-4">
+                        {showTrial ? (
+                          <>
+                            <div className="text-xl font-extrabold text-gray-900">7 days free</div>
+                            <div className="mt-1.5 text-xs text-gray-600">
+                              After 7 days the system will lock and you must choose a paid plan to continue.
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="text-xl font-extrabold text-gray-900">
+                              TSh {pricing.discountedMonthly.toLocaleString()}
+                              <span className="text-xs font-semibold text-gray-500"> / month</span>
+                            </div>
+                            <div className="mt-1.5 text-xs text-gray-600">
                               Billed <span className="font-semibold text-gray-900">TSh {pricing.total.toLocaleString()}</span> every {pricing.months} months
                             </div>
-                          ) : (
-                            <div className="mt-2 text-sm text-gray-600">Billed monthly</div>
-                          )}
-                        </div>
-                      )}
+                          </>
+                        )}
+                      </div>
 
-                      <div className="mt-7 rounded-2xl bg-gray-50 border border-gray-200 p-4">
-                        <div className="flex items-center justify-between text-sm text-gray-700">
+                      <div className="mt-4 rounded-2xl bg-gray-50 border border-gray-200 p-3">
+                        <div className="flex items-center justify-between text-xs text-gray-700">
                           <span>Modules</span>
                           <span className="font-semibold text-gray-900">1</span>
                         </div>
-                        <div className="mt-2 flex items-center justify-between text-sm text-gray-700">
+                        <div className="mt-1.5 flex items-center justify-between text-xs text-gray-700">
                           <span>Users</span>
                           <span className="font-semibold text-gray-900">{String(p.userLimit || '')}</span>
                         </div>
-                        <div className="mt-2 flex items-center justify-between text-sm text-gray-700">
+                        <div className="mt-1.5 flex items-center justify-between text-xs text-gray-700">
                           <span>SMS / mo</span>
                           <span className="font-semibold text-gray-900">{p.id === 'starter' ? '50' : p.id === 'professional' ? '200' : '500'}</span>
                         </div>
                       </div>
 
-                      <div className="mt-6 space-y-3">
+                      <div className="mt-4 space-y-2">
                         {p.features.map((f) => (
-                          <div key={f} className="flex items-center gap-3 text-base text-gray-800">
-                            <span className="w-6 h-6 rounded-full bg-green-600 text-white flex items-center justify-center text-sm">✓</span>
+                          <div key={f} className="flex items-center gap-2.5 text-xs text-gray-800">
+                            <span className="w-5 h-5 rounded-full bg-green-600 text-white flex items-center justify-center text-xs">✓</span>
                             <span>{f}</span>
                           </div>
                         ))}
                       </div>
 
-                        <div className="mt-8">
+                        <div className="mt-5">
                           <button
                             type="button"
-                            className={p.highlight ? 'w-full text-center px-4 py-4 rounded-2xl bg-green-600 text-white text-base font-semibold transition-all duration-300 hover:bg-green-700' : 'w-full text-center px-4 py-4 rounded-2xl bg-gray-900 text-white text-base font-semibold transition-all duration-300 hover:bg-gray-800'}
+                            className={
+                              p.highlight
+                                ? 'w-full text-center px-4 py-2.5 rounded-2xl bg-indigo-600 text-white text-sm font-semibold transition-all duration-300 hover:bg-indigo-700'
+                                : 'w-full text-center px-4 py-2.5 rounded-2xl bg-gray-900 text-white text-sm font-semibold transition-all duration-300 hover:bg-gray-800'
+                            }
                             onClick={async (e) => {
                               e.stopPropagation();
-                              if (isSubmitting) return;
-                              const startedAt = Date.now();
+                              if (!renewalMode && phoneExists) {
+                                setError('Phone number already exists. Please login instead.');
+                                return;
+                              }
                               setSelectedPlan(p.id);
                               try {
                                 const nextDraft = { ...draft, selectedPlan: p.id };
-                                sessionStorage.setItem('signupDraft', JSON.stringify(nextDraft));
+                                setSignupDraft(nextDraft);
                                 setDraft(nextDraft);
                               } catch {}
-                              setIsSubmitting(true);
-                              setLoadingKey(`choose:${p.id}`);
-                              await delayToFiveSeconds(startedAt);
                               openCheckout(p.id);
-                              setIsSubmitting(false);
-                              setLoadingKey('');
                             }}
-                            disabled={isSubmitting && loadingKey !== `choose:${p.id}`}
+                            disabled={!renewalMode && phoneExists}
                           >
                             <span className="inline-flex items-center justify-center gap-2">
-                              <span>{showTrial ? `START FREE — 7 DAYS` : `CHOOSE — TSh ${pricing.total.toLocaleString()}`}</span>
+                              <span>
+                                {showTrial ? 'START FREE - 7 DAYS' : `CHOOSE — TSh ${pricing.discountedMonthly.toLocaleString()}/MO`}
+                              </span>
                             </span>
                           </button>
                         </div>
-                      </button>
+                      </div>
                     );
                   })}
                 </div>
 
                 <div className="mt-10 flex items-center justify-center text-sm text-gray-600">
-                  Prices are monthly.
+                  Available billing: 1 month, 3 months, 6 months, or 1 year.
                 </div>
               </div>
             </div>
@@ -929,10 +751,10 @@ const PlanSelect = ({ onSignUp }) => {
       {checkoutOpen ? (() => {
         const plan = plans.find((p) => p.id === checkoutPlanId);
         if (!plan) return null;
+        const showTrial = !renewalMode && String(plan.id || '') === 'starter';
         const pricing = getPricing(plan);
-        const showTrial = Boolean(plan.trialDays) && activeBilling.id === '1m';
-        const durationLabel = `${pricing.months} month(s)`;
-        const moduleLabel = String(draft?.selectedModule || '').trim() || '—';
+        const durationDays = (Number(plan.durationDays || 30) || 30) * (Number(pricing.months || 0) || 0);
+        const durationLabel = showTrial ? '7 Days (Trial)' : `${durationDays} Days`;
         const totalToPay = showTrial ? 0 : pricing.total;
         const monthlyRate = pricing.discountedMonthly;
         const paymentProviders = [
@@ -942,9 +764,10 @@ const PlanSelect = ({ onSignUp }) => {
           { id: 'halopesa', label: 'HaloPesa', logoSrc: '/halotel.png', logoAlt: 'Halotel' },
           { id: 'selcom', label: 'Selcom Pesa', logoSrc: '/selcom.png', logoAlt: 'Selcom' }
         ];
+        // eslint-disable-next-line no-unused-vars
         const payBusy = paymentFlow === 'initiating' || paymentFlow === 'pending' || loadingKey === 'checkout:confirm';
         const payLabel = showTrial
-          ? 'Start Free — 7 Days'
+          ? 'Start Free - 7 Days'
           : paymentFlow === 'pending' || paymentFlow === 'initiating'
           ? 'Waiting for confirmation…'
           : paymentFlow === 'expired'
@@ -953,7 +776,7 @@ const PlanSelect = ({ onSignUp }) => {
           ? `Retry Pay TSh ${totalToPay.toLocaleString()}`
           : `Pay TSh ${totalToPay.toLocaleString()}`;
         const helperText = showTrial
-          ? 'Your trial will start immediately.'
+          ? 'Starter begins with 7 days free. After 7 days the system locks until a paid plan is chosen.'
           : paymentFlow === 'pending' || paymentFlow === 'initiating'
           ? `Waiting for payment confirmation... ${paymentSecondsLeft}s`
           : paymentFlow === 'expired'
@@ -963,14 +786,7 @@ const PlanSelect = ({ onSignUp }) => {
           : 'You will receive a USSD prompt on your phone to confirm.';
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center">
-            <div className="absolute inset-0 pointer-events-none">
-              <div className="absolute inset-0 blur-md scale-[1.02] opacity-85">
-                <Layout onLogout={() => {}}>
-                  <Dashboard />
-                </Layout>
-              </div>
-              <div className="absolute inset-0 bg-black/35" />
-            </div>
+            <div className="absolute inset-0 bg-black/40" />
             <button type="button" className="absolute inset-0" onClick={closeCheckout} />
             <div className="relative w-[94vw] max-w-[520px] rounded-3xl bg-white shadow-2xl border border-white/60 overflow-hidden">
               <div className="p-6">
@@ -985,8 +801,6 @@ const PlanSelect = ({ onSignUp }) => {
                   <div className="grid grid-cols-2 gap-y-2 text-sm">
                     <div className="text-gray-600">Tier</div>
                     <div className="text-gray-900 font-semibold text-right">{plan.title}</div>
-                    <div className="text-gray-600">Modules</div>
-                    <div className="text-gray-900 font-semibold text-right">{moduleLabel}</div>
                     <div className="text-gray-600">Duration</div>
                     <div className="text-gray-900 font-semibold text-right">{durationLabel}</div>
                     <div className="text-gray-600">Monthly rate</div>
@@ -996,72 +810,68 @@ const PlanSelect = ({ onSignUp }) => {
                     <div className="text-gray-900 font-semibold">Total</div>
                     <div className="text-2xl font-extrabold text-green-700">TSh {totalToPay.toLocaleString()}</div>
                   </div>
-                  {showTrial ? (
-                    <div className="mt-2 text-xs text-gray-600">
-                      Free for 7 days. After trial, payment is required to continue.
+                  {showTrial ? <div className="mt-2 text-xs text-gray-600">No payment is required for the first 7 days on Starter.</div> : null}
+                </div>
+
+                {!showTrial ? (
+                  <>
+                    <div className="mt-5">
+                    <div className="text-sm font-semibold text-gray-900">Payment Phone Number</div>
+                    <div className="mt-2 flex items-center gap-2 bg-white border border-gray-300 rounded-2xl px-3 py-3">
+                      <span className="inline-flex items-center gap-1 rounded-xl bg-green-50 text-green-700 border border-green-200 px-2 py-1">
+                        <span className="text-xs font-semibold">+255</span>
+                      </span>
+                      <input
+                        type="tel"
+                        value={String(paymentPhone || '').replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, '')}
+                        onChange={(e) => {
+                          const raw = String(e.target.value || '');
+                          const digits = raw.replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, '');
+                          setPaymentPhone(digits);
+                          if (paymentReference || paymentFlow !== 'idle') resetPaymentState();
+                          if (checkoutError) setCheckoutError('');
+                        } }
+                        className="bg-transparent w-full text-gray-900 outline-none"
+                        placeholder="6/7XXXXXXXX"
+                        inputMode="numeric" />
                     </div>
-                  ) : null}
-                </div>
-
-                <div className="mt-5">
-                  <div className="text-sm font-semibold text-gray-900">Payment Phone Number</div>
-                  <div className="mt-2 flex items-center gap-2 bg-white border border-gray-300 rounded-2xl px-3 py-3">
-                    <span className="inline-flex items-center gap-1 rounded-xl bg-green-50 text-green-700 border border-green-200 px-2 py-1">
-                      <span className="text-xs font-semibold">+255</span>
-                    </span>
-                    <input
-                      type="tel"
-                      value={String(paymentPhone || '').replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, '')}
-                      onChange={(e) => {
-                        const raw = String(e.target.value || '');
-                        const digits = raw.replace(/[^0-9]/g, '').replace(/^0/, '').replace(/^255/, '');
-                        setPaymentPhone(digits);
-                        if (paymentReference || paymentFlow !== 'idle') resetPaymentState();
-                        if (checkoutError) setCheckoutError('');
-                      }}
-                      className="bg-transparent w-full text-gray-900 outline-none"
-                      placeholder="6/7XXXXXXXX"
-                      inputMode="numeric"
-                    />
                   </div>
-                </div>
-
-                <div className="mt-5">
-                  <div className="text-sm font-semibold text-gray-900">Select Payment Provider</div>
-                  <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
-                    {paymentProviders.map((p) => {
-                      const active = paymentProvider === p.id;
-                      return (
-                        <button
-                          key={p.id}
-                          type="button"
-                          data-no-loading="true"
-                          onClick={() => {
-                            setPaymentProvider(p.id);
-                            if (!paymentPhone) setPaymentPhone('');
-                            if (paymentReference || paymentFlow !== 'idle') resetPaymentState();
-                            if (checkoutError) setCheckoutError('');
-                          }}
-                          className="relative flex flex-col items-center gap-2 py-2"
-                        >
-                          <div className={active ? 'relative w-16 h-16 rounded-full bg-white/80 border-2 border-green-500 shadow-sm flex items-center justify-center overflow-hidden' : 'relative w-16 h-16 rounded-full bg-white/70 border border-gray-200 shadow-sm flex items-center justify-center overflow-hidden hover:bg-white'}>
-                            <img src={p.logoSrc} alt={p.logoAlt} className="max-h-10 w-auto" />
-                          </div>
-                          <div
-                            className={
-                              active
-                                ? 'absolute -top-1 -right-1 w-7 h-7 rounded-full bg-green-600 text-white flex items-center justify-center transition-transform duration-200 scale-105 shadow'
-                                : 'absolute -top-1 -right-1 w-7 h-7 rounded-full bg-white/70 border border-white/60 text-gray-500 flex items-center justify-center transition-transform duration-200 shadow-sm'
-                            }
-                          >
-                            <BadgeCheck className="w-4 h-4" />
-                          </div>
-                          <div className="text-xs font-semibold text-gray-900 leading-tight text-center">{p.label}</div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
+                  <div className="mt-5">
+                      <div className="text-sm font-semibold text-gray-900">Select Payment Provider</div>
+                      <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
+                        {paymentProviders.map((p) => {
+                          const active = paymentProvider === p.id;
+                          return (
+                            <button
+                              key={p.id}
+                              type="button"
+                              data-no-loading="true"
+                              onClick={() => {
+                                setPaymentProvider(p.id);
+                                if (!paymentPhone) setPaymentPhone('');
+                                if (paymentReference || paymentFlow !== 'idle') resetPaymentState();
+                                if (checkoutError) setCheckoutError('');
+                              } }
+                              className="relative flex flex-col items-center gap-2 py-2"
+                            >
+                              <div className={active ? 'relative w-16 h-16 rounded-full bg-white/80 border-2 border-green-500 shadow-sm flex items-center justify-center overflow-hidden' : 'relative w-16 h-16 rounded-full bg-white/70 border border-gray-200 shadow-sm flex items-center justify-center overflow-hidden hover:bg-white'}>
+                                <img src={p.logoSrc} alt={p.logoAlt} className="max-h-10 w-auto" />
+                              </div>
+                              <div
+                                className={active
+                                  ? 'absolute -top-1 -right-1 w-7 h-7 rounded-full bg-green-600 text-white flex items-center justify-center transition-transform duration-200 scale-105 shadow'
+                                  : 'absolute -top-1 -right-1 w-7 h-7 rounded-full bg-white/70 border border-white/60 text-gray-500 flex items-center justify-center transition-transform duration-200 shadow-sm'}
+                              >
+                                <BadgeCheck className="w-4 h-4" />
+                              </div>
+                              <div className="text-xs font-semibold text-gray-900 leading-tight text-center">{p.label}</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
 
                 {paymentReference ? (
                   <div className="mt-4 rounded-2xl bg-gray-50 border border-gray-200 p-3">
@@ -1088,7 +898,18 @@ const PlanSelect = ({ onSignUp }) => {
                   </div>
                 ) : null}
 
-                {checkoutError ? <div className="mt-4 text-red-600 text-sm">{checkoutError}</div> : null}
+                {checkoutError ? (
+                  <div className="mt-4 text-red-600 text-sm">
+                    <div>{checkoutError}</div>
+                    {phoneExists ? (
+                      <div className="mt-2">
+                        <Link to="/login" className="text-green-700 font-semibold hover:underline">
+                          Go to Login
+                        </Link>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 <div className="mt-6">
                   <button
@@ -1098,38 +919,12 @@ const PlanSelect = ({ onSignUp }) => {
                     disabled={isSubmitting}
                   >
                     <span className="inline-flex items-center justify-center gap-2">
-                      {payBusy ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
                       <span>{payLabel}</span>
                     </span>
                   </button>
                   <div className="mt-3 text-xs text-gray-600 text-center">
                     {helperText}
                   </div>
-                  {process.env.NODE_ENV !== 'production' && paymentReference ? (
-                    <div className="mt-3 flex items-center justify-center">
-                      <button
-                        type="button"
-                        className={isWebhookSubmitting ? 'px-4 py-2 rounded-xl bg-gray-900/70 text-white font-semibold text-xs cursor-not-allowed' : 'px-4 py-2 rounded-xl bg-gray-900 text-white font-semibold text-xs hover:bg-gray-800'}
-                        onClick={async () => {
-                          const digits = String(paymentPhone || '').replace(/[^0-9]/g, '');
-                          const normalized = digits.startsWith('0') ? digits.slice(1) : digits;
-                          const localDigits = normalized.startsWith('255') ? normalized.slice(3) : normalized;
-                          await simulatePaymentWebhook({
-                            reference: paymentReference,
-                            phoneNumber: localDigits ? `+255${localDigits}` : '',
-                            amount: totalToPay,
-                            provider: paymentProvider
-                          });
-                        }}
-                        disabled={isWebhookSubmitting}
-                      >
-                        <span className="inline-flex items-center justify-center gap-2">
-                          {isWebhookSubmitting ? <span className="w-4 h-4 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
-                          <span>Simulate payment success (demo)</span>
-                        </span>
-                      </button>
-                    </div>
-                  ) : null}
                 </div>
               </div>
             </div>

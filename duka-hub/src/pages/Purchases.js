@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+/* eslint-disable no-unused-vars */
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Plus, Printer, Mail, Share2, Trash2 } from 'lucide-react';
+import { Plus, Printer, Mail, Share2, Trash2, Loader2 } from 'lucide-react';
 import { formatDisplayDate } from '../utils/date';
 import { UNIT_LABELS, UNIT_OPTIONS } from '../utils/units';
 import DateInput from '../shared/DateInput';
@@ -8,6 +9,76 @@ import PurchaseOrderPrint from '../shared/PurchaseOrderPrint';
 import { flushSync } from 'react-dom';
 import ConfirmDeleteModal from '../shared/ConfirmDeleteModal';
 import { canDeleteRecords } from '../utils/deletePassword';
+import { appendSystemActivity } from '../utils/systemActivity';
+import { productsApi } from '../services/productsApi';
+import { purchasesApi, suppliersApi } from '../services/purchasingApi';
+import { withMinimumDelay } from '../utils/loadingDelay';
+
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    void safeJsonParse;
+    const k = String(key || '');
+    if (!k) return false;
+    let ok = false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+      ok = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (ok && !options?.silent) {
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      }
+    }
+  },
+  del(key, options) {
+    let ok = false;
+    try {
+      window.localStorage.removeItem(String(key || ''));
+      ok = true;
+    } catch {}
+    if (ok && !options?.silent) {
+      try {
+        window.dispatchEvent(new CustomEvent('dataUpdated'));
+      } catch {}
+    }
+  },
+  list() {
+    try {
+      const keys = [];
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i);
+        if (k) keys.push(k);
+      }
+      return keys.sort();
+    } catch {
+      return [];
+    }
+  }
+};
+
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+const setStoredJson = (key, value) => Promise.resolve(localStore.set(key, value));
 
 const PO_SEQUENCE_STORAGE_KEY = 'purchaseOrderNextNumber';
 const parsePoNumber = (value) => {
@@ -16,26 +87,36 @@ const parsePoNumber = (value) => {
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) ? n : NaN;
 };
-const getNextPoNumber = () => {
-  try {
-    const v = parseInt(localStorage.getItem(PO_SEQUENCE_STORAGE_KEY) || '100', 10);
-    return Number.isFinite(v) ? v : 100;
-  } catch {
-    return 100;
-  }
+const generateLpoNumber = (n) => {
+  const v = parseInt(String(n ?? 1), 10);
+  const safe = Number.isFinite(v) && v > 0 ? v : 1;
+  return `PO${String(safe).padStart(5, '0')}`;
 };
-const generateLpoNumber = () => {
-  return String(getNextPoNumber()).padStart(4, '0');
-};
+
+const createEmptyPurchaseForm = (purchaseNumber) => ({
+  lpoNumber: String(purchaseNumber || generateLpoNumber(1)),
+  date: new Date().toISOString().split('T')[0],
+  supplierId: '',
+  supplierName: '',
+  supplierAddress: '',
+  destination: 'stock',
+  items: [{ item: '', _custom: false, description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }],
+  terms: '',
+  notes: '',
+  shipToName: '',
+  shipToAddress: '',
+  vendorMessage: '',
+  memo: '',
+});
 const Purchases = () => {
   const [suppliers, setSuppliers] = useState([]);
   const [purchases, setPurchases] = useState([]);
   const [inventoryItems, setInventoryItems] = useState([]);
   const [showShareMenu, setShowShareMenu] = useState(false);
+  const [saveLoading, setSaveLoading] = useState('');
   const [showAddSupplier, setShowAddSupplier] = useState(false);
-  const [showAddItem, setShowAddItem] = useState(false);
-  const [pendingItemRowIndex, setPendingItemRowIndex] = useState(null);
-  const [newItem, setNewItem] = useState({ name: '', unit: 'kg', price: '' });
+  const [supplierSaving, setSupplierSaving] = useState(false);
+  const [feedback, setFeedback] = useState('');
   const [companyInfo, setCompanyInfo] = useState({});
   const [poToPrint, setPoToPrint] = useState(null);
   const [editingPurchaseId, setEditingPurchaseId] = useState(null);
@@ -62,81 +143,105 @@ const Purchases = () => {
     billedFrom: '',
     shippedFrom: ''
   });
-  const [form, setForm] = useState({
-    lpoNumber: generateLpoNumber(),
-    date: new Date().toISOString().split('T')[0],
-    supplierId: '',
-    supplierName: '',
-    supplierAddress: '',
-    items: [{ item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }],
-    terms: '',
-    notes: '',
-    shipToName: '',
-    shipToAddress: '',
-    vendorMessage: '',
-    memo: '',
-  });
-  useEffect(() => {
-    const savedSuppliers = JSON.parse(localStorage.getItem('suppliers') || '[]');
-    setSuppliers(savedSuppliers);
-    const savedPurchases = JSON.parse(localStorage.getItem('purchases') || '[]');
-    setPurchases(savedPurchases);
+  const [form, setForm] = useState(() => createEmptyPurchaseForm(generateLpoNumber(1)));
+  const [nextPoNumber, setNextPoNumber] = useState(1);
+  const refreshNextPoNumber = useCallback(async () => {
     try {
-      const savedItems = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-      setInventoryItems(Array.isArray(savedItems) ? savedItems : []);
-    } catch {
-      setInventoryItems([]);
-    }
-    try {
-      const existing = localStorage.getItem(PO_SEQUENCE_STORAGE_KEY);
-      if (!existing) {
-        const nums = (savedPurchases || [])
-          .map((p) => String(p?.lpoNumber || '').trim())
-          .filter((v) => /^\d{1,4}$/.test(v))
-          .map((v) => parseInt(v, 10))
-          .filter((n) => Number.isFinite(n));
-        const max = nums.length ? Math.max(...nums) : null;
-        const next = (max === null || max < 100) ? 100 : (max + 1);
-        localStorage.setItem(PO_SEQUENCE_STORAGE_KEY, String(next));
+      const nextNumber = await purchasesApi.previewNextNumber();
+      const parsed = parsePoNumber(nextNumber);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        setNextPoNumber(parsed);
+        return nextNumber;
       }
     } catch {}
-    setForm(prev => ({ ...prev, lpoNumber: generateLpoNumber() }));
+    const fallback = generateLpoNumber(nextPoNumber);
+    const parsedFallback = parsePoNumber(fallback);
+    if (Number.isFinite(parsedFallback) && parsedFallback > 0) {
+      setNextPoNumber(parsedFallback);
+    }
+    return fallback;
+  }, [nextPoNumber]);
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const [savedSuppliers, savedPurchases, savedItems, savedNextNumber, previewNumber] = await Promise.all([
+          suppliersApi.list(),
+          purchasesApi.list(),
+          productsApi.list(),
+          getStoredJson(PO_SEQUENCE_STORAGE_KEY, null),
+          purchasesApi.previewNextNumber().catch(() => '')
+        ]);
+        if (!alive) return;
+        const suppliersList = Array.isArray(savedSuppliers) ? savedSuppliers : [];
+        const purchasesList = Array.isArray(savedPurchases) ? savedPurchases : [];
+        const itemsList = Array.isArray(savedItems) ? savedItems : [];
+        setSuppliers(suppliersList);
+        setPurchases(purchasesList);
+        setInventoryItems(itemsList);
+
+        const nextFromStore = parseInt(String(savedNextNumber ?? ''), 10);
+        const nextComputed = (() => {
+          const nums = (purchasesList || [])
+            .map((p) => String(p?.lpoNumber || '').trim())
+            .map((v) => parsePoNumber(v))
+            .filter((n) => Number.isFinite(n));
+          const max = nums.length ? Math.max(...nums) : null;
+          const next = max === null || max < 1 ? 1 : max + 1;
+          return next;
+        })();
+        const next = Number.isFinite(nextFromStore) && nextFromStore >= 1 ? nextFromStore : nextComputed;
+        const resolvedPreview = String(previewNumber || '').trim() || generateLpoNumber(next);
+        const previewValue = parsePoNumber(resolvedPreview);
+        void setStoredJson(PO_SEQUENCE_STORAGE_KEY, next).catch(() => {});
+        setNextPoNumber(Number.isFinite(previewValue) && previewValue > 0 ? previewValue : next);
+        setForm((prev) => ({ ...prev, lpoNumber: resolvedPreview }));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem('purchaseDraft') || 'null';
-      const draft = JSON.parse(raw);
-      if (draft && Array.isArray(draft.items) && draft.items.length) {
-        const items = draft.items.map((it) => ({
-          item: String(it?.name || ''),
-          description: '',
-          qty: String(it?.qty || ''),
-          unit: String(it?.unit || 'kg'),
-          price: String(it?.price || ''),
-          tax: '',
-          total: 0
-        }));
-        setForm((prev) => ({ ...prev, items: items.length ? items : prev.items }));
-        localStorage.removeItem('purchaseDraft');
-      }
-    } catch {}
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const draft = await getStoredJson('purchaseDraft', null);
+        if (!alive) return;
+        if (draft && Array.isArray(draft.items) && draft.items.length) {
+          const items = draft.items.map((it) => ({
+            item: String(it?.name || ''),
+            _custom: false,
+            description: '',
+            qty: String(it?.qty || ''),
+            unit: String(it?.unit || 'kg'),
+            price: String(it?.price || ''),
+            tax: '',
+            total: 0
+          }));
+          setForm((prev) => ({ ...prev, items: items.length ? items : prev.items }));
+          void setStoredJson('purchaseDraft', null).catch(() => {});
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
     const loadCompanyInfo = () => {
-      try {
-        const saved = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-        setCompanyInfo(saved || {});
-      } catch {
-        setCompanyInfo({});
-      }
+      Promise.resolve()
+        .then(async () => {
+          const saved = await getStoredJson('companyInfo', {});
+          setCompanyInfo(saved && typeof saved === 'object' ? saved : {});
+        })
+        .catch(() => {});
     };
     loadCompanyInfo();
-    window.addEventListener('storage', loadCompanyInfo);
     window.addEventListener('companyInfoUpdated', loadCompanyInfo);
     return () => {
-      window.removeEventListener('storage', loadCompanyInfo);
       window.removeEventListener('companyInfoUpdated', loadCompanyInfo);
     };
   }, []);
@@ -149,12 +254,12 @@ const Purchases = () => {
 
   useEffect(() => {
     const handler = () => {
-      try {
-        const savedItems = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        setInventoryItems(Array.isArray(savedItems) ? savedItems : []);
-      } catch {
-        setInventoryItems([]);
-      }
+      Promise.resolve()
+        .then(async () => {
+          const itemsList = await getStoredJson('inventoryItems', []);
+          setInventoryItems(Array.isArray(itemsList) ? itemsList : []);
+        })
+        .catch(() => {});
     };
     window.addEventListener('dataUpdated', handler);
     return () => window.removeEventListener('dataUpdated', handler);
@@ -162,12 +267,25 @@ const Purchases = () => {
 
   useEffect(() => {
     const handler = () => {
-      try {
-        const savedPurchases = JSON.parse(localStorage.getItem('purchases') || '[]');
-        setPurchases(Array.isArray(savedPurchases) ? savedPurchases : []);
-      } catch {
-        setPurchases([]);
-      }
+      Promise.resolve()
+        .then(async () => {
+          const purchasesList = await purchasesApi.list();
+          setPurchases(Array.isArray(purchasesList) ? purchasesList : []);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener('dataUpdated', handler);
+    return () => window.removeEventListener('dataUpdated', handler);
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      Promise.resolve()
+        .then(async () => {
+          const suppliersList = await suppliersApi.list();
+          setSuppliers(Array.isArray(suppliersList) ? suppliersList : []);
+        })
+        .catch(() => {});
     };
     window.addEventListener('dataUpdated', handler);
     return () => window.removeEventListener('dataUpdated', handler);
@@ -198,41 +316,32 @@ const Purchases = () => {
     (suppliers || []).forEach((s) => {
       (s?.items || []).forEach((it) => upsert(it?.name, it?.unit, it?.price, ''));
     });
-    (purchases || []).forEach((p) => {
-      (p?.items || []).forEach((it) => upsert(it?.item, it?.unit, it?.price, p?.date || ''));
-    });
-    (form?.items || []).forEach((it) => upsert(it?.item, it?.unit, it?.price, form?.date || ''));
-
-    try {
-      const keys = Object.keys(localStorage || {});
-      keys.forEach((k) => {
-        if (!/^stockIn_/.test(k)) return;
-        try {
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const itemName = r?.itemName;
-            if (!itemName) return;
-            upsert(itemName, r?.unit, r?.pricePerItem, r?.date || '');
-          });
-        } catch {}
-      });
-    } catch {}
 
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [inventoryItems, suppliers, purchases, form.items, form.date]);
+  }, [inventoryItems, suppliers]);
 
   const units = useMemo(() => UNIT_OPTIONS, []);
-
-  const openAddItemForRow = (rowIndex) => {
-    setPendingItemRowIndex(rowIndex);
-    setNewItem({ name: '', unit: 'kg', price: '' });
-    setShowAddItem(true);
-  };
+  const currentEditingPurchase = useMemo(
+    () => (Array.isArray(purchases) ? purchases.find((p) => String(p?.id || '') === String(editingPurchaseId || '')) || null : null),
+    [purchases, editingPurchaseId]
+  );
 
   const applyItemToRow = (rowIndex, name) => {
+    if (String(name || '') === '__other__') {
+      const next = [...form.items];
+      next[rowIndex] = { ...next[rowIndex], item: '', _custom: true };
+      const qty = parseFloat(next[rowIndex].qty) || 0;
+      const price = parseFloat(next[rowIndex].price) || 0;
+      const taxPct = parseFloat(next[rowIndex].tax) || 0;
+      const lineAmount = qty * price;
+      const lineTax = (lineAmount * taxPct) / 100;
+      next[rowIndex].total = (lineAmount + lineTax).toFixed(2);
+      setForm((prev) => ({ ...prev, items: next }));
+      return;
+    }
     const chosen = itemCatalog.find((x) => x.name === name);
     const next = [...form.items];
-    next[rowIndex] = { ...next[rowIndex], item: name };
+    next[rowIndex] = { ...next[rowIndex], item: name, _custom: false };
     if (chosen?.unit) next[rowIndex].unit = chosen.unit;
     const chosenBuying = chosen?.buyingPrice ?? chosen?.buyPrice ?? chosen?.costPrice ?? chosen?.price;
     if (chosenBuying !== null && chosenBuying !== undefined && String(next[rowIndex].price || '').trim() === '') {
@@ -245,53 +354,6 @@ const Purchases = () => {
     const lineTax = (lineAmount * taxPct) / 100;
     next[rowIndex].total = (lineAmount + lineTax).toFixed(2);
     setForm((prev) => ({ ...prev, items: next }));
-  };
-
-  const saveNewItem = () => {
-    const name = (newItem.name || '').trim();
-    if (!name) return;
-    const buyingPrice = parseFloat(newItem.price || '0') || 0;
-    const record = {
-      id: `ITEM-${Date.now()}`,
-      name,
-      unit: (newItem.unit || 'kg').trim() || 'kg',
-      buyingPrice,
-      price: buyingPrice,
-      createdAt: new Date().toISOString()
-    };
-    try {
-      const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-      const list = Array.isArray(existing) ? existing : [];
-      const has = list.some((x) => String(x?.name || '').trim().toLowerCase() === name.toLowerCase());
-      const next = has ? list : [...list, record];
-      localStorage.setItem('inventoryItems', JSON.stringify(next));
-      setInventoryItems(next);
-    } catch {
-      const next = [...inventoryItems, record];
-      localStorage.setItem('inventoryItems', JSON.stringify(next));
-      setInventoryItems(next);
-    }
-    if (form.supplierId) {
-      try {
-        const current = JSON.parse(localStorage.getItem('suppliers') || '[]');
-        const list = Array.isArray(current) ? current : [];
-        const idx = list.findIndex((s) => String(s.id) === String(form.supplierId));
-        if (idx >= 0) {
-          const s = list[idx];
-          const items = Array.isArray(s.items) ? s.items.slice() : [];
-          const has = items.some((x) => String(x?.name || '').trim().toLowerCase() === name.toLowerCase());
-          if (!has) items.push({ name, unit: record.unit, price: record.price });
-          list[idx] = { ...s, items };
-          localStorage.setItem('suppliers', JSON.stringify(list));
-          setSuppliers(list);
-        }
-      } catch {}
-    }
-    if (pendingItemRowIndex !== null) {
-      applyItemToRow(pendingItemRowIndex, name);
-    }
-    setShowAddItem(false);
-    setPendingItemRowIndex(null);
   };
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -310,8 +372,8 @@ const Purchases = () => {
       supplierName: supplier ? supplier.name : '',
       supplierAddress: supplier ? (supplier.address || '') : '',
       items: supplier && Array.isArray(supplier.items) && supplier.items.length>0
-        ? supplier.items.map(it => ({ item: it.name, description: '', qty: '', unit: it.unit || 'kg', price: it.price || '', tax: '', total: 0 }))
-        : [{ item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }]
+        ? supplier.items.map(it => ({ item: it.name, _custom: false, description: '', qty: '', unit: it.unit || 'kg', price: it.price || '', tax: '', total: 0 }))
+        : [{ item: '', _custom: false, description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }]
     }));
   };
   const handleItemChange = (i, field, value) => {
@@ -326,7 +388,7 @@ const Purchases = () => {
     setForm(prev => ({ ...prev, items: next }));
   };
   const addItem = () => {
-    setForm(prev => ({ ...prev, items: [...prev.items, { item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }] }));
+    setForm(prev => ({ ...prev, items: [...prev.items, { item: '', _custom: false, description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }] }));
   };
   const subtotal = form.items.reduce((sum, it)=> sum + (parseFloat(it.qty||0) * parseFloat(it.price||0)), 0);
   const taxTotal = form.items.reduce((sum, it)=> {
@@ -339,115 +401,337 @@ const Purchases = () => {
   const vendorPurchases = purchases.filter(p=>p.supplierId===form.supplierId);
   const selectedVendor = suppliers.find(s=>s.id===form.supplierId);
   const saveNewSupplier = () => {
+    if (supplierSaving) return;
     const name = (newSupplier.name || '').trim();
     if (!name) return;
-    const id = `SUP-${Date.now()}`;
-    const record = {
-      id,
-      name,
-      email: (newSupplier.email || '').trim(),
-      phone: (newSupplier.phone || '').trim(),
-      address: (newSupplier.billedFrom || '').trim(),
-      openingBalance: (newSupplier.openingBalance || '').trim(),
-      openingBalanceAsOf: (newSupplier.openingBalanceAsOf || '').trim(),
-      companyName: (newSupplier.companyName || '').trim(),
-      contactFirstName: (newSupplier.contactFirstName || '').trim(),
-      contactLastName: (newSupplier.contactLastName || '').trim(),
-      jobTitle: (newSupplier.jobTitle || '').trim(),
-      workPhone: (newSupplier.workPhone || '').trim(),
-      mobile: (newSupplier.mobile || '').trim(),
-      fax: (newSupplier.fax || '').trim(),
-      ccEmail: (newSupplier.ccEmail || '').trim(),
-      website: (newSupplier.website || '').trim(),
-      other: (newSupplier.other || '').trim(),
-      billedFrom: (newSupplier.billedFrom || '').trim(),
-      shippedFrom: (newSupplier.shippedFrom || '').trim(),
-      items: []
-    };
-    const next = [...suppliers, record];
-    localStorage.setItem('suppliers', JSON.stringify(next));
-    setSuppliers(next);
-    setForm(prev => ({ ...prev, supplierId: id, supplierName: record.name, supplierAddress: record.address || '' }));
-    setNewSupplier({
-      name: '',
-      openingBalance: '',
-      openingBalanceAsOf: new Date().toISOString().split('T')[0],
-      companyName: '',
-      contactFirstName: '',
-      contactLastName: '',
-      jobTitle: '',
-      phone: '',
-      workPhone: '',
-      mobile: '',
-      fax: '',
-      email: '',
-      ccEmail: '',
-      website: '',
-      other: '',
-      billedFrom: '',
-      shippedFrom: ''
-    });
-    setShowAddSupplier(false);
+    setSupplierSaving(true);
+    (async () => {
+      try {
+        const record = await suppliersApi.create({
+          name,
+          email: (newSupplier.email || '').trim(),
+          phone: (newSupplier.phone || '').trim(),
+          address: (newSupplier.billedFrom || '').trim(),
+          openingBalance: (newSupplier.openingBalance || '').trim(),
+          openingBalanceAsOf: (newSupplier.openingBalanceAsOf || '').trim(),
+          companyName: (newSupplier.companyName || '').trim(),
+          contactFirstName: (newSupplier.contactFirstName || '').trim(),
+          contactLastName: (newSupplier.contactLastName || '').trim(),
+          jobTitle: (newSupplier.jobTitle || '').trim(),
+          workPhone: (newSupplier.workPhone || '').trim(),
+          mobile: (newSupplier.mobile || '').trim(),
+          fax: (newSupplier.fax || '').trim(),
+          ccEmail: (newSupplier.ccEmail || '').trim(),
+          website: (newSupplier.website || '').trim(),
+          other: (newSupplier.other || '').trim(),
+          billedFrom: (newSupplier.billedFrom || '').trim(),
+          shippedFrom: (newSupplier.shippedFrom || '').trim()
+        });
+        setSuppliers((prev) => {
+          const list = Array.isArray(prev) ? prev : [];
+          return [record, ...list.filter((entry) => String(entry?.id || '') !== String(record?.id || ''))];
+        });
+        setForm((prev) => ({ ...prev, supplierId: record.id, supplierName: record.name, supplierAddress: record.address || record.billedFrom || '' }));
+        setNewSupplier({
+          name: '',
+          openingBalance: '',
+          openingBalanceAsOf: new Date().toISOString().split('T')[0],
+          companyName: '',
+          contactFirstName: '',
+          contactLastName: '',
+          jobTitle: '',
+          phone: '',
+          workPhone: '',
+          mobile: '',
+          fax: '',
+          email: '',
+          ccEmail: '',
+          website: '',
+          other: '',
+          billedFrom: '',
+          shippedFrom: ''
+        });
+        setShowAddSupplier(false);
+        setFeedback('Supplier saved');
+        window.setTimeout(() => setFeedback(''), 2200);
+      } catch (error) {
+        setFeedback(String(error?.message || 'Failed to save supplier'));
+        window.setTimeout(() => setFeedback(''), 2600);
+      } finally {
+        setSupplierSaving(false);
+      }
+    })();
   };
-  const savePurchase = () => {
+  const savePurchase = async () => {
     const isEdit = Boolean(editingPurchaseId);
     try {
-      const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-      const list = Array.isArray(existing) ? existing : [];
-      const map = new Map(list.map((x) => [String(x?.name || '').trim().toLowerCase(), x]));
-      (form.items || []).forEach((it) => {
-        const name = String(it?.item || '').trim();
-        if (!name) return;
-        const key = name.toLowerCase();
-        if (map.has(key)) return;
-        map.set(key, {
-          id: `ITEM-${Date.now()}-${Math.random()}`,
-          name,
-          unit: String(it?.unit || 'kg'),
-          price: parseFloat(it?.price || '0') || 0,
-          createdAt: new Date().toISOString()
-        });
+      const toNum = (v) => {
+        const n = parseFloat(String(v ?? '').replace(/,/g, ''));
+        return Number.isFinite(n) ? n : 0;
+      };
+      const norm = (s) => String(s || '').trim();
+      const normKey = (s) => norm(s).toLowerCase();
+      const supplierName =
+        String(form.supplierName || '').trim() ||
+        String((suppliers || []).find((s) => String(s.id) === String(form.supplierId))?.name || '').trim() ||
+        undefined;
+
+      const resolvedDestination = String(form.destination || 'stock').trim().toLowerCase() === 'store' ? 'store' : 'stock';
+      const purchaseId = String(isEdit ? editingPurchaseId : `PUR-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+      const existingPurchase = isEdit ? (Array.isArray(purchases) ? purchases : []).find((p) => String(p?.id || '') === String(editingPurchaseId)) : null;
+      if (isEdit && existingPurchase?.persisted) {
+        setFeedback('Editing synced backend purchases is not supported yet.');
+        window.setTimeout(() => setFeedback(''), 2600);
+        return;
+      }
+
+      const existingByName = new Map();
+      (Array.isArray(inventoryItems) ? inventoryItems : []).forEach((it) => {
+        const name = norm(it?.name || it?.itemName || '');
+        const key = normKey(name);
+        if (!key) return;
+        if (!existingByName.has(key)) existingByName.set(key, it);
       });
-      const nextItems = Array.from(map.values());
-      localStorage.setItem('inventoryItems', JSON.stringify(nextItems));
-      setInventoryItems(nextItems);
-    } catch {}
-    const record = { id: isEdit ? editingPurchaseId : Date.now(), ...form, subtotal, taxTotal, total: grandTotal };
-    const next = (() => {
-      const list = Array.isArray(purchases) ? purchases.slice() : [];
-      if (!isEdit) return [...list, record];
-      const idx = list.findIndex((p) => String(p?.id) === String(editingPurchaseId));
-      if (idx >= 0) {
-        list[idx] = record;
-        return list;
-      }
-      return [...list, record];
-    })();
-    localStorage.setItem('purchases', JSON.stringify(next));
-    setPurchases(next);
-    try {
+
+      const computeCategory = (name) => {
+        const it = existingByName.get(normKey(name));
+        const c = String(it?.category || it?.itemType || 'general').trim() || 'general';
+        return c;
+      };
+
+      const cleanedItems = (Array.isArray(form.items) ? form.items : [])
+        .map((it) => {
+          const itemName = norm(it?.item || it?.name || it?.itemName || '');
+          const unit = norm(it?.unit || 'kg') || 'kg';
+          const qty = toNum(it?.qty);
+          const price = toNum(it?.price);
+          const tax = toNum(it?.tax);
+          const lineAmount = qty * price;
+          const lineTax = (lineAmount * tax) / 100;
+          const total = lineAmount + lineTax;
+          const category = norm(it?.category || it?.itemType || computeCategory(itemName) || 'general') || 'general';
+          return {
+            productId: norm(it?.productId || existingByName.get(normKey(itemName))?.id || ''),
+            item: itemName,
+            _custom: Boolean(it?._custom),
+            description: norm(it?.description || ''),
+            qty: String(qty),
+            unit,
+            price: String(price),
+            tax: String(tax),
+            total: String(total.toFixed(2)),
+            category
+          };
+        })
+        .filter((it) => it.item);
+
+      const subtotalLocal = cleanedItems.reduce((sum, it) => sum + toNum(it.qty) * toNum(it.price), 0);
+      const taxTotalLocal = cleanedItems.reduce((sum, it) => sum + ((toNum(it.qty) * toNum(it.price) * toNum(it.tax)) / 100), 0);
+      const grandTotalLocal = subtotalLocal + taxTotalLocal;
+
+      let purchaseRecord = {
+        id: purchaseId,
+        lpoNumber: norm(form.lpoNumber),
+        date: norm(form.date).slice(0, 10) || new Date().toISOString().slice(0, 10),
+        supplierId: norm(form.supplierId),
+        supplierName: norm(supplierName || form.supplierName),
+        supplierAddress: norm(form.supplierAddress),
+        destination: resolvedDestination,
+        items: cleanedItems,
+        subtotal: subtotalLocal,
+        taxTotal: taxTotalLocal,
+        total: grandTotalLocal,
+        terms: norm(form.terms),
+        notes: norm(form.notes),
+        shipToName: norm(form.shipToName),
+        shipToAddress: norm(form.shipToAddress),
+        vendorMessage: norm(form.vendorMessage),
+        memo: norm(form.memo),
+        createdAt: existingPurchase?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
       if (!isEdit) {
-        const cur = parsePoNumber(form.lpoNumber) || getNextPoNumber();
-        const nextPo = (Number.isFinite(cur) ? cur : 100) + 1;
-        localStorage.setItem(PO_SEQUENCE_STORAGE_KEY, String(nextPo));
+        const resolvedItems = await productsApi.ensureForPurchaseItems(cleanedItems);
+        purchaseRecord = {
+          ...purchaseRecord,
+          items: resolvedItems
+        };
+        purchaseRecord = await purchasesApi.create({
+          ...purchaseRecord,
+          useServerNumbering: true
+        });
       }
-    } catch {}
-    try {
-      window.dispatchEvent(new CustomEvent('dataUpdated'));
-    } catch {}
-    setEditingPurchaseId(null);
-    setForm({ lpoNumber: generateLpoNumber(), date: new Date().toISOString().split('T')[0], supplierId: '', supplierName: '', supplierAddress: '', items: [{ item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }], terms: '', notes: '', shipToName: '', shipToAddress: '', vendorMessage: '', memo: '' });
+
+      try {
+        const list = Array.isArray(purchases) ? purchases : [];
+        const next = isEdit
+          ? list.map((p) => (String(p?.id || '') === String(editingPurchaseId) ? purchaseRecord : p))
+          : [purchaseRecord, ...list.filter((p) => String(p?.id || '') !== String(purchaseRecord?.id || ''))];
+        setPurchases(next);
+        if (isEdit) {
+          void setStoredJson('purchases', next).catch(() => {});
+        }
+      } catch {}
+
+      try {
+        if (purchaseRecord?.persisted) {
+          const refreshedProducts = await productsApi.list();
+          setInventoryItems(Array.isArray(refreshedProducts) ? refreshedProducts : []);
+        } else {
+          const list = Array.isArray(inventoryItems) ? inventoryItems : [];
+          const byKey = new Map(list.map((it) => [normKey(it?.name || it?.itemName || ''), it]));
+          const next = list.slice();
+          purchaseRecord.items.forEach((it) => {
+            const key = normKey(it.item);
+            if (!key) return;
+            const existing = byKey.get(key);
+            const buyingPrice = toNum(it.price);
+            if (existing) {
+              const idx = next.findIndex((x) => String(x?.id || '') === String(existing?.id || '') || normKey(x?.name || x?.itemName || '') === key);
+              if (idx >= 0) {
+                next[idx] = {
+                  ...next[idx],
+                  name: norm(next[idx]?.name || next[idx]?.itemName || it.item) || it.item,
+                  unit: norm(next[idx]?.unit || it.unit) || it.unit,
+                  category: norm(next[idx]?.category || next[idx]?.itemType || it.category) || it.category,
+                  buyingPrice,
+                  productId: norm(next[idx]?.productId || it.productId),
+                  updatedAt: new Date().toISOString()
+                };
+              }
+            } else {
+              next.push({
+                id: norm(it.productId) || `ITEM-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                productId: norm(it.productId),
+                name: it.item,
+                category: it.category || 'general',
+                unit: it.unit || 'kg',
+                buyingPrice,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              });
+            }
+          });
+          setInventoryItems(next);
+          void setStoredJson('inventoryItems', next).catch(() => {});
+        }
+      } catch {}
+
+      try {
+        const nowIso = new Date().toISOString();
+        const mkMovement = ({ movementType, itemName, qty, unit, price, category, note, referenceId }) => ({
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          quantity: String(qty),
+          unit: norm(unit) || 'kg',
+          supplier: norm(supplierName || ''),
+          pricePerItem: String(toNum(price)),
+          date: purchaseRecord.date,
+          itemType: category,
+          note: norm(note),
+          itemName: norm(itemName),
+          createdAt: nowIso,
+          referenceId: String(referenceId || purchaseId)
+        });
+
+        const reverseOld = async () => {
+          if (!existingPurchase) return;
+          const oldDest = String(existingPurchase?.destination || 'stock').trim().toLowerCase();
+          if (oldDest !== 'stock') return;
+          const oldItems = Array.isArray(existingPurchase?.items) ? existingPurchase.items : [];
+          const byKey = new Map();
+          oldItems.forEach((it) => {
+            const name = norm(it?.item || it?.name || it?.itemName || '');
+            const key = normKey(name);
+            if (!key) return;
+            const category = norm(it?.category || it?.itemType || computeCategory(name) || 'general') || 'general';
+            const qty = toNum(it?.qty);
+            const unit = norm(it?.unit || 'kg') || 'kg';
+            const price = toNum(it?.price);
+            if (qty <= 0) return;
+            if (!byKey.has(category)) byKey.set(category, []);
+            byKey.get(category).push(
+              mkMovement({
+                movementType: 'stock_out',
+                itemName: name,
+                qty,
+                unit,
+                price,
+                category,
+                note: `Purchase edit revert ${existingPurchase?.lpoNumber || ''}`.trim(),
+                referenceId: purchaseId
+              })
+            );
+          });
+
+          productsApi.appendLocalMovements(Array.from(byKey.values()).flat());
+        };
+
+        await reverseOld();
+
+        const byKey = new Map();
+        cleanedItems.forEach((it) => {
+          const category = norm(it.category || 'general') || 'general';
+          const qty = resolvedDestination === 'stock' ? toNum(it.qty) : 0;
+          const unitCost = toNum(it.price);
+          if (resolvedDestination === 'stock' && qty <= 0) return;
+          if (unitCost <= 0) return;
+          if (!byKey.has(category)) byKey.set(category, []);
+          byKey.get(category).push(
+            mkMovement({
+              movementType: 'stock_in',
+              itemName: it.item,
+              qty,
+              unit: it.unit,
+              price: unitCost,
+              category,
+              note: resolvedDestination === 'stock' ? `Purchase ${purchaseRecord.lpoNumber}`.trim() : `Store ${purchaseRecord.lpoNumber}`.trim(),
+              referenceId: purchaseId
+            })
+          );
+        });
+
+        productsApi.appendLocalMovements(Array.from(byKey.values()).flat());
+      } catch {}
+
+      try {
+        window.dispatchEvent(new CustomEvent('dataUpdated'));
+      } catch {}
+
+      try {
+        appendSystemActivity(
+          isEdit ? 'purchase_edit' : 'purchase_create',
+          isEdit ? 'Purchase updated' : 'Purchase created',
+          `${String(supplierName || 'Supplier').trim() || 'Supplier'} • ${String(purchaseRecord?.lpoNumber || form.lpoNumber || '').trim() || 'LPO'}`,
+          'Purchases',
+          'success',
+          { entityId: purchaseRecord?.id || editingPurchaseId || purchaseRecord?.lpoNumber || form.lpoNumber || null }
+        );
+      } catch {}
+
+      setFeedback(isEdit ? 'Purchase updated' : 'Purchase saved');
+      window.setTimeout(() => setFeedback(''), 2200);
+
+      const nextPurchaseNumber = await refreshNextPoNumber();
+      setEditingPurchaseId(null);
+      setForm(createEmptyPurchaseForm(nextPurchaseNumber));
+    } catch (error) {
+      setFeedback(String(error?.message || 'Failed to save purchase'));
+      window.setTimeout(() => setFeedback(''), 2600);
+    }
   };
-  const loadPurchase = (p) => {
+  const loadPurchase = useCallback((p) => {
     if (!p) return;
     setEditingPurchaseId(p.id || null);
     setForm({
-      lpoNumber: p.lpoNumber || generateLpoNumber(),
+      lpoNumber: p.lpoNumber || generateLpoNumber(nextPoNumber),
       date: p.date || new Date().toISOString().split('T')[0],
       supplierId: p.supplierId || '',
       supplierName: p.supplierName || '',
       supplierAddress: p.supplierAddress || '',
-      items: Array.isArray(p.items) && p.items.length > 0 ? p.items : [{ item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }],
+      destination: String(p.destination || 'stock'),
+      items: Array.isArray(p.items) && p.items.length > 0 ? p.items.map((it) => ({ _custom: false, ...it })) : [{ item: '', _custom: false, description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }],
       terms: p.terms || '',
       notes: p.notes || '',
       shipToName: p.shipToName || '',
@@ -456,13 +740,13 @@ const Purchases = () => {
       memo: p.memo || ''
     });
     setShowShareMenu(false);
-  };
+  }, [nextPoNumber]);
   const saveAndClose = () => {
-    savePurchase();
+    void savePurchase();
   };
   const clearForm = () => {
     setEditingPurchaseId(null);
-    setForm({ lpoNumber: generateLpoNumber(), date: new Date().toISOString().split('T')[0], supplierId: '', supplierName: '', supplierAddress: '', items: [{ item: '', description: '', qty: '', unit: 'kg', price: '', tax: '', total: 0 }], terms: '', notes: '', shipToName: '', shipToAddress: '', vendorMessage: '', memo: '' });
+    setForm(createEmptyPurchaseForm(generateLpoNumber(nextPoNumber)));
   };
 
   const confirmDeletePurchase = () => {
@@ -476,21 +760,97 @@ const Purchases = () => {
       setDeleteModal(false);
       return;
     }
+    const startedAt = Date.now();
     setDeleteLoading(true);
-    try {
-      const list = JSON.parse(localStorage.getItem('purchases') || '[]');
-      const next = (Array.isArray(list) ? list : []).filter((p) => String(p?.id) !== String(purchaseId));
-      localStorage.setItem('purchases', JSON.stringify(next));
-      setPurchases(next);
+    (async () => {
       try {
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
-    } catch {}
-    setDeleteLoading(false);
-    setDeleteModal(false);
-    setEditingPurchaseId(null);
-    clearForm();
-    navigate('/purchases/history');
+        const list = Array.isArray(purchases) ? purchases : [];
+        const deleted = list.find((p) => String(p?.id) === String(purchaseId)) || null;
+        await purchasesApi.remove(purchaseId);
+        const next = list.filter((p) => String(p?.id) !== String(purchaseId));
+        setPurchases(next);
+        try {
+          if (deleted?.persisted) {
+            const refreshedProducts = await productsApi.list();
+            setInventoryItems(Array.isArray(refreshedProducts) ? refreshedProducts : []);
+          } else {
+            const toNum = (v) => {
+              const n = parseFloat(String(v ?? '').replace(/,/g, ''));
+              return Number.isFinite(n) ? n : 0;
+            };
+            const norm = (s) => String(s || '').trim();
+            const normKey = (s) => norm(s).toLowerCase();
+            const dest = String(deleted?.destination || 'stock').trim().toLowerCase();
+            if (dest === 'stock') {
+              const inv = Array.isArray(inventoryItems) ? inventoryItems : [];
+              const existingByName = new Map();
+              inv.forEach((it) => {
+                const name = norm(it?.name || it?.itemName || '');
+                const key = normKey(name);
+                if (!key) return;
+                if (!existingByName.has(key)) existingByName.set(key, it);
+              });
+              const computeCategory = (name) => {
+                const it = existingByName.get(normKey(name));
+                const c = String(it?.category || it?.itemType || 'general').trim() || 'general';
+                return c;
+              };
+              const nowIso = new Date().toISOString();
+              const byKey = new Map();
+              const items = Array.isArray(deleted?.items) ? deleted.items : [];
+              items.forEach((it) => {
+                const name = norm(it?.item || it?.name || it?.itemName || '');
+                const qty = toNum(it?.qty);
+                if (!name || qty <= 0) return;
+                const unit = norm(it?.unit || 'kg') || 'kg';
+                const price = toNum(it?.price);
+                const category = norm(it?.category || it?.itemType || computeCategory(name) || 'general') || 'general';
+                if (!byKey.has(category)) byKey.set(category, []);
+                byKey.get(category).push({
+                  id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                  quantity: String(qty),
+                  unit,
+                  supplier: norm(deleted?.supplierName || ''),
+                  pricePerItem: String(price),
+                  date: norm(deleted?.date).slice(0, 10) || new Date().toISOString().slice(0, 10),
+                  itemType: category,
+                  note: `Purchase deleted ${norm(deleted?.lpoNumber || '')}`.trim(),
+                  itemName: name,
+                  createdAt: nowIso,
+                  referenceId: String(purchaseId || '')
+                });
+              });
+
+              productsApi.appendLocalMovements(Array.from(byKey.values()).flat());
+            }
+          }
+        } catch {}
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+        try {
+          appendSystemActivity(
+            'purchase_delete',
+            'Purchase deleted',
+            `${String(deleted?.supplierName || deleted?.supplier || 'Purchase').trim() || 'Purchase'} • ${String(deleted?.lpoNumber || deleted?.purchaseId || purchaseId || '').trim()}`,
+            'Purchases',
+            'warning',
+            { entityId: purchaseId }
+          );
+        } catch {}
+      } catch (error) {
+        setFeedback(String(error?.message || 'Unable to delete purchase.'));
+        window.setTimeout(() => setFeedback(''), 3200);
+      }
+      const elapsed = Date.now() - startedAt;
+      const remaining = 5000 - elapsed;
+      if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+      setDeleteLoading(false);
+      setDeleteModal(false);
+      setEditingPurchaseId(null);
+      clearForm();
+      navigate('/purchases/history');
+    })();
   };
 
   useEffect(() => {
@@ -502,7 +862,7 @@ const Purchases = () => {
       loadPurchase(found);
       navigate('/purchases', { replace: true });
     }
-  }, [location.search, purchases, navigate]);
+  }, [location.search, purchases, navigate, loadPurchase]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -523,6 +883,11 @@ const Purchases = () => {
 
   return (
     <div className="space-y-6">
+      {feedback ? (
+        <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+          {feedback}
+        </div>
+      ) : null}
       <ConfirmDeleteModal
         open={deleteModal}
         title="Delete Purchase Order?"
@@ -567,11 +932,11 @@ const Purchases = () => {
         ) : null}
       </div>
       {showAddSupplier && (
-        <div className="fixed inset-0 bg-gray-900 bg-opacity-60 flex items-center justify-center z-50">
-          <div className="bg-white border border-gray-200 rounded-xl shadow-lg w-11/12 md:w-[900px] overflow-hidden">
+        <div className="fixed inset-0 bg-transparent flex items-center justify-center z-50">
+          <div className="bg-white border border-gray-200 rounded-xl w-11/12 md:w-[900px] overflow-hidden">
             <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between">
               <div className="text-gray-900 font-semibold">Add New Supplier</div>
-              <button className="text-sm text-gray-600 hover:text-gray-900" onClick={()=>setShowAddSupplier(false)}>Close</button>
+              <button className={supplierSaving ? 'text-sm text-gray-400 cursor-not-allowed' : 'text-sm text-gray-600 hover:text-gray-900'} onClick={() => (supplierSaving ? null : setShowAddSupplier(false))}>Close</button>
             </div>
             <div className="p-5 space-y-4">
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
@@ -657,47 +1022,32 @@ const Purchases = () => {
                 </div>
               </div>
               <div className="flex justify-end gap-2 pt-2">
-                <button type="button" className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={()=>{ setNewSupplier({ name: '', openingBalance: '', openingBalanceAsOf: new Date().toISOString().split('T')[0], companyName: '', contactFirstName: '', contactLastName: '', jobTitle: '', phone: '', workPhone: '', mobile: '', fax: '', email: '', ccEmail: '', website: '', other: '', billedFrom: '', shippedFrom: '' }); setShowAddSupplier(false); }}>Cancel</button>
-                <button type="button" className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={saveNewSupplier}>Save Supplier</button>
+                <button
+                  type="button"
+                  className={supplierSaving ? 'px-4 py-2 rounded-lg border border-gray-300 text-gray-500 bg-gray-50 cursor-not-allowed' : 'px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100'}
+                  disabled={supplierSaving}
+                  onClick={() => {
+                    if (supplierSaving) return;
+                    setNewSupplier({ name: '', openingBalance: '', openingBalanceAsOf: new Date().toISOString().split('T')[0], companyName: '', contactFirstName: '', contactLastName: '', jobTitle: '', phone: '', workPhone: '', mobile: '', fax: '', email: '', ccEmail: '', website: '', other: '', billedFrom: '', shippedFrom: '' });
+                    setShowAddSupplier(false);
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className={supplierSaving ? 'px-4 py-2 rounded-lg bg-green-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 inline-flex items-center gap-2'}
+                  onClick={saveNewSupplier}
+                  disabled={supplierSaving}
+                >
+                  <span>{supplierSaving ? 'Saving...' : 'Save Supplier'}</span>
+                </button>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {showAddItem && (
-        <div className="fixed inset-0 bg-gray-900 bg-opacity-60 flex items-center justify-center z-50">
-          <div className="bg-white border border-gray-200 rounded-xl shadow-lg w-11/12 md:w-[560px] overflow-hidden">
-            <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between">
-              <div className="text-gray-900 font-semibold">Add New Item</div>
-              <button className="text-sm text-gray-600 hover:text-gray-900" onClick={()=>{ setShowAddItem(false); setPendingItemRowIndex(null); }}>Close</button>
-            </div>
-            <div className="p-5 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Item Name</label>
-                <input value={newItem.name} onChange={(e)=>setNewItem(prev=>({ ...prev, name: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 rounded-lg" placeholder="Item name" />
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Unit</label>
-                  <select value={newItem.unit} onChange={(e)=>setNewItem(prev=>({ ...prev, unit: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 rounded-lg">
-                    {units.map((u)=> <option key={u} value={u}>{u}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Default Rate</label>
-                  <input type="number" value={newItem.price} onChange={(e)=>setNewItem(prev=>({ ...prev, price: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 rounded-lg" placeholder="0" />
-                </div>
-              </div>
-              <div className="flex justify-end gap-2 pt-2">
-                <button type="button" className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={()=>{ setShowAddItem(false); setPendingItemRowIndex(null); }}>Cancel</button>
-                <button type="button" className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={saveNewItem}>Save Item</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      
       <div className="bg-white border border-gray-200 rounded-xl">
         <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
           <div className="text-gray-900 font-semibold">Purchase Order</div>
@@ -771,7 +1121,7 @@ const Purchases = () => {
           </div>
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px]">
-          <div className="p-6">
+          <div className="p-4">
             <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 mb-4">
               <div className="grid grid-cols-4 gap-4 items-start">
                 <div className="col-span-3">
@@ -796,27 +1146,34 @@ const Purchases = () => {
                 </div>
             </div>
             </div>
-            <div className="grid grid-cols-12 gap-4 items-start mb-6">
+            <div className="grid grid-cols-12 gap-4 items-start mb-4">
               <div className="col-span-6"></div>
               <div className="col-span-3">
                 <label className="block text-xs font-medium text-gray-500 mb-1">Vendor</label>
-                <textarea name="supplierAddress" value={form.supplierAddress} onChange={handleChange} className="w-full px-3 py-2 border rounded-lg text-sm h-20" placeholder="Vendor address" />
+                <textarea name="supplierAddress" value={form.supplierAddress} onChange={handleChange} className="w-full px-3 py-2 border rounded-lg text-sm h-14" placeholder="Vendor address" />
               </div>
               <div className="col-span-3">
                 <label className="block text-xs font-medium text-gray-500 mb-1">Ship To</label>
-                <textarea name="shipToAddress" value={form.shipToAddress} onChange={handleChange} className="w-full px-3 py-2 border rounded-lg text-sm h-20" placeholder="Shipping address" />
+                <textarea name="shipToAddress" value={form.shipToAddress} onChange={handleChange} className="w-full px-3 py-2 border rounded-lg text-sm h-14" placeholder="Shipping address" />
               </div>
             </div>
             <div className="bg-white border border-gray-200 rounded-xl">
               <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <div className="text-gray-900 font-semibold">ITEMS</div>
-                <button className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2" onClick={addItem}>
-                  <Plus className="w-4 h-4" />
-                  <span className="text-sm">Add Line</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  <div className="text-sm text-gray-600">Receive to</div>
+                  <select name="destination" value={form.destination} onChange={handleChange} className="px-3 py-2 border border-gray-300 rounded-lg bg-white text-sm">
+                    <option value="stock">Stock In</option>
+                    <option value="store">Store</option>
+                  </select>
+                  <button className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2" onClick={addItem}>
+                    <Plus className="w-4 h-4" />
+                    <span className="text-sm">Add Line</span>
+                  </button>
+                </div>
               </div>
-              <div className="p-4 overflow-auto">
-                <table className="min-w-[980px] w-full table-fixed border-collapse border border-gray-200">
+              <div className="p-4 overflow-x-hidden">
+                <table className="w-full table-fixed border-collapse border border-gray-200">
                   <thead>
                     <tr className="bg-gray-50">
                       <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-center w-1/12 border border-gray-200">No.</th>
@@ -836,20 +1193,24 @@ const Purchases = () => {
                         <td className="px-3 py-2 border border-gray-200">
                           <select
                             className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none"
-                            value={it.item}
+                            value={it._custom ? '__other__' : it.item}
                             onChange={(e)=>{
                               const v = e.target.value;
-                              if (v === '__add_new_item__') {
-                                openAddItemForRow(i);
-                                return;
-                              }
                               applyItemToRow(i, v);
                             }}
                           >
                             <option value="">Select item</option>
-                            <option value="__add_new_item__">+ Add new item</option>
+                            <option value="__other__">Other product</option>
                             {itemCatalog.map((x)=> <option key={x.name} value={x.name}>{x.name}</option>)}
                           </select>
+                          {it._custom ? (
+                            <input
+                              className="mt-1 w-full px-2 py-1 text-sm bg-transparent focus:outline-none border-t border-gray-200"
+                              value={it.item}
+                              onChange={(e) => handleItemChange(i, 'item', e.target.value)}
+                              placeholder="Type product name"
+                            />
+                          ) : null}
                         </td>
                         <td className="px-3 py-2 border border-gray-200">
                           <input className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={it.description} onChange={(e)=>handleItemChange(i,'description',e.target.value)} placeholder="Description" />
@@ -911,6 +1272,7 @@ const Purchases = () => {
               {editingPurchaseId && canDeleteRecords() ? (
                 <button
                   type="button"
+                  data-delete-trigger="true"
                   onClick={() => setDeleteModal(true)}
                   className="px-4 py-2 rounded-lg border border-red-200 text-red-700 hover:bg-red-50 inline-flex items-center gap-2 mr-auto"
                 >
@@ -919,8 +1281,52 @@ const Purchases = () => {
                 </button>
               ) : null}
               <button type="button" onClick={clearForm} className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100">Clear</button>
-              <button type="button" onClick={savePurchase} className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Save & New</button>
-              <button type="button" onClick={saveAndClose} className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700">Save & Close</button>
+              <button
+                type="button"
+                disabled={!!saveLoading}
+                onClick={async () => {
+                  if (saveLoading) return;
+                  setSaveLoading('new');
+                  try {
+                    await withMinimumDelay(async () => {
+                      await savePurchase();
+                    }, 5000);
+                  } finally {
+                    setSaveLoading('');
+                  }
+                }}
+                className={
+                  saveLoading
+                    ? 'px-4 py-2 rounded-lg bg-blue-600/70 text-white cursor-not-allowed inline-flex items-center gap-2'
+                    : 'px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-2'
+                }
+              >
+                {saveLoading === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                <span>{saveLoading === 'new' ? 'Saving...' : 'Save & New'}</span>
+              </button>
+              <button
+                type="button"
+                disabled={!!saveLoading}
+                onClick={async () => {
+                  if (saveLoading) return;
+                  setSaveLoading('close');
+                  try {
+                    await withMinimumDelay(async () => {
+                      await savePurchase();
+                    }, 5000);
+                  } finally {
+                    setSaveLoading('');
+                  }
+                }}
+                className={
+                  saveLoading
+                    ? 'px-4 py-2 rounded-lg bg-green-600/70 text-white cursor-not-allowed inline-flex items-center gap-2'
+                    : 'px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 inline-flex items-center gap-2'
+                }
+              >
+                {saveLoading === 'close' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                <span>{saveLoading === 'close' ? 'Saving...' : 'Save & Close'}</span>
+              </button>
             </div>
           </div>
           <div className="border-l border-gray-200 bg-gray-50 p-5">

@@ -1,6 +1,55 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search, MoreVertical, Printer, Upload } from 'lucide-react';
+import { purchasesApi, suppliersApi } from '../services/purchasingApi';
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    void safeJsonParse;
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    void safeJsonParse;
+    const k = String(key || '');
+    if (!k) return false;
+    let ok = false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+      ok = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (ok && !options?.silent) {
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      }
+    }
+  }
+};
+// eslint-disable-next-line no-unused-vars
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+// eslint-disable-next-line no-unused-vars
+const setStoredJson = (key, value) => Promise.resolve(localStore.set(key, value));
+const supplierIdFromName = (name) => {
+  const s = String(name || '').trim().toLowerCase();
+  if (!s) return '';
+  return s.replace(/\s+/g, '_').replace(/[^a-z0-9_]+/g, '').slice(0, 60) || s.slice(0, 60);
+};
 const Suppliers = () => {
   const [suppliers, setSuppliers] = useState([]);
   const [purchases, setPurchases] = useState([]);
@@ -8,16 +57,68 @@ const Suppliers = () => {
   const [sortKey, setSortKey] = useState('vendor_asc');
   const [selectedIds, setSelectedIds] = useState([]);
   const [openMenuId, setOpenMenuId] = useState(null);
+  const [feedback, setFeedback] = useState('');
   const navigate = useNavigate();
   useEffect(() => {
-    const saved = JSON.parse(localStorage.getItem('suppliers') || '[]');
-    setSuppliers(saved);
-    try {
-      const savedPurchases = JSON.parse(localStorage.getItem('purchases') || '[]');
-      setPurchases(Array.isArray(savedPurchases) ? savedPurchases : []);
-    } catch {
-      setPurchases([]);
-    }
+    let alive = true;
+    const load = () => {
+      Promise.resolve()
+        .then(async () => {
+          const [savedSuppliers, purchaseOrders] = await Promise.all([
+            suppliersApi.list(),
+            purchasesApi.list()
+          ]);
+          if (!alive) return;
+          const stored = Array.isArray(savedSuppliers) ? savedSuppliers : [];
+          const orders = Array.isArray(purchaseOrders) ? purchaseOrders : [];
+          const ordersWithSupplierId = orders.map((p) => ({ ...p, supplierId: p?.supplierId || supplierIdFromName(p?.supplierName) }));
+          setPurchases(ordersWithSupplierId);
+
+          const byId = new Map(stored.map((s) => [String(s?.id || ''), s]));
+          const byName = new Map(stored.map((s) => [String(s?.name || s?.companyName || '').trim().toLowerCase(), s]));
+          const derived = Array.from(
+            new Map(
+              ordersWithSupplierId
+                .map((p) => {
+                  const supplierName = String(p?.supplierName || '').trim();
+                  const supplierId = String(p?.supplierId || supplierIdFromName(supplierName));
+                  return supplierName ? [supplierId || supplierIdFromName(supplierName), { supplierId, supplierName }] : null;
+                })
+                .filter(Boolean)
+            ).values()
+          )
+            .filter(({ supplierId, supplierName }) => {
+              const normalizedName = String(supplierName || '').trim().toLowerCase();
+              return !byId.has(String(supplierId || '')) && !byName.has(normalizedName);
+            })
+            .map(({ supplierId, supplierName }) => {
+              const nm = String(supplierName || '').trim();
+              const id = String(supplierId || supplierIdFromName(nm));
+              const prev = byId.get(id) || byName.get(nm.toLowerCase()) || null;
+              return {
+                id,
+                name: nm,
+                companyName: nm,
+                email: prev?.email || '',
+                phone: prev?.phone || '',
+                openingBalance: prev?.openingBalance ?? 0,
+                inactive: Boolean(prev?.inactive),
+                persisted: Boolean(prev?.persisted)
+              };
+            });
+          const mergedSuppliers = [...stored, ...derived].sort((left, right) => {
+            return String(left?.name || left?.companyName || '').localeCompare(String(right?.name || right?.companyName || ''));
+          });
+          setSuppliers(mergedSuppliers);
+        })
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener('dataUpdated', load);
+    return () => {
+      alive = false;
+      window.removeEventListener('dataUpdated', load);
+    };
   }, []);
   useEffect(() => {
     const onClick = (e) => {
@@ -30,7 +131,7 @@ const Suppliers = () => {
   const supplierStats = useMemo(() => {
     const map = new Map();
     (purchases || []).forEach((p) => {
-      const key = String(p?.supplierId || '');
+      const key = String(p?.supplierId || supplierIdFromName(p?.supplierName) || '');
       if (!key) return;
       if (!map.has(key)) {
         map.set(key, { poCount: 0, total: 0, lastDate: '' });
@@ -141,10 +242,19 @@ const Suppliers = () => {
   };
 
   const setSupplierInactive = (supplierId, inactive) => {
-    const next = (suppliers || []).map((s) => (String(s.id) === String(supplierId) ? { ...s, inactive: !!inactive } : s));
-    localStorage.setItem('suppliers', JSON.stringify(next));
-    setSuppliers(next);
-    setOpenMenuId(null);
+    (async () => {
+      try {
+        const updated = await suppliersApi.patch(supplierId, { inactive: !!inactive });
+        setSuppliers((prev) => (Array.isArray(prev) ? prev.map((s) => (String(s.id) === String(supplierId) ? { ...s, ...updated } : s)) : prev));
+        setFeedback(inactive ? 'Supplier marked inactive' : 'Supplier marked active');
+        window.setTimeout(() => setFeedback(''), 2200);
+      } catch (error) {
+        setFeedback(String(error?.message || 'Failed to update supplier'));
+        window.setTimeout(() => setFeedback(''), 2600);
+      } finally {
+        setOpenMenuId(null);
+      }
+    })();
   };
 
   const createBillForSupplier = (supplierId) => {
@@ -153,6 +263,11 @@ const Suppliers = () => {
 
   return (
     <div className="space-y-6">
+      {feedback ? (
+        <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+          {feedback}
+        </div>
+      ) : null}
       <div className="flex items-center justify-between">
         <div className="text-sm text-gray-700">Showing: <span className="font-medium text-gray-900">{selectionLabel}</span></div>
         {selectedIds.length > 0 && (

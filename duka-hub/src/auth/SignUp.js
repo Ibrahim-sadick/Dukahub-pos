@@ -1,11 +1,53 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Building2, Camera, Eye, EyeOff, KeyRound, ArrowLeft, ArrowRight, Briefcase, Phone, User } from 'lucide-react';
-import { RiShoppingCart2Line } from 'react-icons/ri';
+import { Building2, Camera, Eye, EyeOff, KeyRound, ArrowLeft, ArrowRight, Briefcase, Loader2, Phone, User } from 'lucide-react';
 import { FaGoogle, FaFacebookF } from 'react-icons/fa';
+import { checkSignupPhoneAvailability } from '../services/authApi';
+import { setSignupDraft } from '../services/signupDraft';
+import { sendOtp } from '../services/otpService';
+
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const readJson = (key, fallback) => {
+  try {
+    return safeJsonParse(window.localStorage.getItem(String(key || '')), fallback);
+  } catch {
+    return fallback;
+  }
+};
+
+const writeJson = (key, value) => {
+  try {
+    window.localStorage.setItem(String(key || ''), JSON.stringify(value));
+  } catch {}
+};
+
+const removeKey = (key) => {
+  try {
+    window.localStorage.removeItem(String(key || ''));
+  } catch {}
+};
+
+const ensureMinimumLoadingTime = async (startedAt, minimumMs = 5000) => {
+  const elapsed = Date.now() - Number(startedAt || 0);
+  const remaining = Math.max(0, Number(minimumMs || 0) - elapsed);
+  if (!remaining) return;
+  await new Promise((resolve) => setTimeout(resolve, remaining));
+};
 
 const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   const navigate = useNavigate();
+  const isEmbedded = layout === 'embedded';
+  const logoSrc = React.useMemo(() => {
+    const base = String(process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
+    return encodeURI(`${base}/favicon-96x96.png`);
+  }, []);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [formData, setFormData] = useState({
     companyName: '',
@@ -32,6 +74,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   const [step, setStep] = useState(1);
   const [renderedStep, setRenderedStep] = useState(1);
   const [slide, setSlide] = useState({ status: 'idle', direction: 'forward', visible: true });
+  const [sendOtpPhase, setSendOtpPhase] = useState('idle');
   const slideTimerRef = useRef(null);
   const afterStepChangeRef = useRef(null);
   const [otpCode, setOtpCode] = useState('');
@@ -43,6 +86,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   const [logoPreview, setLogoPreview] = useState('');
   const [profilePreview, setProfilePreview] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  // eslint-disable-next-line no-unused-vars
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [cropOpen, setCropOpen] = useState(false);
   const [cropSrc, setCropSrc] = useState('');
@@ -52,12 +96,6 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   const [cropNatural, setCropNatural] = useState({ w: 0, h: 0 });
   const cropImgRef = useRef(null);
   const cropDragRef = useRef({ startX: 0, startY: 0, startOffsetX: 0, startOffsetY: 0 });
-
-  const delayToFiveSeconds = async (startedAt) => {
-    const elapsed = Date.now() - startedAt;
-    const remaining = 5000 - elapsed;
-    if (remaining > 0) await new Promise((r) => setTimeout(r, remaining));
-  };
 
   const handleLogoUpload = (e) => {
     const file = e.target.files[0];
@@ -111,38 +149,6 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
     return () => {
       if (slideTimerRef.current) clearTimeout(slideTimerRef.current);
     };
-  }, []);
-
-  useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem('signupDraft');
-      if (!raw) return;
-      const draft = JSON.parse(raw);
-      if (draft?.formData) {
-        setFormData((prev) => {
-          const next = { ...prev, ...draft.formData };
-          const existingFirst = String(next.firstName || '').trim();
-          const existingLast = String(next.lastName || '').trim();
-          const full = String(next.fullName || '').trim();
-          if ((!existingFirst || !existingLast) && full) {
-            const parts = full.split(/\s+/).filter(Boolean);
-            const firstName = existingFirst || String(parts[0] || '').trim();
-            const lastName = existingLast || String(parts.slice(1).join(' ') || '').trim();
-            return { ...next, firstName, lastName };
-          }
-          return next;
-        });
-      }
-      if (typeof draft?.logoPreview === 'string') setLogoPreview(draft.logoPreview);
-      if (typeof draft?.profilePreview === 'string') setProfilePreview(draft.profilePreview);
-      if (draft?.step === 4) {
-        setStep(4);
-        setRenderedStep(4);
-      } else if (draft?.step === 3) {
-        setStep(3);
-        setRenderedStep(3);
-      }
-    } catch {}
   }, []);
 
   useEffect(() => {
@@ -237,6 +243,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
     const phoneDigits = phone.replace(/[^0-9]/g, '');
     const localDigits = String(phoneDigits.startsWith('255') ? phoneDigits.slice(3) : phoneDigits).replace(/^0+/, '');
     if (!localDigits) newErrors.phone = 'Phone number is required';
+    else if (localDigits.length !== 9) newErrors.phone = 'Enter a valid Tanzania phone number';
     if (!formData.agreeToTerms) newErrors.agreeToTerms = 'You must agree to continue';
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
@@ -282,50 +289,52 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
       alert(`Your OTP code is: ${code}`);
     } catch {}
   };*/
- const sendOtp = async () => {
+  const normalizeTzPhone255 = (raw) => {
+    const digits = String(raw || '').replace(/[^0-9]/g, '');
+    if (!digits) return '';
+    const local = (() => {
+      if (digits.startsWith('255')) return digits.slice(3);
+      if (digits.startsWith('0')) return digits.slice(1);
+      return digits;
+    })().replace(/^0+/, '');
+    if (local.length !== 9) return '';
+    if (!(local.startsWith('6') || local.startsWith('7'))) return '';
+    return `255${local}`;
+  };
 
-  const code = generateOtp();
-  setOtpResendSeconds(22);
+  const storeSignupOtp = (phone255, code) => {
+    try {
+      const key = 'signupOtpHistory';
+      const prev = readJson(key, []);
+      const list = Array.isArray(prev) ? prev : [];
+      const next = [{ phone: phone255, otp: code, sentAt: Date.now(), expiresAt: Date.now() + 10 * 60 * 1000 }, ...list].slice(0, 5);
+      writeJson(key, next);
+    } catch {}
+  };
 
-  try {
-
-    const phone = (formData.phone || '').trim();
-
-    // toa characters zisizo number
-    const phoneDigits = phone.replace(/[^0-9]/g, '');
-
-    // badilisha 07xxxxxxxx -> 2557xxxxxxxx
-    let formattedPhone = phoneDigits;
-
-    if (phoneDigits.startsWith('0')) {
-      formattedPhone = '255' + phoneDigits.slice(1);
+  const sendOtpNow = async ({ reuseCode } = {}) => {
+    const code = String(reuseCode || generateOtp() || '').trim();
+    try {
+      const phone255 = normalizeTzPhone255(formData.phone);
+      if (!phone255) {
+        setErrors((prev) => ({ ...prev, phone: 'Phone number is invalid' }));
+        return false;
+      }
+      if (!code || code.length !== 6) throw new Error('Unable to generate OTP');
+      await sendOtp({ phone: phone255, otp: code });
+      setOtpResendSeconds(30);
+      storeSignupOtp(phone255, code);
+      setErrors((prev) => ({ ...prev, otp: '' }));
+      return true;
+    } catch (err) {
+      const message = String(err?.message || 'Failed to send OTP. Please try again.');
+      setOtpCode('');
+      setOtpExpiresAt(0);
+      setOtpResendSeconds(0);
+      setErrors((prev) => ({ ...prev, otp: message }));
+      return false;
     }
-
-    if (phoneDigits.startsWith('255')) {
-      formattedPhone = phoneDigits;
-    }
-
-    const res = await fetch("https://mpira.online/api/send-otp", {
-      method: "POST",
-      headers: {
-       
-        "Content-Type": "application/json",
-         "Accept": "application/json"
-      },
-      body: JSON.stringify({
-        phone: formattedPhone,
-        otp: code
-      })
-    });
-
-    const data = await res.json();
-
-    console.log("OTP sent:", data);
-
-  } catch (error) {
-    console.error("OTP error:", error);
-  }
-};
+  };
 
   useEffect(() => {
     if (step !== 2) return;
@@ -336,23 +345,57 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
 
   const handleNextFromStep1 = async () => {
     if (isSubmitting) return;
-    const startedAt = Date.now();
     if (!validateStep1()) return;
+    const startedAt = Date.now();
+    let shouldAdvance = false;
     setIsSubmitting(true);
-    await delayToFiveSeconds(startedAt);
-    goToStep(2, {
-      afterEnter: () => {
-        sendOtp();
-        const el = otpRefs.current[0];
-        if (el && typeof el.focus === 'function') el.focus();
-        setIsSubmitting(false);
+    setSendOtpPhase('checking_backend');
+    try {
+      const availability = await checkSignupPhoneAvailability({ phone: formData.phone });
+      if (!availability?.available) {
+        setErrors((prev) => ({
+          ...prev,
+          phone: String(availability?.message || 'Phone number already exists. Please login instead.')
+        }));
+        return;
       }
-    });
+      setSendOtpPhase('sending_code');
+      const code = generateOtp();
+      const ok = await sendOtpNow({ reuseCode: code });
+      if (!ok) return;
+      shouldAdvance = true;
+    } catch (error) {
+      setErrors((prev) => ({
+        ...prev,
+        phone: String(error?.message || 'Unable to verify this phone number right now.')
+      }));
+    } finally {
+      await ensureMinimumLoadingTime(startedAt, 5000);
+      if (shouldAdvance) {
+        goToStep(2, {
+          afterEnter: () => {
+            const el = otpRefs.current[0];
+            if (el && typeof el.focus === 'function') el.focus();
+          }
+        });
+      }
+      setSendOtpPhase('idle');
+      setIsSubmitting(false);
+    }
   };
 
-  const handleVerifyOtp = async () => {
+  const handleVerifyOtp = async (valueOverride) => {
     if (isSubmitting) return;
-    const input = String(otpInput || '').trim();
+    const inputFromBoxes = (() => {
+      try {
+        return String(otpRefs.current.map((el) => String(el?.value || '')).join('') || '')
+          .replace(/[^0-9]/g, '')
+          .slice(0, 6);
+      } catch {
+        return '';
+      }
+    })();
+    const input = String(valueOverride ?? inputFromBoxes ?? otpInput ?? '').replace(/[^0-9]/g, '').slice(0, 6);
     if (input.length !== 6) {
       setErrors((prev) => ({ ...prev, otp: 'Enter the 6-digit code' }));
       return;
@@ -361,27 +404,62 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
       setErrors((prev) => ({ ...prev, otp: 'OTP expired. Please resend.' }));
       return;
     }
-    if (input !== otpCode) {
-      setErrors((prev) => ({ ...prev, otp: 'Invalid OTP' }));
+    const fallbackOtp = (() => {
+      try {
+        const saved = readJson('signupOtpHistory', []);
+        const list = Array.isArray(saved) ? saved : [];
+        const active = list
+          .filter((r) => Number(r?.expiresAt || 0) >= Date.now())
+          .map((r) => String(r?.otp || '').replace(/[^0-9]/g, '').slice(0, 6))
+          .filter((c) => c.length === 6);
+        return active;
+      } catch {
+        return [];
+      }
+    })();
+    const latest = String(otpCode || '').replace(/[^0-9]/g, '').slice(0, 6);
+    const activeOtps = Array.from(new Set([latest, ...(Array.isArray(fallbackOtp) ? fallbackOtp : [])].filter((c) => c.length === 6)));
+    if (activeOtps.length === 0) {
+      setErrors((prev) => ({ ...prev, otp: 'Please resend OTP and try again.' }));
       return;
     }
-    setErrors((prev) => ({ ...prev, otp: '' }));
+    if (!activeOtps.includes(input)) {
+      setErrors((prev) => ({ ...prev, otp: 'Incorrect OTP code. Please try again.' }));
+      return;
+    }
     try {
-      sessionStorage.setItem('prefillLoginPhone', String(formData.phone || '').trim());
+      removeKey('signupOtpHistory');
     } catch {}
-    const startedAt = Date.now();
+    setErrors((prev) => ({ ...prev, otp: '' }));
     setIsSubmitting(true);
-    await delayToFiveSeconds(startedAt);
+    await new Promise((r) => setTimeout(r, 800));
     goToStep(3);
     setIsSubmitting(false);
   };
 
+  useEffect(() => {
+    if (step !== 2) return;
+    if (!otpCode) return;
+    if (!navigator?.credentials?.get) return;
+    const ac = new AbortController();
+    Promise.resolve()
+      .then(() => navigator.credentials.get({ otp: { transport: ['sms'] }, signal: ac.signal }))
+      .then((cred) => {
+        const code = String(cred?.code || '').replace(/[^0-9]/g, '').slice(0, 6);
+        if (code.length !== 6) return;
+        setOtpInput(code);
+        setErrors((prev) => ({ ...prev, otp: '' }));
+        const el = otpRefs.current[Math.min(5, code.length)];
+        if (el && typeof el.focus === 'function') el.focus();
+      })
+      .catch(() => {});
+    return () => ac.abort();
+  }, [otpCode, step]);
+
   const handleNextFromStep3 = async () => {
     if (isSubmitting) return;
     if (!validateStep3()) return;
-    const startedAt = Date.now();
     setIsSubmitting(true);
-    await delayToFiveSeconds(startedAt);
     goToStep(4);
     setIsSubmitting(false);
   };
@@ -389,22 +467,21 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   const handleNextFromStep4 = async () => {
     if (isSubmitting) return;
     if (!validateStep4()) return;
-    const startedAt = Date.now();
     setIsSubmitting(true);
-    await delayToFiveSeconds(startedAt);
     const draft = {
       step: 4,
       formData,
+      selectedModule: 'retail_supermarket',
       logoPreview,
       profilePreview,
       otpVerified: true,
       savedAt: Date.now()
     };
-    try {
-      sessionStorage.setItem('signupDraft', JSON.stringify(draft));
-    } catch {}
     setErrors({});
-    navigate('/signup/modules');
+    try {
+      setSignupDraft(draft);
+    } catch {}
+    navigate('/signup/plan');
   };
 
   const handleSubmit = async (e) => {
@@ -422,42 +499,43 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
   })();
 
   const content = (
-    <div className={layout === 'embedded' ? '' : 'px-6 lg:px-12 py-6 lg:py-10'}>
-      <form onSubmit={handleSubmit} className={layout === 'embedded' ? 'w-full max-w-2xl mx-auto' : 'w-full max-w-2xl mx-auto'}>
+    <div className={isEmbedded ? '' : 'px-6 lg:px-12 py-6 lg:py-10'}>
+      <form onSubmit={handleSubmit} className={isEmbedded ? 'w-full max-w-xl mx-auto' : 'w-full max-w-2xl mx-auto'}>
         <div className="w-full">
-              <div className="pt-2 pb-6">
-                <div className="flex items-center gap-2">
-                  <div className={step >= 1 ? 'h-1.5 w-12 rounded-full bg-green-600' : 'h-1.5 w-12 rounded-full bg-green-100'} />
-                  <div className={step >= 2 ? 'h-1.5 w-12 rounded-full bg-green-600' : 'h-1.5 w-12 rounded-full bg-green-100'} />
-                  <div className={step >= 3 ? 'h-1.5 w-12 rounded-full bg-green-600' : 'h-1.5 w-12 rounded-full bg-green-100'} />
-                  <div className={step >= 4 ? 'h-1.5 w-12 rounded-full bg-green-600' : 'h-1.5 w-12 rounded-full bg-green-100'} />
-                </div>
-              </div>
-
-              <div className="p-5 lg:p-6">
+              <div className={isEmbedded ? 'p-3' : 'p-5 lg:p-6'}>
                 <div className={stepPanelClassName}>
                 {renderedStep === 1 && (
-                  <div className="space-y-5">
+                  <div className={isEmbedded ? 'space-y-4' : 'space-y-5'}>
+                    <div className="flex justify-center">
+                      <img
+                        src={logoSrc}
+                        alt="DukaHub 3"
+                        className={isEmbedded ? 'h-16 w-auto max-w-full object-contain' : 'h-20 w-auto max-w-full object-contain'}
+                        onError={(e) => {
+                          e.currentTarget.src = `${String(process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '')}/favicon-96x96.png`;
+                        }}
+                      />
+                    </div>
+                    <p className="text-center -mt-1 text-sm text-gray-600">Sign up for your new account</p>
                     <div className="flex items-start gap-4">
-                      <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
-                        <Building2 className="w-6 h-6 text-green-700" />
+                      <div className={`${isEmbedded ? 'w-12 h-12' : 'w-14 h-14'} rounded-2xl bg-green-50 flex items-center justify-center`}>
+                        <Phone className="w-6 h-6 text-green-700" />
                       </div>
                       <div className="pt-1">
-                        <div className="text-xs font-semibold tracking-widest text-green-700">STEP 1 OF 4</div>
-                        <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Enter Your Phone</div>
-                        <div className="mt-2 text-sm text-gray-600">We&apos;ll send a verification code to confirm your number.</div>
+                        <div className={`${isEmbedded ? 'mt-1.5 text-xl font-extrabold' : 'mt-2 text-2xl font-extrabold'} text-gray-900 tracking-tight`}>Enter phone number</div>
+                        <div className="mt-2 text-sm text-gray-600">We’ll send a 6-digit OTP via SMS.</div>
                       </div>
                     </div>
                     <div>
                       <label className="text-sm font-semibold text-gray-900">Phone Number <span className="text-red-500">*</span></label>
-                      <div className="mt-2 flex items-center border border-green-200 rounded-2xl overflow-hidden bg-white">
-                        <div className="px-4 py-3 text-sm font-semibold text-green-700 bg-green-50 border-r border-green-200 whitespace-nowrap">TZ +255</div>
+                      <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white shadow-sm transition focus-within:ring-2 focus-within:ring-green-500 ${errors.phone ? 'border-red-300 bg-red-50/40' : 'border-green-200'}`}>
+                        <div className={`px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} text-sm font-semibold text-green-800 bg-green-50 border-r border-green-200 whitespace-nowrap`}>TZ +255</div>
                         <input
                           type="tel"
                           name="phone"
                           value={String(formData.phone || '').replace(/[^0-9]/g, '').replace(/^255/, '').replace(/^0+/, '')}
                           onChange={handleChange}
-                          className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
+                          className={`w-full px-4 ${isEmbedded ? 'py-2.5 text-base' : 'py-3 text-lg'} outline-none text-gray-900 placeholder-gray-400 font-mono tracking-wider`}
                           placeholder="7XX XXX XXX"
                           inputMode="numeric"
                         />
@@ -471,23 +549,23 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                           name="country"
                           value={formData.country}
                           onChange={handleChange}
-                          className="w-full px-4 py-3 border border-green-200 rounded-2xl bg-white text-gray-900 outline-none"
+                          className={`w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border border-green-200 rounded-2xl bg-white text-gray-900 outline-none`}
                         >
-                          <option value="Tanzania">Tanzania tz</option>
+                          <option value="Tanzania">Tanzania</option>
                         </select>
                       </div>
                     </div>
                     <div className="flex items-center gap-4">
                       <div className="flex-1 h-px bg-gray-200" />
-                      <div className="text-xs font-semibold tracking-widest text-gray-500">OR SIGN UP WITH</div>
+                      <div className="text-xs font-semibold tracking-widest text-gray-500">OR</div>
                       <div className="flex-1 h-px bg-gray-200" />
                     </div>
                     <div className="grid grid-cols-2 gap-4">
-                      <button type="button" className="w-full py-3 rounded-2xl border border-gray-200 bg-white hover:bg-gray-50 font-semibold text-gray-900 flex items-center justify-center gap-2">
-                        <FaGoogle />
+                      <button type="button" className={`w-full ${isEmbedded ? 'py-2.5 text-sm' : 'py-3'} rounded-2xl border border-gray-200 bg-white hover:bg-gray-50 font-semibold text-gray-900 flex items-center justify-center gap-2`}>
+                        <FaGoogle className="text-[#EA4335]" />
                         <span>Google</span>
                       </button>
-                      <button type="button" className="w-full py-3 rounded-2xl border border-gray-200 bg-white hover:bg-gray-50 font-semibold text-gray-900 flex items-center justify-center gap-2">
+                      <button type="button" className={`w-full ${isEmbedded ? 'py-2.5 text-sm' : 'py-3'} rounded-2xl border border-gray-200 bg-white hover:bg-gray-50 font-semibold text-gray-900 flex items-center justify-center gap-2`}>
                         <FaFacebookF className="text-blue-600" />
                         <span>Facebook</span>
                       </button>
@@ -495,53 +573,60 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                     <div className="flex items-start gap-3">
                       <input type="checkbox" id="agreeToTerms" name="agreeToTerms" checked={formData.agreeToTerms} onChange={handleChange} className="h-5 w-5 text-green-600 focus:ring-green-500 border-gray-300 rounded mt-0.5" />
                       <label htmlFor="agreeToTerms" className="text-sm text-gray-700">
-                        By continuing, I agree to the{' '}
-                        <a href="/terms" className="text-green-700 underline">Terms of Service</a> and{' '}
-                        <a href="/privacy" className="text-green-700 underline">Privacy Policy</a>
+                        I agree to{' '}
+                        <a href="/terms" className="text-green-700 underline">Terms</a> and{' '}
+                        <a href="/privacy" className="text-green-700 underline">Privacy</a>
                       </label>
                     </div>
                     {errors.agreeToTerms ? <div className="text-red-600 text-sm -mt-2">{errors.agreeToTerms}</div> : null}
-                    <button type="button" className="w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold" onClick={handleNextFromStep1} disabled={isSubmitting}>
-                      {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
-                      <span>Send OTP Code</span>
-                      <ArrowRight className="w-5 h-5" />
+                    <button type="button" className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 font-semibold`} onClick={handleNextFromStep1} disabled={isSubmitting}>
+                      {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin" /> : <ArrowRight className="w-5 h-5" />}
+                      <span>{sendOtpPhase === 'checking_backend' ? 'Checking number...' : sendOtpPhase === 'sending_code' ? 'Sending code...' : 'Send Code'}</span>
                     </button>
+                    {errors.otp ? (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                        {errors.otp}
+                      </div>
+                    ) : null}
                   </div>
                 )}
 
                 {renderedStep === 2 && (
-                  <div className="space-y-8">
+                  <div className={isEmbedded ? 'space-y-6' : 'space-y-8'}>
+                    <div className="flex justify-center">
+                      <img
+                        src={logoSrc}
+                        alt="DukaHub 3"
+                        className={isEmbedded ? 'h-16 w-auto max-w-full object-contain' : 'h-20 w-auto max-w-full object-contain'}
+                        onError={(e) => {
+                          e.currentTarget.src = `${String(process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '')}/favicon-96x96.png`;
+                        }}
+                      />
+                    </div>
+                    <p className="text-center -mt-1 text-sm text-gray-600">Sign up for your new account</p>
                     <div className="flex items-start gap-4">
-                      <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
+                      <div className={`${isEmbedded ? 'w-12 h-12' : 'w-14 h-14'} rounded-2xl bg-green-50 flex items-center justify-center`}>
                         <KeyRound className="w-6 h-6 text-green-700" />
                       </div>
                       <div className="pt-1">
-                        <div className="text-xs font-semibold tracking-widest text-green-700">STEP 2 OF 4</div>
-                        <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Verify OTP Code</div>
+                        <div className={`${isEmbedded ? 'mt-1.5 text-xl font-extrabold' : 'mt-2 text-2xl font-extrabold'} text-gray-900 tracking-tight`}>OTP verification</div>
                         <div className="mt-2 text-sm text-gray-600">
-                          Enter the 6-digit code sent to{' '}
-                          <span className="text-green-700 font-semibold">
-                            +255{' '}
-                            {(() => {
-                              const phoneDigits = String(formData.phone || '').replace(/[^0-9]/g, '');
-                              const local = phoneDigits.startsWith('255') ? phoneDigits.slice(3) : phoneDigits;
-                              if (!local) return '7XX XXX XXX';
-                              const first = local.slice(0, 1) || '7';
-                              return `${first}XX XXX XXX`;
-                            })()}
-                          </span>
+                          Enter the 6-digit code sent to <span className="font-semibold text-gray-900">+255 {String(formData.phone || '').replace(/[^0-9]/g, '').replace(/^255/, '').replace(/^0+/, '')}</span>
                         </div>
                       </div>
                     </div>
 
                     <div
-                      className="grid grid-cols-6 gap-3"
+                      className="grid grid-cols-6 gap-2 sm:gap-3"
                       onPaste={(e) => {
                         const pasted = String(e.clipboardData?.getData('text') || '').replace(/[^0-9]/g, '').slice(0, 6);
                         if (!pasted) return;
                         e.preventDefault();
                         setOtpInput(pasted);
                         setErrors((prev) => ({ ...prev, otp: '' }));
+                        if (pasted.length === 6) {
+                          void handleVerifyOtp(pasted);
+                        }
                         const idx = Math.min(5, pasted.length);
                         const el = otpRefs.current[idx];
                         if (el && typeof el.focus === 'function') el.focus();
@@ -569,6 +654,9 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                             const merged = next.join('').replace(/\s/g, '').slice(0, 6);
                             setOtpInput(merged);
                             setErrors((prev) => ({ ...prev, otp: '' }));
+                            if (merged.length === 6) {
+                              void handleVerifyOtp(merged);
+                            }
                             const el = otpRefs.current[Math.min(5, i + 1)];
                             if (el && typeof el.focus === 'function') el.focus();
                           }}
@@ -578,7 +666,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                               if (el && typeof el.focus === 'function') el.focus();
                             }
                           }}
-                          className={`h-14 w-full rounded-2xl border text-center text-xl font-semibold outline-none focus:ring-2 focus:ring-green-500 ${
+                          className={`${isEmbedded ? 'h-12 text-xl' : 'h-14 text-2xl'} w-full rounded-2xl border text-center font-mono font-extrabold tracking-widest outline-none shadow-sm transition focus:ring-2 focus:ring-green-500 ${
                             errors.otp ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
                           }`}
                           inputMode="numeric"
@@ -587,6 +675,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                       ))}
                     </div>
                     {errors.otp ? <div className="text-red-600 text-sm -mt-4">{errors.otp}</div> : null}
+                    <div className="text-center text-xs text-gray-500 -mt-2">Tip: you can paste the full code.</div>
 
                     <div className="text-center text-sm text-gray-600">
                       Didn&apos;t receive code?{' '}
@@ -596,7 +685,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                         disabled={otpResendSeconds > 0 || isSubmitting}
                         onClick={() => {
                           if (otpResendSeconds > 0) return;
-                          sendOtp();
+                          void sendOtpNow();
                           const el = otpRefs.current[0];
                           if (el && typeof el.focus === 'function') el.focus();
                         }}
@@ -607,17 +696,16 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
 
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 font-semibold`}
                       onClick={handleVerifyOtp}
                       disabled={isSubmitting}
                     >
-                      {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
                       <span>Verify &amp; Continue</span>
                       <ArrowRight className="w-5 h-5" />
                     </button>
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 font-semibold`}
                       onClick={() => {
                         goToStep(1);
                         setErrors({});
@@ -631,70 +719,50 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                 )}
 
                 {renderedStep === 3 && (
-                  <div className="space-y-4">
-                    <div className="flex items-start gap-4">
-                      <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
-                        <User className="w-6 h-6 text-green-700" />
-                      </div>
-                      <div className="pt-1">
-                        <div className="text-xs font-semibold tracking-widest text-green-700">STEP 3 OF 4</div>
-                        <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Your Profile</div>
-                        <div className="mt-2 text-sm text-gray-600">Tell us a little about yourself to personalise your account.</div>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-6">
+                  <div className="space-y-5">
+                    <div className="flex flex-col items-center text-center">
                       <div className="relative">
-                        <div className="w-20 h-20 rounded-full bg-green-50 border border-green-200 flex items-center justify-center overflow-hidden">
+                        <div className={`${isEmbedded ? 'w-24 h-24' : 'w-28 h-28'} rounded-full bg-gray-100 border-4 border-white shadow-md flex items-center justify-center overflow-hidden`}>
                           {profilePreview ? (
                             <img src={profilePreview} alt="Profile" className="w-full h-full object-cover" />
                           ) : (
-                            <Camera className="w-7 h-7 text-green-700" />
+                            <User className="w-12 h-12 text-gray-500" />
                           )}
                         </div>
-                        <label className="absolute -bottom-2 -right-2 w-9 h-9 rounded-full bg-green-600 text-white flex items-center justify-center cursor-pointer shadow-md">
+                        <label className="absolute bottom-1 right-0 w-10 h-10 rounded-full bg-teal-700 text-white flex items-center justify-center cursor-pointer shadow-md hover:bg-teal-800 transition">
                           <Camera className="w-4 h-4" />
                           <input type="file" accept="image/*" onChange={handleProfileUpload} className="hidden" />
                         </label>
                       </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-green-700">Upload profile photo</div>
-                        <div className="text-sm text-gray-600">JPG or PNG, max 2MB.</div>
-                        <div className="text-sm text-gray-600">Optional but recommended.</div>
-                      </div>
+                      <div className="mt-5 text-3xl font-extrabold text-gray-900 tracking-tight">Your Details</div>
+                      <div className="mt-1 text-sm text-gray-500">Let&apos;s set up your profile for a personalized experience.</div>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
-                        <label className="text-sm font-semibold text-gray-900">First Name <span className="text-red-500">*</span></label>
-                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.firstName ? 'border-red-300 bg-red-50/40' : 'border-green-200'}`}>
-                          <div className="px-4 text-gray-400">
-                            <User className="w-5 h-5" />
-                          </div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-700">First Name</label>
+                        <div className={`mt-2 border rounded-2xl overflow-hidden bg-white ${errors.firstName ? 'border-red-300 bg-red-50/40' : 'border-gray-200'}`}>
                           <input
                             type="text"
                             name="firstName"
                             value={formData.firstName}
                             onChange={handleChange}
-                            className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
-                            placeholder="e.g. Amani"
+                            className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} outline-none text-gray-900 placeholder-gray-400`}
+                            placeholder="e.g. Julian"
                           />
                         </div>
                         {errors.firstName ? <div className="text-red-600 text-sm mt-2">{errors.firstName}</div> : null}
                       </div>
                       <div>
-                        <label className="text-sm font-semibold text-gray-900">Last Name <span className="text-red-500">*</span></label>
-                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.lastName ? 'border-red-300 bg-red-50/40' : 'border-green-200'}`}>
-                          <div className="px-4 text-gray-400">
-                            <User className="w-5 h-5" />
-                          </div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Last Name</label>
+                        <div className={`mt-2 border rounded-2xl overflow-hidden bg-white ${errors.lastName ? 'border-red-300 bg-red-50/40' : 'border-gray-200'}`}>
                           <input
                             type="text"
                             name="lastName"
                             value={formData.lastName}
                             onChange={handleChange}
-                            className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
-                            placeholder="e.g. Juma"
+                            className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} outline-none text-gray-900 placeholder-gray-400`}
+                            placeholder="e.g. Marston"
                           />
                         </div>
                         {errors.lastName ? <div className="text-red-600 text-sm mt-2">{errors.lastName}</div> : null}
@@ -702,91 +770,26 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                     </div>
 
                     <div>
-                      <label className="text-sm font-semibold text-gray-900">Phone Number (Verified)</label>
-                      <div className="mt-2 flex items-center border border-green-200 rounded-2xl overflow-hidden bg-white">
-                        <div className="px-4 py-3 text-sm font-semibold text-green-700 bg-green-50 border-r border-green-200 whitespace-nowrap flex items-center gap-2">
-                          <Phone className="w-4 h-4" />
-                          TZ +255
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Phone Number</label>
+                      <div className="mt-2 flex gap-2">
+                        <div className={`min-w-[96px] px-3 ${isEmbedded ? 'py-3' : 'py-3.5'} text-sm font-semibold text-gray-700 bg-white border border-gray-200 rounded-2xl whitespace-nowrap flex items-center justify-between gap-2`}>
+                          <span>TZ +255</span>
+                          <span className="text-gray-400">v</span>
                         </div>
                         <input
                           type="tel"
                           name="email"
                           value={String(formData.phone || '').replace(/[^0-9]/g, '').replace(/^255/, '').replace(/^0+/, '')}
                           readOnly
-                          className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
-                          placeholder="7XX XXX XXX"
+                          className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} border border-gray-200 rounded-2xl outline-none text-gray-900 placeholder-gray-400 bg-white`}
+                          placeholder="000-000-0000"
                         />
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="text-sm font-semibold text-gray-900">Password <span className="text-red-500">*</span></label>
-                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.password ? 'border-red-300' : 'border-green-200'}`}>
-                          <div className="px-4 text-gray-400">
-                            <KeyRound className="w-5 h-5" />
-                          </div>
-                          <input
-                            type={showPassword ? 'text' : 'password'}
-                            name="password"
-                            value={formData.password}
-                            onChange={handleChange}
-                            className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
-                            placeholder="Min 8 characters"
-                          />
-                          <button type="button" className="px-4 text-gray-400" onClick={() => setShowPassword((v) => !v)}>
-                            {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                          </button>
-                        </div>
-                        {errors.password ? <div className="text-red-600 text-sm mt-2">{errors.password}</div> : null}
-                      </div>
-                      <div>
-                        <label className="text-sm font-semibold text-gray-900">Confirm Password <span className="text-red-500">*</span></label>
-                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.confirmPassword ? 'border-red-300' : 'border-green-200'}`}>
-                          <div className="px-4 text-gray-400">
-                            <KeyRound className="w-5 h-5" />
-                          </div>
-                          <input
-                            type={showConfirmPassword ? 'text' : 'password'}
-                            name="confirmPassword"
-                            value={formData.confirmPassword}
-                            onChange={handleChange}
-                            className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
-                            placeholder="Repeat password"
-                          />
-                          <button type="button" className="px-4 text-gray-400" onClick={() => setShowConfirmPassword((v) => !v)}>
-                            {showConfirmPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                          </button>
-                        </div>
-                        {errors.confirmPassword ? <div className="text-red-600 text-sm mt-2">{errors.confirmPassword}</div> : null}
-                      </div>
-                    </div>
-
-                    {(() => {
-                      const password = String(formData.password || '');
-                      const lengthScore = Math.min(3, Math.floor(password.length / 4));
-                      const hasNumber = /[0-9]/.test(password) ? 1 : 0;
-                      const hasLetter = /[A-Za-z]/.test(password) ? 1 : 0;
-                      const score = Math.min(3, lengthScore + hasNumber + hasLetter);
-                      const label = score >= 3 ? 'Strong' : score >= 2 ? 'Medium' : 'Weak';
-                      const color = score >= 3 ? 'bg-green-500' : score >= 2 ? 'bg-yellow-400' : 'bg-red-400';
-                      return (
-                        <div className="-mt-2">
-                          <div className="flex items-center gap-2">
-                            <div className={`h-1.5 flex-1 rounded-full ${score >= 1 ? color : 'bg-gray-200'}`} />
-                            <div className={`h-1.5 flex-1 rounded-full ${score >= 2 ? color : 'bg-gray-200'}`} />
-                            <div className={`h-1.5 flex-1 rounded-full ${score >= 3 ? color : 'bg-gray-200'}`} />
-                          </div>
-                          <div className="mt-2 text-sm text-gray-700">
-                            Password strength: <span className={score >= 3 ? 'text-green-700 font-semibold' : score >= 2 ? 'text-yellow-700 font-semibold' : 'text-red-600 font-semibold'}>{label}</span>
-                          </div>
-                        </div>
-                      );
-                    })()}
-
                     <div>
-                      <label className="text-sm font-semibold text-gray-900">Role</label>
-                      <div className="mt-2 flex items-center border border-green-200 rounded-2xl overflow-hidden bg-white">
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Role</label>
+                      <div className="mt-2 flex items-center border border-gray-200 rounded-2xl overflow-hidden bg-white">
                         <div className="px-4 text-gray-400">
                           <Briefcase className="w-5 h-5" />
                         </div>
@@ -795,24 +798,59 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                           name="role"
                           value="Owner / Manager"
                           readOnly
-                          className="w-full px-4 py-3 outline-none text-gray-900 placeholder-gray-400"
+                          className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} outline-none text-gray-900 placeholder-gray-400`}
                         />
+                        <div className="px-4 text-gray-400">v</div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Create Password</label>
+                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.password ? 'border-red-300' : 'border-gray-200'}`}>
+                          <input
+                            type={showPassword ? 'text' : 'password'}
+                            name="password"
+                            value={formData.password}
+                            onChange={handleChange}
+                            className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} outline-none text-gray-900 placeholder-gray-400`}
+                            placeholder="........"
+                          />
+                          <button type="button" className="px-4 text-gray-400" onClick={() => setShowPassword((v) => !v)}>
+                            {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                          </button>
+                        </div>
+                        {errors.password ? <div className="text-red-600 text-sm mt-2">{errors.password}</div> : null}
+                      </div>
+
+                      <div>
+                        <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Confirm Password</label>
+                        <div className={`mt-2 flex items-center border rounded-2xl overflow-hidden bg-white ${errors.confirmPassword ? 'border-red-300' : 'border-gray-200'}`}>
+                          <input
+                            type={showConfirmPassword ? 'text' : 'password'}
+                            name="confirmPassword"
+                            value={formData.confirmPassword}
+                            onChange={handleChange}
+                            className={`w-full px-4 ${isEmbedded ? 'py-3' : 'py-3.5'} outline-none text-gray-900 placeholder-gray-400`}
+                            placeholder="........"
+                          />
+                        </div>
+                        {errors.confirmPassword ? <div className="text-red-600 text-sm mt-2">{errors.confirmPassword}</div> : null}
                       </div>
                     </div>
 
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-3 text-base' : 'px-5 py-3.5 text-lg'} rounded-full bg-teal-700 text-white hover:bg-teal-800 flex items-center justify-center gap-2 font-semibold`}
                       onClick={handleNextFromStep3}
                       disabled={isSubmitting}
                     >
-                      {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
                       <span>Save &amp; Continue</span>
                       <ArrowRight className="w-5 h-5" />
                     </button>
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 font-semibold`}
                       onClick={() => {
                         goToStep(2);
                         setErrors({});
@@ -826,134 +864,127 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
                 )}
 
                 {renderedStep === 4 && (
-                  <div className="space-y-4">
-                    <div className="flex items-start gap-4">
-                      <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
-                        <Briefcase className="w-6 h-6 text-green-700" />
+                  <div className="w-full max-w-lg mx-auto space-y-3.5">
+                    <div className="flex flex-col items-center text-center">
+                      <div className={`${isEmbedded ? 'w-12 h-12' : 'w-14 h-14'} rounded-2xl bg-teal-50 flex items-center justify-center`}>
+                        <Building2 className="w-6 h-6 text-teal-700" />
                       </div>
-                      <div className="pt-1">
-                        <div className="text-xs font-semibold tracking-widest text-green-700">STEP 4 OF 4</div>
-                        <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Business Setup</div>
+                      <div className="mt-3 text-2xl font-extrabold text-gray-900 tracking-tight">Business details</div>
+                      <div className="mt-1 max-w-sm text-xs text-gray-500">
+                        Please provide the official details for your legal business entity.
                       </div>
                     </div>
 
-                    <div>
-                      <label className="text-sm font-semibold text-gray-900">Business Logo</label>
-                      <div className="mt-3 flex items-center gap-6">
-                        <div className="relative">
-                          <div className="w-20 h-20 rounded-full bg-green-50 border border-green-200 flex items-center justify-center overflow-hidden">
-                            {logoPreview ? (
-                              <img src={logoPreview} alt="Logo" className="w-full h-full object-cover" />
-                            ) : (
-                              <Building2 className="w-7 h-7 text-green-700" />
-                            )}
-                          </div>
-                          <label className="absolute -bottom-2 -right-2 w-9 h-9 rounded-full bg-green-600 text-white flex items-center justify-center cursor-pointer shadow-md">
-                            <Camera className="w-4 h-4" />
-                            <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
-                          </label>
-                        </div>
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-green-700">{logoPreview ? 'Logo selected' : 'Upload business logo'}</div>
-                          <div className="text-sm text-gray-600">JPG or PNG, max 2MB.</div>
-                          <div className="text-sm text-gray-600">Optional.</div>
+                    <div className="flex flex-col items-center text-center">
+                      <div className="relative">
+                        <div className={`${isEmbedded ? 'w-20 h-20' : 'w-24 h-24'} rounded-full bg-gray-100 border-4 border-white shadow-md flex items-center justify-center overflow-hidden`}>
                           {logoPreview ? (
-                            <button type="button" className="mt-1 text-sm text-green-700 hover:text-green-800 underline" onClick={() => setLogoPreview('')}>
-                              Remove
-                            </button>
-                          ) : null}
+                            <img src={logoPreview} alt="Logo" className="w-full h-full object-cover" />
+                          ) : (
+                            <Camera className="w-8 h-8 text-gray-500" />
+                          )}
                         </div>
+                        <label className="absolute bottom-0 right-0 w-9 h-9 rounded-full bg-teal-700 text-white flex items-center justify-center cursor-pointer shadow-md hover:bg-teal-800 transition">
+                          <Camera className="w-4 h-4" />
+                          <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
+                        </label>
                       </div>
+                      <div className="mt-2 text-[11px] font-bold uppercase tracking-wider text-slate-600">Logo (Optional)</div>
+                      {logoPreview ? (
+                        <button type="button" className="mt-1 text-xs text-teal-700 hover:text-teal-800 underline" onClick={() => setLogoPreview('')}>
+                          Remove
+                        </button>
+                      ) : null}
                     </div>
 
                     <div>
-                      <label className="text-sm font-semibold text-gray-900">Business Name <span className="text-red-500">*</span></label>
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Business Name <span className="text-red-500">*</span></label>
                       <input
                         type="text"
                         name="companyName"
                         value={formData.companyName}
                         onChange={handleChange}
-                        className={`mt-2 w-full px-4 py-3 border rounded-2xl outline-none focus:ring-2 focus:ring-green-500 ${
-                          errors.companyName ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
+                        className={`mt-1.5 w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border rounded-2xl outline-none focus:ring-2 focus:ring-teal-500 ${
+                          errors.companyName ? 'border-red-300 bg-red-50/40' : 'border-gray-200 bg-white'
                         }`}
-                        placeholder="e.g. Amani General Store"
+                        placeholder="e.g. Acme Corp Industries"
                       />
                       {errors.companyName ? <div className="text-red-600 text-sm mt-2">{errors.companyName}</div> : null}
                     </div>
 
                     <div>
-                      <label className="text-sm font-semibold text-gray-900">City / Town <span className="text-red-500">*</span></label>
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">City / Town <span className="text-red-500">*</span></label>
                       <input
                         type="text"
                         name="locationCity"
                         value={formData.locationCity}
                         onChange={handleChange}
-                        className={`mt-2 w-full px-4 py-3 border rounded-2xl outline-none focus:ring-2 focus:ring-green-500 ${
-                          errors.locationCity ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
+                        className={`mt-1.5 w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border rounded-2xl outline-none focus:ring-2 focus:ring-teal-500 ${
+                          errors.locationCity ? 'border-red-300 bg-red-50/40' : 'border-gray-200 bg-white'
                         }`}
-                        placeholder="e.g. Arusha"
+                        placeholder="Enter city name"
                       />
                       {errors.locationCity ? <div className="text-red-600 text-sm mt-2">{errors.locationCity}</div> : null}
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="text-sm font-semibold text-gray-900">TIN Number</label>
-                        <input
-                          type="text"
-                          name="taxId"
-                          value={formData.taxId}
-                          onChange={handleChange}
-                          className="mt-2 w-full px-4 py-3 border border-green-200 rounded-2xl bg-white text-gray-900 outline-none"
-                          placeholder="e.g. 100-200-300"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-sm font-semibold text-gray-900">VAT Registration</label>
-                        <input
-                          type="text"
-                          name="vatRegistration"
-                          value={formData.vatRegistration}
-                          onChange={handleChange}
-                          className="mt-2 w-full px-4 py-3 border border-green-200 rounded-2xl bg-white text-gray-900 outline-none"
-                          placeholder="Optional"
-                        />
-                      </div>
+                    <div>
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">TIN Number</label>
+                      <input
+                        type="text"
+                        name="taxId"
+                        value={formData.taxId}
+                        onChange={handleChange}
+                        className={`mt-1.5 w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border border-gray-200 rounded-2xl bg-white text-gray-900 outline-none`}
+                        placeholder="Tax Identification Number"
+                      />
                     </div>
 
                     <div>
-                      <label className="text-sm font-semibold text-gray-900">Business Address</label>
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">VAT Registration (Optional)</label>
+                      <input
+                        type="text"
+                        name="vatRegistration"
+                        value={formData.vatRegistration}
+                        onChange={handleChange}
+                        className={`mt-1.5 w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border border-gray-200 rounded-2xl bg-white text-gray-900 outline-none`}
+                        placeholder="VAT Reference"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-bold uppercase tracking-wider text-slate-700">Business Address</label>
                       <textarea
                         name="businessAddress"
                         value={formData.businessAddress}
                         onChange={handleChange}
                         rows={2}
-                        className="mt-2 w-full px-4 py-3 border border-green-200 rounded-2xl bg-white text-gray-900 outline-none resize-none"
-                        placeholder="Street, area, city..."
+                        className={`mt-1.5 w-full px-4 ${isEmbedded ? 'py-2.5' : 'py-3'} border border-gray-200 rounded-2xl bg-white text-gray-900 outline-none resize-none`}
+                        placeholder="Street name, Building, Floor..."
                       />
                     </div>
 
-                    <div className="flex items-start gap-3">
-                      <input type="checkbox" id="agreeBusinessTerms" name="agreeBusinessTerms" checked={formData.agreeBusinessTerms} onChange={handleChange} className="h-5 w-5 text-green-600 focus:ring-green-500 border-gray-300 rounded mt-0.5" />
-                      <label htmlFor="agreeBusinessTerms" className="text-sm text-gray-700">
-                        I confirm all business information is accurate and I accept the{' '}
-                        <a href="/terms" className="text-green-700 underline">Platform Terms</a>.
-                      </label>
+                    <div className="rounded-2xl bg-gray-50 border border-gray-200 px-4 py-3">
+                      <div className="flex items-start gap-3">
+                        <input type="checkbox" id="agreeBusinessTerms" name="agreeBusinessTerms" checked={formData.agreeBusinessTerms} onChange={handleChange} className="h-5 w-5 text-teal-700 focus:ring-teal-500 border-gray-300 rounded mt-0.5" />
+                        <label htmlFor="agreeBusinessTerms" className="text-sm text-gray-700">
+                          I confirm the details are correct and accept the{' '}
+                          <a href="/terms" className="text-teal-700 underline">Platform Terms</a>.
+                        </label>
+                      </div>
                     </div>
                     {errors.agreeBusinessTerms ? <div className="text-red-600 text-sm -mt-2">{errors.agreeBusinessTerms}</div> : null}
 
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-full bg-teal-700 text-white hover:bg-teal-800 flex items-center justify-center gap-2 font-semibold`}
                       onClick={handleNextFromStep4}
                       disabled={isSubmitting}
                     >
-                      {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
-                      <span>Complete Setup</span>
+                      <span>Finish</span>
                     </button>
                     <button
                       type="button"
-                      className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
+                      className={`w-full ${isEmbedded ? 'px-4 py-2.5 text-base' : 'px-5 py-3 text-lg'} rounded-2xl bg-white border border-teal-200 text-gray-900 hover:bg-teal-50 flex items-center justify-center gap-2 font-semibold`}
                       onClick={() => {
                         goToStep(3);
                         setErrors({});
@@ -996,7 +1027,7 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
     >
       <div className="w-full max-w-lg rounded-3xl bg-white/75 backdrop-blur-2xl border border-white/60 p-6">
         <div className="text-xl font-extrabold text-gray-900">Crop photo</div>
-        <div className="mt-2 text-sm text-gray-600">Drag to reposition, then adjust zoom.</div>
+        <div className="mt-2 text-sm text-gray-600">Drag to move. Use zoom to fit.</div>
         <div className="mt-5 flex items-center justify-center">
           <div
             className="relative rounded-3xl bg-gray-50 border border-gray-200 overflow-hidden"
@@ -1123,21 +1154,6 @@ const SignUp = ({ layout = 'full', onNavigateLogin, onStepChange }) => {
     <div className="min-h-screen bg-gradient-to-br from-green-50 via-white to-emerald-100">
       <div className="min-h-screen w-full">
         <div className="min-h-screen w-full bg-white/40 backdrop-blur-2xl border border-white/50 shadow-sm">
-          <div className="sticky top-0 z-30 bg-white/55 backdrop-blur-2xl border-b border-white/50">
-            <div className="px-6 lg:px-12 py-4">
-              <div className="flex items-center justify-center gap-3 leading-none">
-                <span className="text-4xl md:text-5xl font-extrabold text-green-600 tracking-tight">Duka</span>
-                <div className="flex items-center leading-none">
-                  <span className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight">Hub</span>
-                  <span className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight">n</span>
-                  <span className="inline-flex items-center justify-center w-[54px] h-[54px] rounded-full bg-green-600 align-middle -mx-2">
-                    <RiShoppingCart2Line className="text-white" size={34} />
-                  </span>
-                  <span className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight">w</span>
-                </div>
-              </div>
-            </div>
-          </div>
           {content}
         </div>
       </div>

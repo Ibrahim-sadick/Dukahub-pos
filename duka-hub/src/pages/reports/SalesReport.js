@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Download, FileText, Printer } from 'lucide-react';
 import { formatDisplayDate } from '../../utils/date';
-import { downloadCsvFile, printWithTitle } from '../../utils/reportActions';
+import { downloadExcelFile, printWithTitle } from '../../utils/reportActions';
+import { reportingApi } from '../../services/reportingApi';
+import { salesApi } from '../../services/salesApi';
 
 const toNum = (v) => {
   const n = Number(String(v ?? '').replace(/,/g, ''));
@@ -87,27 +89,76 @@ const Donut = ({ data, total }) => {
   );
 };
 
-const LineChart = ({ points }) => {
+const BarChart = ({ points }) => {
   const w = 640;
   const h = 220;
-  const pad = 24;
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
-  const minX = Math.min(...xs, 0);
-  const maxX = Math.max(...xs, 1);
-  const minY = 0;
-  const maxY = Math.max(...ys, 1);
-  const sx = (x) => pad + ((x - minX) * (w - pad * 2)) / (maxX - minX || 1);
-  const sy = (y) => h - pad - ((y - minY) * (h - pad * 2)) / (maxY - minY || 1);
-  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(p.x)} ${sy(p.y)}`).join(' ');
-  const area = `${d} L ${sx(points[points.length - 1]?.x ?? 0)} ${sy(0)} L ${sx(points[0]?.x ?? 0)} ${sy(0)} Z`;
+  const padX = 56;
+  const padY = 22;
+  const plotW = w - padX * 2;
+  const plotH = h - padY * 2;
+  const ys = points.map((p) => Number(p.y || 0));
+  const rawMax = Math.max(0, ...ys, 1);
+  const niceNum = (range, round) => {
+    const exponent = Math.floor(Math.log10(range || 1));
+    const fraction = range / Math.pow(10, exponent);
+    let niceFraction;
+    if (round) {
+      if (fraction < 1.5) niceFraction = 1;
+      else if (fraction < 3) niceFraction = 2;
+      else if (fraction < 7) niceFraction = 5;
+      else niceFraction = 10;
+    } else {
+      if (fraction <= 1) niceFraction = 1;
+      else if (fraction <= 2) niceFraction = 2;
+      else if (fraction <= 5) niceFraction = 5;
+      else niceFraction = 10;
+    }
+    return niceFraction * Math.pow(10, exponent);
+  };
+  const range = niceNum(rawMax, false);
+  const step = niceNum(range / 4, true);
+  const maxV = Math.ceil(rawMax / step) * step || 1;
+  const yFor = (v) => padY + ((maxV - v) * plotH) / (maxV || 1);
+  const y0 = padY + plotH;
+  const n = Math.max(1, points.length);
+  const barW = Math.max(6, (plotW / n) * 0.6);
+  const gap = (plotW - barW * n) / (n + 1);
+
   return (
     <svg className="w-full h-[220px]" viewBox={`0 0 ${w} ${h}`}>
-      <path d={area} fill="rgba(34,197,94,0.08)" />
-      <path d={d} fill="none" stroke="#16a34a" strokeWidth="3" />
-      {points.map((p) => (
-        <circle key={p.x} cx={sx(p.x)} cy={sy(p.y)} r="4" fill="#16a34a" />
-      ))}
+      <g opacity="0.35">
+        {new Array(5).fill(0).map((_, i) => {
+          const v = maxV - i * step;
+          const y = yFor(v);
+          return <line key={i} x1={padX} y1={y} x2={w - padX} y2={y} stroke="#e5e7eb" strokeWidth="1" />;
+        })}
+      </g>
+      <g>
+        {new Array(5).fill(0).map((_, i) => {
+          const v = maxV - i * step;
+          const y = yFor(v);
+          return (
+            <text key={i} x={padX - 10} y={y + 4} textAnchor="end" fontSize="10" fill="#6b7280">
+              {money(v)}
+            </text>
+          );
+        })}
+      </g>
+      {points.map((p, i) => {
+        const v = Number(p.y || 0);
+        const x = padX + gap + i * (barW + gap);
+        const y = yFor(v);
+        const bh = Math.max(0, y0 - y);
+        return <rect key={p.label || i} x={x} y={y} width={barW} height={bh} fill="#16a34a" rx="6" />;
+      })}
+      {points.map((p, i) => {
+        const x = padX + gap + i * (barW + gap) + barW / 2;
+        return (
+          <text key={p.label || i} x={x} y={h - 8} textAnchor="middle" fontSize="10" fill="#6b7280">
+            {String(p.label || '')}
+          </text>
+        );
+      })}
     </svg>
   );
 };
@@ -117,25 +168,54 @@ export default function SalesReport() {
   const [category, setCategory] = useState('all');
   const [staff, setStaff] = useState('all');
   const [refreshKey, setRefreshKey] = useState(0);
+  const [allSales, setAllSales] = useState([]);
+  const [salesSummary, setSalesSummary] = useState(null);
+  const [prevSalesSummary, setPrevSalesSummary] = useState(null);
 
   useEffect(() => {
     const onEvent = () => setRefreshKey((v) => v + 1);
     window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
     return () => {
       window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
     };
   }, []);
 
-  const allSales = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('sales') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const rawSales = await salesApi.list().catch(() => []);
+        if (!alive) return;
+
+        const combined = Array.isArray(rawSales) ? rawSales : [];
+
+        const normalized = combined.map((s) => {
+          const items = Array.isArray(s?.items) ? s.items : [];
+          const qty = items.reduce((sum, it) => sum + toNum(it?.quantity ?? it?.qty), 0);
+          const cat = String(items[0]?.productType || s?.itemType || s?.saleType || 'General').trim();
+          const invoiceNumber = String(s?.saleNumber || s?.invoiceNumber || s?.orderNumber || s?.id || '').trim();
+          const date = String(s?.date || s?.orderDateTime || s?.orderDate || s?.createdAt || '').trim();
+          const amount = toNum(s?.amount ?? s?.finalTotal ?? s?.total ?? s?.totalTzs);
+          return {
+            ...s,
+            date,
+            amount,
+            finalTotal: amount,
+            invoiceNumber,
+            customerName: String(s?.customerName || s?.name || s?.customer || '').trim() || '—',
+            category: cat,
+            productType: cat,
+            quantitySold: qty,
+            cashier: String(s?.cashier || s?.staff?.fullName || s?.staff?.employeeId || s?.user || s?.createdBy || '').trim(),
+            paymentMethod: String(s?.paymentMethod || '').trim()
+          };
+        });
+        setAllSales(normalized);
+      })
+      .catch(() => setAllSales([]));
+    return () => {
+      alive = false;
+    };
   }, [refreshKey]);
 
   const categoryOptions = useMemo(() => {
@@ -210,6 +290,38 @@ export default function SalesReport() {
     return { start: null, end: null };
   }, [period]);
 
+  const rangeRequest = useMemo(() => ({
+    from: range.start || new Date(2000, 0, 1),
+    to: range.end || new Date()
+  }), [range.end, range.start]);
+
+  const prevRangeRequest = useMemo(() => {
+    if (!prevRange.start || !prevRange.end) return null;
+    return { from: prevRange.start, to: prevRange.end };
+  }, [prevRange.end, prevRange.start]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const [currentSummary, previousSummary] = await Promise.all([
+          reportingApi.salesSummary(rangeRequest),
+          prevRangeRequest ? reportingApi.salesSummary(prevRangeRequest) : Promise.resolve(null)
+        ]);
+        if (!alive) return;
+        setSalesSummary(currentSummary || null);
+        setPrevSalesSummary(previousSummary || null);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setSalesSummary(null);
+        setPrevSalesSummary(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [prevRangeRequest, rangeRequest, refreshKey]);
+
   const filteredPrev = useMemo(() => {
     if (!prevRange.start || !prevRange.end) return [];
     return allSales.filter((s) => {
@@ -235,28 +347,64 @@ export default function SalesReport() {
     return { sum, tx, items, returns, avg: tx ? sum / tx : 0 };
   }, [filteredPrev]);
 
-  const dailyTrend = useMemo(() => {
-    if (!range.start || !range.end) {
-      const byMonth = new Map();
-      filtered.forEach((s) => {
+  const useBackendSummary = category === 'all' && staff === 'all';
+
+  const summaryTotals = useMemo(() => {
+    if (!useBackendSummary || !salesSummary) return totals;
+    const sum = toNum(salesSummary?.aggregate?._sum?.finalTotal);
+    const tx = toNum(salesSummary?.aggregate?._count?._all);
+    const items = (Array.isArray(salesSummary?.topProducts) ? salesSummary.topProducts : []).reduce(
+      (acc, entry) => acc + toNum(entry?._sum?.qty),
+      0
+    );
+    return { sum, tx, items, returns: 0, avg: tx ? sum / tx : 0 };
+  }, [salesSummary, totals, useBackendSummary]);
+
+  const summaryTotalsPrev = useMemo(() => {
+    if (!useBackendSummary || !prevSalesSummary) return totalsPrev;
+    const sum = toNum(prevSalesSummary?.aggregate?._sum?.finalTotal);
+    const tx = toNum(prevSalesSummary?.aggregate?._count?._all);
+    const items = (Array.isArray(prevSalesSummary?.topProducts) ? prevSalesSummary.topProducts : []).reduce(
+      (acc, entry) => acc + toNum(entry?._sum?.qty),
+      0
+    );
+    return { sum, tx, items, returns: 0, avg: tx ? sum / tx : 0 };
+  }, [prevSalesSummary, totalsPrev, useBackendSummary]);
+
+  const monthlyTrend = useMemo(() => {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+    const months = [];
+    for (let i = 11; i >= 0; i -= 1) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({ key: monthKey(d), label: d.toLocaleString(undefined, { month: 'short' }) });
+    }
+
+    const cat = String(category || 'all').toLowerCase();
+    const st = String(staff || 'all').toLowerCase();
+    const byMonth = new Map(months.map((m) => [m.key, 0]));
+    allSales
+      .filter((s) => {
+        if (cat === 'all') return true;
+        return normalizeCategory(s.category || s.productType || s.productName).toLowerCase() === cat;
+      })
+      .filter((s) => {
+        if (st === 'all') return true;
+        const v = String(s.cashier || s.staffName || s.user || s.createdBy || '').trim().toLowerCase();
+        return v === st;
+      })
+      .forEach((s) => {
         const d = parseIsoDate(s.date);
         if (!d) return;
+        if (d < start || d > end) return;
         const k = monthKey(d);
+        if (!byMonth.has(k)) return;
         byMonth.set(k, (byMonth.get(k) || 0) + toNum(s.amount ?? s.finalTotal));
       });
-      const keys = Array.from(byMonth.keys()).sort((a, b) => a.localeCompare(b)).slice(-12);
-      return keys.map((k, i) => ({ x: i, y: byMonth.get(k) || 0, label: k }));
-    }
-    const days = Math.round((range.end.getTime() - range.start.getTime()) / 86400000) + 1;
-    const byDay = new Array(days).fill(0);
-    filtered.forEach((s) => {
-      const d = parseIsoDate(s.date);
-      if (!d) return;
-      const idx = Math.floor((d.getTime() - range.start.getTime()) / 86400000);
-      if (idx >= 0 && idx < days) byDay[idx] += toNum(s.amount ?? s.finalTotal);
-    });
-    return byDay.map((v, i) => ({ x: i, y: v, label: String(i + 1) }));
-  }, [filtered, range.end, range.start]);
+
+    return months.map((m, i) => ({ x: i, y: byMonth.get(m.key) || 0, label: m.label }));
+  }, [allSales, category, staff]);
 
   const categories = useMemo(() => {
     const map = new Map();
@@ -271,6 +419,17 @@ export default function SalesReport() {
   }, [filtered]);
 
   const paymentMethods = useMemo(() => {
+    if (useBackendSummary && salesSummary && Array.isArray(salesSummary?.byPaymentMethod)) {
+      const palette = ['#16a34a', '#2563eb', '#d97706', '#7c3aed', '#0ea5e9'];
+      return salesSummary.byPaymentMethod
+        .map((entry, i) => ({
+          label: normalizePayment(entry?.paymentMethod),
+          value: toNum(entry?._sum?.finalTotal),
+          color: palette[i % palette.length]
+        }))
+        .filter((entry) => entry.value > 0)
+        .slice(0, 5);
+    }
     const map = new Map();
     filtered.forEach((s) => {
       const k = normalizePayment(s.paymentMethod);
@@ -280,18 +439,42 @@ export default function SalesReport() {
     arr.sort((a, b) => b.value - a.value);
     const palette = ['#16a34a', '#2563eb', '#d97706', '#7c3aed', '#0ea5e9'];
     return arr.slice(0, 5).map((d, i) => ({ ...d, color: palette[i % palette.length] }));
-  }, [filtered]);
+  }, [filtered, salesSummary, useBackendSummary]);
 
   const topProducts = useMemo(() => {
+    if (useBackendSummary && salesSummary && Array.isArray(salesSummary?.topProducts)) {
+      return salesSummary.topProducts
+        .map((entry) => ({
+          label: String(entry?.productName || 'Product').trim() || 'Product',
+          value: toNum(entry?._sum?.total),
+          qty: toNum(entry?._sum?.qty)
+        }))
+        .filter((entry) => entry.value > 0 || entry.qty > 0)
+        .slice(0, 5);
+    }
     const map = new Map();
     filtered.forEach((s) => {
+      const items = Array.isArray(s.items) ? s.items : null;
+      if (items && items.length) {
+        items.forEach((it) => {
+          const name = String(it?.item || it?.itemName || '').trim();
+          if (!name) return;
+          const amt = (() => {
+            if (it?.amountTzs != null && it?.amountTzs !== '') return toNum(it.amountTzs);
+            if (it?.amount != null && it?.amount !== '') return toNum(it.amount);
+            return toNum(it?.qty) * toNum(it?.rate);
+          })();
+          map.set(name, (map.get(name) || 0) + amt);
+        });
+        return;
+      }
       const k = String(s.productName || s.subcategory || s.description || s.productType || 'Product').trim();
       map.set(k, (map.get(k) || 0) + toNum(s.amount ?? s.finalTotal));
     });
     const arr = Array.from(map.entries()).map(([label, value]) => ({ label, value }));
     arr.sort((a, b) => b.value - a.value);
     return arr.slice(0, 5);
-  }, [filtered]);
+  }, [filtered, salesSummary, useBackendSummary]);
 
   const recent = useMemo(() => {
     const arr = filtered.slice();
@@ -299,9 +482,10 @@ export default function SalesReport() {
     return arr.slice(0, 8);
   }, [filtered]);
 
-  const exportCSV = () => {
-    const rows = [['Invoice', 'Customer', 'Items', 'Amount', 'Payment', 'Cashier', 'Date', 'Status']];
-    recent.forEach((s, i) => {
+  const exportExcel = () => {
+    const rows = [['Invoice', 'Customer', 'Items', 'Amount (TSH)', 'Payment', 'Cashier', 'Date', 'Status']];
+    const list = filtered.slice().sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')) || toNum(a.id) - toNum(b.id));
+    list.forEach((s, i) => {
       const invoice = String(s.invoiceNumber || s.id || `INV-${String(i + 1).padStart(4, '0')}`);
       const customer = String(s.customerName || '—');
       const items = String(toNum(s.quantity || s.quantitySold || 1));
@@ -312,7 +496,11 @@ export default function SalesReport() {
       const status = String(s.paymentMethod || '').toLowerCase() === 'credit' ? 'Pending' : 'Paid';
       rows.push([invoice, customer, items, amount, payment, cashier, date, status]);
     });
-    downloadCsvFile(`sales_report_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+    downloadExcelFile(`sales_report_${new Date().toISOString().slice(0, 10)}.xls`, {
+      title: 'Sales Report',
+      subtitle: String(range?.label || ''),
+      rows
+    });
   };
 
   const exportPDF = () => {
@@ -320,11 +508,19 @@ export default function SalesReport() {
   };
 
   const totalCat = categories.reduce((s, c) => s + Number(c.value || 0), 0);
-  const card = (title, value, delta, tone) => (
+  const count0 = (n) => {
+    const x = Number(n || 0);
+    try {
+      return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(Number.isFinite(x) ? x : 0);
+    } catch {
+      return String(Number.isFinite(x) ? x : 0);
+    }
+  };
+  const card = (title, value, delta, tone, kind = 'money') => (
     <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden">
       <div className="p-5">
         <div className="text-[11px] font-medium text-gray-500 tracking-wide">{title}</div>
-        <div className="mt-2 text-3xl font-semibold text-gray-900">TSH {money(value)}</div>
+        <div className="mt-2 text-3xl font-semibold text-gray-900">{kind === 'money' ? `TSH ${money(value)}` : count0(value)}</div>
         <div className={delta >= 0 ? 'mt-2 text-sm font-medium text-emerald-700' : 'mt-2 text-sm font-medium text-rose-700'}>
           {delta >= 0 ? '▲' : '▼'} {Math.abs(delta).toFixed(1)}%
         </div>
@@ -333,19 +529,22 @@ export default function SalesReport() {
     </div>
   );
 
-  const deltaSales = pct(totals.sum, totalsPrev.sum);
-  const deltaTx = pct(totals.tx, totalsPrev.tx);
-  const deltaAvg = pct(totals.avg, totalsPrev.avg);
-  const deltaItems = pct(totals.items, totalsPrev.items);
+  const deltaSales = pct(summaryTotals.sum, summaryTotalsPrev.sum);
+  const deltaTx = pct(summaryTotals.tx, summaryTotalsPrev.tx);
+  const deltaAvg = pct(summaryTotals.avg, summaryTotalsPrev.avg);
+  const deltaItems = pct(summaryTotals.items, summaryTotalsPrev.items);
 
   return (
     <div className="space-y-6">
       <style>{`
+        .report-print-only { display: none; }
         @media print {
+          @page { size: landscape; margin: 12mm; }
           body * { visibility: hidden !important; }
           .report-print-scope, .report-print-scope * { visibility: visible !important; }
           .report-print-scope { position: absolute !important; inset: 0 !important; padding: 16px !important; background: white !important; }
           .report-no-print { display: none !important; }
+          .report-print-only { display: block !important; }
         }
       `}</style>
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -363,9 +562,9 @@ export default function SalesReport() {
             <FileText className="w-4 h-4" />
             PDF
           </button>
-          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportCSV}>
+          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportExcel}>
             <Download className="w-4 h-4" />
-            CSV
+            Excel
           </button>
           <button type="button" className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 inline-flex items-center gap-2" onClick={exportPDF}>
             <Printer className="w-4 h-4" />
@@ -374,12 +573,11 @@ export default function SalesReport() {
         </div>
       </div>
 
-      <div className="report-print-scope bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
+      <div className="bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
             <div className="text-[12px] text-emerald-700 font-medium tracking-wide">Revenue analysis</div>
-            <div className="mt-2 text-3xl font-semibold text-gray-900">Sales Report</div>
-            <div className="mt-2 text-sm text-gray-600">Complete overview of sales performance — {range.label}</div>
+            <div className="mt-2 text-sm text-gray-600">Complete overview of sales performance</div>
           </div>
           <div className="flex items-center gap-3 report-no-print">
             <select value={category} onChange={(e) => setCategory(e.target.value)} className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm">
@@ -400,21 +598,20 @@ export default function SalesReport() {
         </div>
 
         <div className="mt-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
-          {card('TOTAL SALES', totals.sum, deltaSales, '#16a34a')}
-          {card('TRANSACTIONS', totals.tx, deltaTx, '#2563eb')}
-          {card('AVG SALE VALUE', totals.avg, deltaAvg, '#7c3aed')}
-          {card('ITEMS SOLD', totals.items, deltaItems, '#d97706')}
-          {card('RETURNS', totals.returns, 0, '#ef4444')}
+          {card('TOTAL SALES', summaryTotals.sum, deltaSales, '#16a34a', 'money')}
+          {card('TRANSACTIONS', summaryTotals.tx, deltaTx, '#2563eb', 'count')}
+          {card('AVG SALE VALUE', summaryTotals.avg, deltaAvg, '#7c3aed', 'money')}
+          {card('ITEMS SOLD', summaryTotals.items, deltaItems, '#d97706', 'count')}
+          {card('RETURNS', summaryTotals.returns, 0, '#ef4444', 'count')}
         </div>
 
         <div className="mt-6 grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="xl:col-span-2 bg-white border border-gray-200 rounded-2xl">
             <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
               <div className="text-base font-semibold text-gray-900">Daily Sales Trend</div>
-              <span className="px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium">{range.label}</span>
             </div>
             <div className="p-5">
-              <LineChart points={dailyTrend.length ? dailyTrend.map((p) => ({ x: p.x, y: p.y })) : [{ x: 0, y: 0 }]} />
+              <BarChart points={monthlyTrend.length ? monthlyTrend.map((p) => ({ x: p.x, y: p.y, label: p.label })) : [{ x: 0, y: 0, label: '' }]} />
             </div>
           </div>
 
@@ -452,7 +649,7 @@ export default function SalesReport() {
               {paymentMethods.length ? (
                 paymentMethods.map((p) => {
                   const v = Number(p.value || 0);
-                  const pctVal = totals.sum ? (v * 100) / totals.sum : 0;
+                  const pctVal = summaryTotals.sum ? (v * 100) / summaryTotals.sum : 0;
                   return (
                     <div key={p.label} className="space-y-2">
                       <div className="flex items-center justify-between text-sm">
@@ -501,10 +698,15 @@ export default function SalesReport() {
           </div>
         </div>
 
-        <div className="mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
+        <div className="report-print-scope mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
           <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
-            <div className="text-base font-semibold text-gray-900">Recent Sales Transactions</div>
-            <span className="px-3 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">Last 8 records</span>
+            <div>
+              <div className="report-print-only">
+                <div className="text-lg font-semibold text-gray-900">Sales Report</div>
+              </div>
+              <div className="report-no-print text-base font-semibold text-gray-900">Recent Sales Transactions</div>
+            </div>
+            <span className="report-no-print px-3 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">Last 8 records</span>
           </div>
           <div className="overflow-auto">
             <table className="min-w-[980px] w-full">

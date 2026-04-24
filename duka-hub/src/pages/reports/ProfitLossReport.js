@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Download, FileText, Printer } from 'lucide-react';
+import { reportingApi } from '../../services/reportingApi';
 import { formatDisplayDate } from '../../utils/date';
-import { downloadCsvFile, printWithTitle } from '../../utils/reportActions';
+import { downloadExcelFile, printWithTitle } from '../../utils/reportActions';
 
 const toNum = (v) => {
   const n = Number(String(v ?? '').replace(/,/g, ''));
@@ -24,15 +25,8 @@ const money1 = (n) => {
   }
 };
 
-const parseIsoDate = (d) => {
-  const t = Date.parse(String(d || ''));
-  return Number.isFinite(t) ? new Date(t) : null;
-};
-
 const startOfMonth = (d) => new Date(d.getFullYear(), d.getMonth(), 1);
 const endOfMonth = (d) => new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
-
-const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 
 const pct = (cur, prev) => {
   const p = Number(prev || 0);
@@ -41,34 +35,106 @@ const pct = (cur, prev) => {
   return ((c - p) * 100) / p;
 };
 
-const MultiLineChart = ({ series }) => {
+const GroupedBarChart = ({ groups }) => {
   const w = 740;
-  const h = 240;
-  const pad = 28;
-  const all = series.flatMap((s) => s.points);
-  const xs = all.map((p) => p.x);
-  const ys = all.map((p) => p.y);
-  const minX = Math.min(...xs, 0);
-  const maxX = Math.max(...xs, 1);
-  const minY = 0;
-  const maxY = Math.max(...ys, 1);
-  const sx = (x) => pad + ((x - minX) * (w - pad * 2)) / (maxX - minX || 1);
-  const sy = (y) => h - pad - ((y - minY) * (h - pad * 2)) / (maxY - minY || 1);
+  const h = 260;
+  const padX = 52;
+  const padY = 26;
+  const plotW = w - padX * 2;
+  const plotH = h - padY * 2;
+  const vals = (Array.isArray(groups) ? groups : []).flatMap((g) => [Number(g?.revenue || 0), Number(g?.expenses || 0), Number(g?.profit || 0)]);
+  const rawMin = Math.min(0, ...vals.map((v) => Number(v) || 0));
+  const rawMax = Math.max(0, ...vals.map((v) => Number(v) || 0));
+  const niceNum = (range, round) => {
+    const exponent = Math.floor(Math.log10(range || 1));
+    const fraction = range / Math.pow(10, exponent);
+    let niceFraction;
+    if (round) {
+      if (fraction < 1.5) niceFraction = 1;
+      else if (fraction < 3) niceFraction = 2;
+      else if (fraction < 7) niceFraction = 5;
+      else niceFraction = 10;
+    } else {
+      if (fraction <= 1) niceFraction = 1;
+      else if (fraction <= 2) niceFraction = 2;
+      else if (fraction <= 5) niceFraction = 5;
+      else niceFraction = 10;
+    }
+    return niceFraction * Math.pow(10, exponent);
+  };
+  const range = niceNum(rawMax - rawMin, false);
+  const step = niceNum(range / 4, true);
+  const minV = Math.floor(rawMin / step) * step;
+  const maxV = Math.ceil(rawMax / step) * step;
+  const yFor = (v) => padY + ((maxV - v) * plotH) / (maxV - minV || 1);
+  const y0 = yFor(0);
+  const n = Math.max(1, (Array.isArray(groups) ? groups : []).length);
+  const groupW = plotW / n;
+  const barW = Math.max(6, groupW * 0.22);
+  const gap = Math.max(3, barW * 0.25);
+  const series = [
+    { key: 'revenue', label: 'Revenue', color: '#16a34a' },
+    { key: 'expenses', label: 'Expenses', color: '#ef4444' },
+    { key: 'profit', label: 'Profit', color: '#4f46e5' }
+  ];
   return (
-    <svg className="w-full h-[240px]" viewBox={`0 0 ${w} ${h}`}>
+    <svg className="w-full h-[260px]" viewBox={`0 0 ${w} ${h}`}>
       <g opacity="0.35">
         {new Array(5).fill(0).map((_, i) => {
-          const y = pad + (i * (h - pad * 2)) / 4;
-          return <line key={i} x1={pad} y1={y} x2={w - pad} y2={y} stroke="#e5e7eb" strokeWidth="1" />;
+          const v = maxV - i * step;
+          const y = yFor(v);
+          return <line key={i} x1={padX} y1={y} x2={w - padX} y2={y} stroke="#e5e7eb" strokeWidth="1" />;
         })}
       </g>
-      {series.map((s) => {
-        const d = s.points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(p.x)} ${sy(p.y)}`).join(' ');
-        return <path key={s.key} d={d} fill="none" stroke={s.color} strokeWidth="3" />;
+      <g>
+        {new Array(5).fill(0).map((_, i) => {
+          const v = maxV - i * step;
+          const y = yFor(v);
+          return (
+            <text key={i} x={padX - 10} y={y + 4} textAnchor="end" fontSize="10" fill="#6b7280">
+              {money0(v)}
+            </text>
+          );
+        })}
+      </g>
+      <line x1={padX} y1={y0} x2={w - padX} y2={y0} stroke="#9ca3af" strokeWidth="1" opacity="0.6" />
+      {(Array.isArray(groups) ? groups : []).map((g, i) => {
+        const cx = padX + groupW * i + groupW / 2;
+        const totalW = barW * 3 + gap * 2;
+        const startX = cx - totalW / 2;
+        const values = {
+          revenue: Number(g?.revenue || 0),
+          expenses: Number(g?.expenses || 0),
+          profit: Number(g?.profit || 0)
+        };
+        return (
+          <g key={g.key || i}>
+            {series.map((s, j) => {
+              const v = values[s.key];
+              const x = startX + j * (barW + gap);
+              const yV = yFor(v);
+              const yZ = y0;
+              const y = Math.min(yV, yZ);
+              const bh = Math.abs(yV - yZ);
+              return (
+                <rect
+                  key={s.key}
+                  x={x}
+                  y={y}
+                  width={barW}
+                  height={bh}
+                  rx="3"
+                  fill={s.color}
+                  opacity={s.key === 'profit' && v < 0 ? 0.5 : 0.85}
+                />
+              );
+            })}
+            <text x={cx} y={h - 8} textAnchor="middle" fontSize="10" fill="#6b7280">
+              {String(g.label || '')}
+            </text>
+          </g>
+        );
       })}
-      {series.map((s) =>
-        s.points.map((p) => <circle key={`${s.key}_${p.x}`} cx={sx(p.x)} cy={sy(p.y)} r="3.5" fill={s.color} />)
-      )}
     </svg>
   );
 };
@@ -89,46 +155,16 @@ const StatCard = ({ title, value, note, tone }) => {
 export default function ProfitLossReport() {
   const [period, setPeriod] = useState('thisMonth');
   const [refreshKey, setRefreshKey] = useState(0);
+  const [report, setReport] = useState(null);
+  const [prevSummary, setPrevSummary] = useState(null);
 
   useEffect(() => {
     const onEvent = () => setRefreshKey((v) => v + 1);
     window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
     return () => {
       window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
     };
   }, []);
-
-  const salesAll = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('sales') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
-  }, [refreshKey]);
-
-  const expensesAll = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('expenses') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
-  }, [refreshKey]);
-
-  const lossesAll = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('losses') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
-  }, [refreshKey]);
 
   const range = useMemo(() => {
     const now = new Date();
@@ -140,42 +176,6 @@ export default function ProfitLossReport() {
     if (period === 'thisYear') return { label: 'This Year', start: new Date(now.getFullYear(), 0, 1), end: new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999) };
     return { label: 'All Time', start: null, end: null };
   }, [period]);
-
-  const sales = useMemo(() => {
-    const start = range.start;
-    const end = range.end;
-    return salesAll.filter((s) => {
-      const d = parseIsoDate(s.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-  }, [range.end, range.start, salesAll]);
-
-  const expenses = useMemo(() => {
-    const start = range.start;
-    const end = range.end;
-    return expensesAll.filter((e) => {
-      const d = parseIsoDate(e.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-  }, [expensesAll, range.end, range.start]);
-
-  const losses = useMemo(() => {
-    const start = range.start;
-    const end = range.end;
-    return lossesAll.filter((l) => {
-      const d = parseIsoDate(l.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-  }, [lossesAll, range.end, range.start]);
 
   const prevRange = useMemo(() => {
     const now = new Date();
@@ -190,129 +190,90 @@ export default function ProfitLossReport() {
     return { start: null, end: null };
   }, [period]);
 
-  const totals = useMemo(() => {
-    const grossRevenue = sales.reduce((s, r) => s + toNum(r.amount ?? r.finalTotal), 0);
-    const totalExpenses = expenses.reduce((s, r) => s + toNum(r.amount), 0);
-    const totalLosses = losses.reduce((s, r) => s + toNum(r.estimatedValue ?? r.amount), 0);
-    const netProfit = grossRevenue - totalExpenses - totalLosses;
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const [currentReport, previousSummary] = await Promise.all([
+          reportingApi.profitLossReport({ from: range.start, to: range.end }),
+          reportingApi.profitLossSummary({ from: prevRange.start, to: prevRange.end })
+        ]);
+        if (!alive) return;
+        setReport(currentReport || null);
+        setPrevSummary(previousSummary || null);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setReport(null);
+        setPrevSummary(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [prevRange.end, prevRange.start, range.end, range.start, refreshKey]);
+
+  const summaryTotals = useMemo(() => {
+    const grossRevenue = toNum(report?.revenue);
+    const totalExpenses = toNum(report?.operatingExpenses);
+    const totalLosses = toNum(report?.stockLosses);
+    const netProfit = toNum(report?.netProfit);
     const margin = grossRevenue ? (netProfit * 100) / grossRevenue : 0;
     const tax = netProfit > 0 ? netProfit * 0.18 : 0;
     return { grossRevenue, totalExpenses, totalLosses, netProfit, margin, tax };
-  }, [expenses, losses, sales]);
+  }, [report]);
 
-  const prevTotals = useMemo(() => {
-    const start = prevRange.start;
-    const end = prevRange.end;
-    const prevSales = salesAll.filter((s) => {
-      const d = parseIsoDate(s.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-    const prevExpenses = expensesAll.filter((e) => {
-      const d = parseIsoDate(e.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-    const prevLosses = lossesAll.filter((l) => {
-      const d = parseIsoDate(l.date);
-      if (!d) return false;
-      if (start && d < start) return false;
-      if (end && d > end) return false;
-      return true;
-    });
-    const grossRevenue = prevSales.reduce((s, r) => s + toNum(r.amount ?? r.finalTotal), 0);
-    const totalExpenses = prevExpenses.reduce((s, r) => s + toNum(r.amount), 0);
-    const totalLosses = prevLosses.reduce((s, r) => s + toNum(r.estimatedValue ?? r.amount), 0);
-    const netProfit = grossRevenue - totalExpenses - totalLosses;
+  const summaryPrevTotals = useMemo(() => {
+    const grossRevenue = toNum(prevSummary?.revenue);
+    const totalExpenses = toNum(prevSummary?.operatingExpenses);
+    const totalLosses = toNum(prevSummary?.stockLosses);
+    const netProfit = toNum(prevSummary?.netProfit);
     const margin = grossRevenue ? (netProfit * 100) / grossRevenue : 0;
-    return { grossRevenue, totalExpenses, netProfit, margin };
-  }, [expensesAll, lossesAll, salesAll, prevRange.end, prevRange.start]);
+    return { grossRevenue, totalExpenses, totalLosses, netProfit, margin };
+  }, [prevSummary]);
 
-  const deltas = useMemo(() => {
+  const summaryDeltas = useMemo(() => {
     return {
-      revenue: pct(totals.grossRevenue, prevTotals.grossRevenue),
-      expenses: pct(totals.totalExpenses, prevTotals.totalExpenses),
-      netProfit: pct(totals.netProfit, prevTotals.netProfit),
-      marginPts: totals.margin - prevTotals.margin
+      revenue: pct(summaryTotals.grossRevenue, summaryPrevTotals.grossRevenue),
+      expenses: pct(
+        summaryTotals.totalExpenses + summaryTotals.totalLosses,
+        summaryPrevTotals.totalExpenses + summaryPrevTotals.totalLosses
+      ),
+      netProfit: pct(summaryTotals.netProfit, summaryPrevTotals.netProfit),
+      marginPts: summaryTotals.margin - summaryPrevTotals.margin
     };
-  }, [prevTotals, totals]);
+  }, [summaryPrevTotals, summaryTotals]);
 
   const expensesByCategory = useMemo(() => {
-    const map = new Map();
-    expenses.forEach((e) => {
-      const k = String(e.category || 'Other').trim() || 'Other';
-      map.set(k, (map.get(k) || 0) + toNum(e.amount));
-    });
-    losses.forEach((l) => {
-      const k = 'Other Operating Costs';
-      map.set(k, (map.get(k) || 0) + toNum(l.estimatedValue ?? l.amount));
-    });
-    const rows = Array.from(map.entries()).map(([label, value]) => ({ label, value }));
-    rows.sort((a, b) => b.value - a.value);
-    return rows;
-  }, [expenses, losses]);
+    return Array.isArray(report?.expenseCategories) ? report.expenseCategories : [];
+  }, [report]);
 
-  const trend = useMemo(() => {
-    const now = new Date();
-    const months = [];
-    for (let i = 11; i >= 0; i -= 1) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      months.push({ key: monthKey(d), idx: 11 - i });
-    }
-    const rev = new Map(months.map((m) => [m.key, 0]));
-    const exp = new Map(months.map((m) => [m.key, 0]));
-    const los = new Map(months.map((m) => [m.key, 0]));
-    salesAll.forEach((s) => {
-      const d = parseIsoDate(s.date);
-      if (!d) return;
-      const k = monthKey(d);
-      if (!rev.has(k)) return;
-      rev.set(k, (rev.get(k) || 0) + toNum(s.amount ?? s.finalTotal));
-    });
-    expensesAll.forEach((e) => {
-      const d = parseIsoDate(e.date);
-      if (!d) return;
-      const k = monthKey(d);
-      if (!exp.has(k)) return;
-      exp.set(k, (exp.get(k) || 0) + toNum(e.amount));
-    });
-    lossesAll.forEach((l) => {
-      const d = parseIsoDate(l.date);
-      if (!d) return;
-      const k = monthKey(d);
-      if (!los.has(k)) return;
-      los.set(k, (los.get(k) || 0) + toNum(l.estimatedValue ?? l.amount));
-    });
-    const revenuePts = months.map((m) => ({ x: m.idx, y: rev.get(m.key) || 0 }));
-    const expensePts = months.map((m) => ({ x: m.idx, y: (exp.get(m.key) || 0) + (los.get(m.key) || 0) }));
-    const profitPts = months.map((m) => ({ x: m.idx, y: (rev.get(m.key) || 0) - (exp.get(m.key) || 0) - (los.get(m.key) || 0) }));
-    return { revenuePts, expensePts, profitPts };
-  }, [expensesAll, lossesAll, salesAll]);
+  const trendGroups = useMemo(() => {
+    return Array.isArray(report?.trend?.groups) ? report.trend.groups : [];
+  }, [report]);
 
-  const exportCSV = () => {
+  const recentActivity = useMemo(() => {
+    return Array.isArray(report?.recentActivity) ? report.recentActivity : [];
+  }, [report]);
+
+  const exportExcel = () => {
     const rows = [
       ['Section', 'Label', 'Amount'],
-      ['Income', 'Gross Revenue', String(totals.grossRevenue)],
-      ['Expenses', 'Total Expenses', String(totals.totalExpenses)],
-      ['Expenses', 'Total Losses', String(totals.totalLosses)],
-      ['Summary', 'Net Profit', String(totals.netProfit)],
-      ['Summary', 'Profit Margin (%)', String(totals.margin.toFixed(2))],
-      ['Summary', 'Tax Estimate (18%)', String(totals.tax)]
+      ['Income', 'Gross Revenue', String(summaryTotals.grossRevenue)],
+      ['Expenses', 'Total Expenses', String(summaryTotals.totalExpenses)],
+      ['Expenses', 'Total Losses', String(summaryTotals.totalLosses)],
+      ['Summary', 'Net Profit', String(summaryTotals.netProfit)],
+      ['Summary', 'Profit Margin (%)', String(summaryTotals.margin.toFixed(2))],
+      ['Summary', 'Tax Estimate (18%)', String(summaryTotals.tax)]
     ];
     expensesByCategory.forEach((r) => rows.push(['Expenses', r.label, String(r.value)]));
-    downloadCsvFile(`profit_loss_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+    downloadExcelFile(`profit_loss_${new Date().toISOString().slice(0, 10)}.xls`, {
+      title: 'Profit & Loss Report',
+      subtitle: String(range?.label || ''),
+      rows
+    });
   };
 
   const exportPDF = () => printWithTitle(`Profit & Loss Report - ${range.label}`);
-
-  const monthLabel = useMemo(() => {
-    if (!range.start) return 'All Time';
-    return range.start.toLocaleString(undefined, { month: 'long', year: 'numeric' });
-  }, [range.start]);
 
   return (
     <div className="space-y-6">
@@ -326,7 +287,7 @@ export default function ProfitLossReport() {
       `}</style>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="text-sm text-gray-600">
-          Reports <span className="mx-1">›</span> <span className="text-gray-900 font-medium">Profit &amp; Loss Report</span>
+          Reports <span className="mx-1">›</span> <span className="text-gray-900 font-medium">Profit &amp; Loss</span>
         </div>
         <div className="flex items-center gap-2 report-no-print">
           <select value={period} onChange={(e) => setPeriod(e.target.value)} className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm">
@@ -339,9 +300,9 @@ export default function ProfitLossReport() {
             <FileText className="w-4 h-4" />
             PDF
           </button>
-          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportCSV}>
+          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportExcel}>
             <Download className="w-4 h-4" />
-            CSV
+            Excel
           </button>
           <button type="button" className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 inline-flex items-center gap-2" onClick={exportPDF}>
             <Printer className="w-4 h-4" />
@@ -354,27 +315,23 @@ export default function ProfitLossReport() {
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
             <div className="text-[12px] text-sky-700 font-medium tracking-wide">Financial summary</div>
-            <div className="mt-2 text-3xl font-semibold text-gray-900">Profit &amp; Loss Report</div>
-            <div className="mt-2 text-sm text-gray-600">Income vs expenses financial statement — {range.label}</div>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium">{monthLabel}</span>
+            <div className="mt-2 text-sm text-gray-600">Income vs expenses</div>
           </div>
         </div>
 
         <div className="mt-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
-          <StatCard title="GROSS REVENUE" value={`TSH ${money0(totals.grossRevenue)}`} note={`${deltas.revenue >= 0 ? '▲' : '▼'} ${money1(Math.abs(deltas.revenue))}% vs last month`} tone="#16a34a" />
-          <StatCard title="TOTAL EXPENSES" value={`TSH ${money0(totals.totalExpenses + totals.totalLosses)}`} note={`${deltas.expenses >= 0 ? '▲' : '▼'} ${money1(Math.abs(deltas.expenses))}% vs last month`} tone="#ef4444" />
-          <StatCard title="NET PROFIT" value={`TSH ${money0(totals.netProfit)}`} note={`${deltas.netProfit >= 0 ? '▲' : '▼'} ${money1(Math.abs(deltas.netProfit))}% vs last month`} tone="#2563eb" />
-          <StatCard title="PROFIT MARGIN" value={`${money1(totals.margin)}%`} note={`${deltas.marginPts >= 0 ? '▲' : '▼'} ${money1(Math.abs(deltas.marginPts))} pts`} tone="#7c3aed" />
-          <StatCard title="TAX ESTIMATE (18%)" value={`TSH ${money0(totals.tax)}`} note="VAT inclusive" tone="#f59e0b" />
+          <StatCard title="GROSS REVENUE" value={`TSH ${money0(summaryTotals.grossRevenue)}`} note={`${summaryDeltas.revenue >= 0 ? '▲' : '▼'} ${money1(Math.abs(summaryDeltas.revenue))}% vs last month`} tone="#16a34a" />
+          <StatCard title="TOTAL EXPENSES" value={`TSH ${money0(summaryTotals.totalExpenses + summaryTotals.totalLosses)}`} note={`${summaryDeltas.expenses >= 0 ? '▲' : '▼'} ${money1(Math.abs(summaryDeltas.expenses))}% vs last month`} tone="#ef4444" />
+          <StatCard title="NET PROFIT" value={`TSH ${money0(summaryTotals.netProfit)}`} note={`${summaryDeltas.netProfit >= 0 ? '▲' : '▼'} ${money1(Math.abs(summaryDeltas.netProfit))}% vs last month`} tone="#2563eb" />
+          <StatCard title="PROFIT MARGIN" value={`${money1(summaryTotals.margin)}%`} note={`${summaryDeltas.marginPts >= 0 ? '▲' : '▼'} ${money1(Math.abs(summaryDeltas.marginPts))} pts`} tone="#7c3aed" />
+          <StatCard title="TAX ESTIMATE (18%)" value={`TSH ${money0(summaryTotals.tax)}`} note="VAT inclusive" tone="#f59e0b" />
         </div>
 
         <div className="mt-6 grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="xl:col-span-2 bg-white border border-gray-200 rounded-2xl">
             <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
               <div className="text-base font-semibold text-gray-900">Revenue vs Expenses vs Profit — 12 Months</div>
-              <span className="px-3 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-medium">Trend</span>
+              <span className="px-3 py-1 rounded-full bg-amber-50 text-amber-700 text-xs font-medium">Monthly</span>
             </div>
             <div className="p-5">
               <div className="flex items-center gap-4 flex-wrap text-sm text-gray-700">
@@ -392,13 +349,7 @@ export default function ProfitLossReport() {
                 </div>
               </div>
               <div className="mt-4">
-                <MultiLineChart
-                  series={[
-                    { key: 'rev', color: '#16a34a', points: trend.revenuePts },
-                    { key: 'exp', color: '#ef4444', points: trend.expensePts },
-                    { key: 'pro', color: '#4f46e5', points: trend.profitPts }
-                  ]}
-                />
+                <GroupedBarChart groups={trendGroups} />
               </div>
             </div>
           </div>
@@ -406,17 +357,16 @@ export default function ProfitLossReport() {
           <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden">
             <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
               <div className="text-base font-semibold text-gray-900">P&amp;L Statement</div>
-              <span className="px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium">{monthLabel}</span>
             </div>
             <div className="divide-y divide-gray-100">
               <div className="px-5 py-3 text-[12px] text-gray-600 font-medium tracking-wide">INCOME</div>
               <div className="px-5 py-3 flex items-center justify-between gap-3">
                 <div className="text-sm text-gray-800">Product Sales</div>
-                <div className="text-sm font-medium text-emerald-700">TSH {money0(totals.grossRevenue)}</div>
+                <div className="text-sm font-medium text-emerald-700">TSH {money0(summaryTotals.grossRevenue)}</div>
               </div>
               <div className="px-5 py-3 flex items-center justify-between gap-3 bg-emerald-50/40">
                 <div className="text-sm text-gray-800">Net Revenue</div>
-                <div className="text-sm font-medium text-emerald-700">TSH {money0(totals.grossRevenue)}</div>
+                <div className="text-sm font-medium text-emerald-700">TSH {money0(summaryTotals.grossRevenue)}</div>
               </div>
               <div className="px-5 py-3 text-[12px] text-gray-600 font-medium tracking-wide">EXPENSES</div>
               {expensesByCategory.slice(0, 6).map((r) => (
@@ -427,11 +377,11 @@ export default function ProfitLossReport() {
               ))}
               <div className="px-5 py-3 flex items-center justify-between gap-3 bg-rose-50/40">
                 <div className="text-sm text-gray-800">Total Expenses</div>
-                <div className="text-sm font-medium text-rose-700">-TSH {money0(totals.totalExpenses + totals.totalLosses)}</div>
+                <div className="text-sm font-medium text-rose-700">-TSH {money0(summaryTotals.totalExpenses + summaryTotals.totalLosses)}</div>
               </div>
               <div className="px-5 py-4 flex items-center justify-between gap-3 bg-emerald-50/60">
                 <div className="text-sm text-gray-900 font-medium">NET PROFIT</div>
-                <div className="text-xl font-semibold text-emerald-700">TSH {money0(totals.netProfit)}</div>
+                <div className="text-xl font-semibold text-emerald-700">TSH {money0(summaryTotals.netProfit)}</div>
               </div>
             </div>
           </div>
@@ -440,7 +390,6 @@ export default function ProfitLossReport() {
         <div className="mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
           <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
             <div className="text-base font-semibold text-gray-900">Recent Activity</div>
-            <span className="px-3 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">{range.label}</span>
           </div>
           <div className="overflow-auto">
             <table className="min-w-[980px] w-full">
@@ -454,41 +403,7 @@ export default function ProfitLossReport() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {(() => {
-                  const rows = [];
-                  sales.slice(-10).forEach((s, i) => {
-                    rows.push({
-                      key: `s_${s.id}_${i}`,
-                      date: s.date,
-                      type: 'Sale',
-                      ref: String(s.invoiceNumber || s.id || ''),
-                      category: String(s.productType || s.category || s.productName || 'Sales'),
-                      amount: toNum(s.amount ?? s.finalTotal)
-                    });
-                  });
-                  expenses.slice(-10).forEach((e, i) => {
-                    rows.push({
-                      key: `e_${e.id}_${i}`,
-                      date: e.date,
-                      type: 'Expense',
-                      ref: String(e.expenseNumber || e.id || ''),
-                      category: String(e.category || 'Expense'),
-                      amount: -toNum(e.amount)
-                    });
-                  });
-                  losses.slice(-10).forEach((l, i) => {
-                    rows.push({
-                      key: `l_${l.id}_${i}`,
-                      date: l.date,
-                      type: 'Loss',
-                      ref: String(l.id || ''),
-                      category: String(l.reason || l.type || 'Loss'),
-                      amount: -toNum(l.estimatedValue ?? l.amount)
-                    });
-                  });
-                  rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
-                  return rows.slice(0, 10);
-                })().map((r) => (
+                {recentActivity.map((r) => (
                   <tr key={r.key} className="grid grid-cols-[140px_minmax(0,1fr)_140px_180px_140px] px-5 py-3 items-center">
                     <td className="text-sm text-gray-700">{r.date ? formatDisplayDate(r.date) : '—'}</td>
                     <td className="text-sm font-medium text-gray-900 truncate">{r.type}</td>
@@ -499,7 +414,7 @@ export default function ProfitLossReport() {
                     </td>
                   </tr>
                 ))}
-                {sales.length === 0 && expenses.length === 0 && losses.length === 0 ? (
+                {recentActivity.length === 0 ? (
                   <tr>
                     <td className="px-5 py-10 text-sm text-gray-600" colSpan={5}>
                       No transactions found for this period.

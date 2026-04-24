@@ -5,6 +5,55 @@ import { formatDisplayDate } from '../utils/date';
 import DateInput from '../shared/DateInput';
 import ConfirmDeleteModal from '../shared/ConfirmDeleteModal';
 import { canDeleteRecords } from '../utils/deletePassword';
+import { downloadExcelFile } from '../utils/reportActions';
+import { purchasesApi } from '../services/purchasingApi';
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    void safeJsonParse;
+    const k = String(key || '');
+    if (!k) return false;
+    let ok = false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+      ok = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (ok && !options?.silent) {
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      }
+    }
+  }
+};
+
+// eslint-disable-next-line no-unused-vars
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+// eslint-disable-next-line no-unused-vars
+const supplierIdFromName = (name) => {
+  const s = String(name || '').trim().toLowerCase();
+  if (!s) return '';
+  return s.replace(/\s+/g, '_').replace(/[^a-z0-9_]+/g, '').slice(0, 60) || s.slice(0, 60);
+};
 
 const PurchaseHistory = () => {
   const navigate = useNavigate();
@@ -23,6 +72,7 @@ const PurchaseHistory = () => {
   const [widths, setWidths] = useState([160, 120, 220, 120, 140, 110, 160]);
   const [deleteModal, setDeleteModal] = useState({ open: false, purchaseId: '' });
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [feedback, setFeedback] = useState('');
   const vendorIdFilter = useMemo(() => {
     const params = new URLSearchParams(location.search);
     return params.get('vendorId') || '';
@@ -34,18 +84,32 @@ const PurchaseHistory = () => {
   }, [location.search]);
 
   useEffect(() => {
-    try {
-      const list = JSON.parse(localStorage.getItem('purchases') || '[]');
-      setPurchases(Array.isArray(list) ? list : []);
-    } catch {
-      setPurchases([]);
-    }
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const list = await purchasesApi.list();
+        if (!alive) return;
+        const arr = Array.isArray(list) ? list : [];
+        const withSupplierId = arr.map((p) => ({ ...p, supplierId: p?.supplierId || supplierIdFromName(p?.supplierName) }));
+        setPurchases(withSupplierId);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [refreshKey]);
+
+  useEffect(() => {
+    const onEvent = () => setRefreshKey((v) => v + 1);
+    window.addEventListener('dataUpdated', onEvent);
+    return () => window.removeEventListener('dataUpdated', onEvent);
+  }, []);
 
   const filteredRows = useMemo(() => {
     const q = (search || '').trim().toLowerCase();
     const start = new Date(fromDate);
     const end = new Date(toDate);
+    end.setHours(23, 59, 59, 999);
     const rows = (purchases || []).filter((p) => {
       if (vendorIdsFilter.length > 0 && !vendorIdsFilter.includes(String(p?.supplierId || ''))) return false;
       if (vendorIdsFilter.length === 0 && vendorIdFilter && String(p?.supplierId || '') !== String(vendorIdFilter)) return false;
@@ -109,23 +173,20 @@ const PurchaseHistory = () => {
     window.addEventListener('mouseup', up);
   };
 
-  const exportCSV = () => {
-    const header = ['Date', 'P.O. No.', 'Vendor', 'Items', 'Total'];
+  const exportExcel = () => {
+    const header = ['Date', 'P.O. No.', 'Vendor', 'Items', 'Total (TSH)'];
     const rows = filteredRows.map((p) => [
       formatDisplayDate(p?.date),
       p?.lpoNumber || '',
       p?.supplierName || '',
-      Array.isArray(p?.items) ? p.items.length : 0,
-      Number(p?.total) || 0
+      String(Array.isArray(p?.items) ? p.items.length : 0),
+      String(Number(p?.total) || 0)
     ]);
-    const csv = [header, ...rows].map((x) => x.join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'purchase_history.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadExcelFile(`purchase_history_${new Date().toISOString().slice(0, 10)}.xls`, {
+      title: 'Purchase History',
+      subtitle: `${String(fromDate || '').slice(0, 10)} to ${String(toDate || '').slice(0, 10)}`,
+      rows: [header, ...rows]
+    });
   };
 
   const deletePurchase = (purchaseId) => {
@@ -138,18 +199,27 @@ const PurchaseHistory = () => {
     if (!purchaseId) return;
     if (!canDeleteRecords()) return;
 
+    const startedAt = Date.now();
     setDeleteLoading(true);
-    try {
-      const list = JSON.parse(localStorage.getItem('purchases') || '[]');
-      const next = (Array.isArray(list) ? list : []).filter((p) => String(p?.id) !== String(purchaseId));
-      localStorage.setItem('purchases', JSON.stringify(next));
+    (async () => {
       try {
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
-    } catch {}
-    setDeleteLoading(false);
-    setDeleteModal({ open: false, purchaseId: '' });
-    setRefreshKey((n) => n + 1);
+        await purchasesApi.remove(purchaseId);
+        const next = (Array.isArray(purchases) ? purchases : []).filter((p) => String(p?.id) !== String(purchaseId));
+        setPurchases(next);
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      } catch (error) {
+        setFeedback(String(error?.message || 'Unable to delete purchase.'));
+        window.setTimeout(() => setFeedback(''), 3200);
+      }
+      const elapsed = Date.now() - startedAt;
+      const remaining = 5000 - elapsed;
+      if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+      setDeleteLoading(false);
+      setDeleteModal({ open: false, purchaseId: '' });
+      setRefreshKey((n) => n + 1);
+    })();
   };
 
   const openPurchase = (purchaseId) => {
@@ -158,6 +228,11 @@ const PurchaseHistory = () => {
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl">
+      {feedback ? (
+        <div className="mx-6 mt-6 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+          {feedback}
+        </div>
+      ) : null}
       <ConfirmDeleteModal
         open={deleteModal.open}
         title="Delete Purchase Order?"
@@ -186,7 +261,7 @@ const PurchaseHistory = () => {
           >
             E-mail
           </button>
-          <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportCSV}>
+          <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportExcel}>
             Excel
           </button>
           <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={() => setHideHeader((v) => !v)}>
@@ -306,8 +381,8 @@ const PurchaseHistory = () => {
                           <button className="px-3 py-1.5 rounded-lg bg-green-600 text-white text-sm hover:bg-green-700" onClick={() => openPurchase(p.id)}>
                             Open
                           </button>
-                          {canDeleteRecords() ? (
-                            <button className="ml-2 px-3 py-1.5 rounded-lg border border-red-200 text-red-700 text-sm hover:bg-red-50" onClick={() => deletePurchase(p.id)}>
+                          {canDeleteRecords() && !p.persisted ? (
+                            <button data-delete-trigger="true" className="ml-2 px-3 py-1.5 rounded-lg border border-red-200 text-red-700 text-sm hover:bg-red-50" onClick={() => deletePurchase(p.id)}>
                               <span className="inline-flex items-center gap-2">
                                 <Trash2 className="w-4 h-4" />
                                 Delete

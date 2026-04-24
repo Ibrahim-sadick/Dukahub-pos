@@ -47,163 +47,126 @@ export default function SalesOrderPrint({
   const _total = toNumber(total == null ? _subtotal + _tax : total);
   const convertedTotal = showConverted ? _total * exRate : 0;
 
-  const companyLines = [
-    details.location ? `Address: ${details.location}` : '',
-    details.branch ? `City/State: ${details.branch}` : '',
-    details.poBox ? `Postal Code: ${details.poBox}` : '',
-    details.email ? `Email Address: ${details.email}` : '',
-    details.phone ? `Phone: ${details.phone}` : '',
-    details.website ? `Website: ${details.website}` : '',
-    details.tin ? `TIN: ${details.tin}` : ''
-  ].filter(Boolean);
+  const companyName = String(details.companyName || details.name || '').trim();
+  const logoSrc = String(details.logo || details.logoPreview || '').trim();
+  const poNumber = String(salesOrderNumber || '').trim();
+  const balanceDueText = `${cur} ${money2(_total)}`;
 
   return (
     <div className="so-print w-full bg-white">
-      <div className="px-10 py-10">
-        <div className="border border-gray-300">
-          <div className="px-10 pt-10 pb-6">
-            <div className="flex items-start justify-between gap-10">
-              <div className="min-w-0">
-                <div className="text-[26px] leading-tight font-extrabold text-gray-900">{(details.companyName || details.name || 'Your Company Name').toString()}</div>
-                <div className="mt-3 text-sm text-gray-700 space-y-1">
-                  {companyLines.length ? companyLines.map((line) => <div key={line}>{line}</div>) : null}
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="text-[44px] leading-none font-extrabold text-green-600 tracking-wide">Sales Invoice</div>
-              </div>
-            </div>
+      <div className="px-12 py-10">
+        <div className="flex items-start justify-between gap-10">
+          <div className="min-w-0">
+            {logoSrc ? <img src={logoSrc} alt="" className="h-20 w-auto object-contain" /> : null}
+            <div className="mt-6 text-[20px] font-semibold text-gray-900">{companyName || '—'}</div>
           </div>
 
-          <div className="px-10 pb-10">
-            <div className="bg-green-100 border border-green-200">
-              <div className="px-8 py-8">
-                <div className="grid grid-cols-2 gap-10 text-sm">
-                  <div>
-                    <div className="font-bold text-gray-900">Bill to</div>
-                    <div className="mt-3 space-y-1 text-gray-800">
-                      <div>{(billToName || 'Company Name').toString()}</div>
-                      <div>{billToAddress ? `Address: ${(billToAddress || '').toString()}` : 'Address:'}</div>
-                      {shipToName || shipToAddress ? (
-                        <>
-                          <div className="pt-3 font-bold text-gray-900">Ship to</div>
-                          <div>{(shipToName || '').toString()}</div>
-                          <div>{shipToAddress ? `Address: ${(shipToAddress || '').toString()}` : ''}</div>
-                        </>
-                      ) : null}
-                    </div>
-                  </div>
-                  <div className="space-y-2 text-gray-900">
-                    <div className="flex items-center justify-between gap-6">
-                      <div className="font-bold">Invoice#:</div>
-                      <div className="font-bold">{(invoiceNumber || '').toString() || '—'}</div>
-                    </div>
-                    <div className="flex items-center justify-between gap-6">
-                      <div className="font-bold">Sales Order#:</div>
-                      <div className="font-bold">{(salesOrderNumber || '').toString() || '—'}</div>
-                    </div>
-                    <div className="flex items-center justify-between gap-6">
-                      <div className="font-bold">Date:</div>
-                      <div className="font-bold">{date ? formatDisplayDate(date) : '—'}</div>
-                    </div>
-                    <div className="flex items-center justify-between gap-6">
-                      <div className="font-bold">Due Date:</div>
-                      <div className="font-bold">{dueDate ? formatDisplayDate(dueDate) : '—'}</div>
-                    </div>
-                  </div>
-                </div>
+          <div className="min-w-[380px] text-right">
+            <div className="flex items-end justify-end gap-3">
+              <div className="w-[3px] h-[44px] bg-gray-900" />
+              <div>
+                <div className="text-[46px] leading-none font-semibold tracking-wide text-gray-900">INVOICE</div>
+                <div className="mt-2 text-[18px] text-gray-600 font-medium"># {String(invoiceNumber || '').trim() || '—'}</div>
               </div>
             </div>
 
-            <div className="mt-10 border border-green-200">
-              <div className="bg-green-50 border-b border-green-200">
-                <div className="grid grid-cols-[1fr_120px_120px_140px_160px] text-sm font-bold text-gray-900">
-                  <div className="px-6 py-4">Description</div>
-                  <div className="px-6 py-4 text-right">Quantity</div>
-                  <div className="px-6 py-4 text-right">Unit</div>
-                  <div className="px-6 py-4 text-right">Rate</div>
-                  <div className="px-6 py-4 text-right">Amount</div>
-                </div>
-              </div>
-              <div className="bg-green-50/40">
-                {safeItems.length ? (
-                  safeItems.map((it, idx) => {
-                    const qty = toNumber(it?.qty);
-                    const unit = (it?.unit || '').toString().trim();
-                    const rate = toNumber(it?.rate ?? it?.price);
-                    const amount = toNumber(it?.amount ?? it?.total ?? qty * rate);
-                    const name = (it?.item || it?.name || '').toString().trim();
-                    const desc = (it?.description || '').toString().trim();
-                    const label = [name, desc].filter(Boolean).join(' - ') || 'Product or service description goes here';
-                    return (
-                      <div key={`${idx}-${label}`} className="grid grid-cols-[1fr_120px_120px_140px_160px] text-sm text-gray-900 border-b border-green-200/60 last:border-b-0">
-                        <div className="px-6 py-4 break-words">{label}</div>
-                        <div className="px-6 py-4 text-right">{money2(qty)}</div>
-                        <div className="px-6 py-4 text-right">{unit || '—'}</div>
-                        <div className="px-6 py-4 text-right">{money2(rate)}</div>
-                        <div className="px-6 py-4 text-right">{money2(amount)}</div>
-                      </div>
-                    );
-                  })
-                ) : (
-                  Array.from({ length: 4 }).map((_, idx) => (
-                    <div key={idx} className="grid grid-cols-[1fr_120px_120px_140px_160px] text-sm text-gray-900 border-b border-green-200/60 last:border-b-0">
-                      <div className="px-6 py-4">Product or service description goes here</div>
-                      <div className="px-6 py-4 text-right">0.00</div>
-                      <div className="px-6 py-4 text-right">—</div>
-                      <div className="px-6 py-4 text-right">0.00</div>
-                      <div className="px-6 py-4 text-right">0.00</div>
-                    </div>
-                  ))
-                )}
-              </div>
+            <div className="mt-10 grid grid-cols-2 gap-x-8 gap-y-3 text-[14px]">
+              <div className="text-gray-600">Date:</div>
+              <div className="text-gray-900 font-medium">{date ? formatDisplayDate(date) : '—'}</div>
+              <div className="text-gray-600">Due Date:</div>
+              <div className="text-gray-900 font-medium">{dueDate ? formatDisplayDate(dueDate) : '—'}</div>
+              <div className="text-gray-600">PO Number:</div>
+              <div className="text-gray-900 font-medium">{poNumber || '—'}</div>
             </div>
 
-            <div className="mt-10 bg-green-50/40 border border-green-200">
-              <div className="grid grid-cols-2 gap-10 px-8 py-8">
-                <div className="text-sm text-gray-900">
-                  <div className="font-bold">Notes:</div>
-                  <div className="mt-2 text-gray-800">{(notes || '').toString().trim() || 'Comments can go here.'}</div>
-                </div>
-                <div className="text-sm text-gray-900">
-                  <div className="flex items-center justify-between py-2">
-                    <div className="font-bold">Subtotal</div>
-                    <div>{cur} {money2(_subtotal)}</div>
-                  </div>
-                  <div className="flex items-center justify-between py-2">
-                    <div className="font-bold">Tax Rate</div>
-                    <div>{toNumber(taxRate) ? `${money2(toNumber(taxRate))}%` : '0.00%'}</div>
-                  </div>
-                  <div className="flex items-center justify-between py-2">
-                    <div className="font-bold">Tax</div>
-                    <div>{cur} {money2(_tax)}</div>
-                  </div>
-                  <div className="border-t border-green-300 mt-4 pt-4 flex items-center justify-between">
-                    <div className="text-lg font-extrabold">Total</div>
-                    <div className="text-lg font-extrabold">{cur} {money2(_total)}</div>
-                  </div>
-                  {showConverted ? (
-                    <div className="mt-3 text-sm text-gray-800 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <div className="font-bold">Exchange Rate</div>
-                        <div>USD/TZS {money2(exRate)}</div>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <div className="font-bold">Total ({convCur})</div>
-                        <div>{convCur} {money2(convertedTotal)}</div>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-10 flex items-center justify-between text-sm text-blue-700">
-              <div className="font-semibold">{(details.website || '').toString().trim() || ''}</div>
-              <div className="text-xs text-gray-500">{details.companyName ? '' : ''}</div>
+            <div className="mt-5 bg-gray-100 rounded-md px-6 py-4 flex items-center justify-between gap-4">
+              <div className="text-[16px] font-semibold text-gray-900">Balance Due:</div>
+              <div className="text-[18px] font-semibold text-gray-900">{balanceDueText}</div>
             </div>
           </div>
         </div>
+
+        <div className="mt-10 flex items-start justify-between gap-10">
+          <div className="flex-1 grid grid-cols-2 gap-12">
+            <div>
+              <div className="text-[13px] font-medium text-gray-600">Bill To:</div>
+              <div className="mt-2 text-[14px] font-semibold text-gray-900">{String(billToName || '').trim() || '—'}</div>
+              {String(billToAddress || '').trim() ? (
+                <div className="mt-1 text-[13px] text-gray-700 whitespace-pre-line">{String(billToAddress || '').trim()}</div>
+              ) : null}
+            </div>
+            <div>
+              <div className="text-[13px] font-medium text-gray-600">Ship To:</div>
+              <div className="mt-2 text-[14px] font-semibold text-gray-900">{String(shipToName || '').trim() || '—'}</div>
+              {String(shipToAddress || '').trim() ? (
+                <div className="mt-1 text-[13px] text-gray-700 whitespace-pre-line">{String(shipToAddress || '').trim()}</div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-12 rounded-md overflow-hidden border border-gray-200">
+          <div className="bg-gray-900 text-white text-[13px] font-medium grid grid-cols-[1fr_120px_160px_160px] px-6 py-3">
+            <div>Item</div>
+            <div className="text-right">Quantity</div>
+            <div className="text-right">Rate</div>
+            <div className="text-right">Amount</div>
+          </div>
+          <div className="divide-y divide-gray-200">
+            {safeItems.length ? (
+              safeItems.map((it, idx) => {
+                const qty = toNumber(it?.qty);
+                const rate = toNumber(it?.rate ?? it?.price);
+                const amount = toNumber(it?.amount ?? it?.total ?? qty * rate);
+                const name = String(it?.item || it?.name || '').trim() || '—';
+                const desc = String(it?.description || it?.desc || it?.note || '').trim();
+                return (
+                  <div key={`${idx}-${name}`} className="grid grid-cols-[1fr_120px_160px_160px] px-6 py-4 text-[13px] text-gray-900">
+                    <div className="break-words">
+                      <div className="font-semibold">{name}</div>
+                      {desc ? <div className="mt-1 text-[12px] text-gray-600">{desc}</div> : null}
+                    </div>
+                    <div className="text-right">{money2(qty)}</div>
+                    <div className="text-right">{cur} {money2(rate)}</div>
+                    <div className="text-right">{cur} {money2(amount)}</div>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="px-6 py-6 text-[13px] text-gray-600">No items</div>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-10 flex items-start justify-between gap-10">
+          <div className="flex-1" />
+          <div className="min-w-[360px] text-[14px]">
+            <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+              <div className="text-gray-600 text-right">Subtotal:</div>
+              <div className="text-gray-900 text-right">{cur} {money2(_subtotal)}</div>
+              <div className="text-gray-600 text-right">Tax ({toNumber(taxRate) ? `${money2(toNumber(taxRate))}%` : '0%'}):</div>
+              <div className="text-gray-900 text-right">{cur} {money2(_tax)}</div>
+              <div className="text-gray-600 text-right">Total:</div>
+              <div className="text-gray-900 text-right font-semibold">{cur} {money2(_total)}</div>
+            </div>
+            {showConverted ? (
+              <div className="mt-5 text-[12px] text-gray-600">
+                <div className="flex items-center justify-between">
+                  <div>Exchange Rate</div>
+                  <div className="text-gray-900">USD/TZS {money2(exRate)}</div>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <div>Total ({convCur})</div>
+                  <div className="text-gray-900">{convCur} {money2(convertedTotal)}</div>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        {String(notes || '').trim() ? (
+          <div className="mt-10 text-[12px] text-gray-700 whitespace-pre-line">{String(notes || '').trim()}</div>
+        ) : null}
       </div>
     </div>
   );

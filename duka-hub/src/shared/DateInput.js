@@ -40,7 +40,10 @@ const DateInput = ({ name, value, onChange, className, disabled, ...rest }) => {
         name={name}
         value={isoValue}
         onChange={(e) => onChange && onChange({ target: { name: e.target.name, value: e.target.value } })}
-        className="absolute inset-0 opacity-0 z-0"
+        className="absolute inset-0 opacity-0 z-0 pointer-events-none text-transparent"
+        tabIndex={-1}
+        aria-hidden="true"
+        style={{ caretColor: 'transparent' }}
         disabled={disabled}
         {...rest}
       />

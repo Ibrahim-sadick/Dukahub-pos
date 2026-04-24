@@ -1,6 +1,8 @@
 export const UNIT_OPTIONS = [
   'try',
   'tray',
+  'crt',
+  'crate',
   'kg',
   'gram',
   'pcs',
@@ -24,6 +26,8 @@ export const UNIT_OPTIONS = [
 export const UNIT_LABELS = {
   try: 'Tray',
   tray: 'Tray',
+  crt: 'Crate',
+  crate: 'Crate',
   kg: 'Kilogram',
   gram: 'Gram',
   pcs: 'Pieces',
@@ -43,4 +47,3 @@ export const UNIT_LABELS = {
   item: 'Item',
   set: 'Set'
 };
-

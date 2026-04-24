@@ -7,7 +7,66 @@ import ConfirmDeleteModal from '../shared/ConfirmDeleteModal';
 import { canDeleteRecords } from '../utils/deletePassword';
 import SalesOrderPrint from '../shared/SalesOrderPrint';
 import { elementToPdfFile } from '../utils/pdf';
+import { appendSystemActivity } from '../utils/systemActivity';
+import { productsApi } from '../services/productsApi';
+import { salesApi } from '../services/salesApi';
  
+
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    void safeJsonParse;
+    const k = String(key || '');
+    if (!k) return false;
+    let ok = false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+      ok = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (ok && !options?.silent) {
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      }
+    }
+  }
+};
+
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+const setStoredJson = (key, value) => Promise.resolve(localStore.set(key, value));
+
+const normalizeCurrencyLabel = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || 'TZS';
+};
+
+const formatMoneyValue = (value) => {
+  const amount = Number(value || 0);
+  return Number.isFinite(amount) ? amount.toLocaleString() : '0';
+};
+
+const getSaleCurrencyLabel = (sale) => normalizeCurrencyLabel(sale?.currency || sale?.currencyLabel);
+
+const formatSaleMoney = (sale, value) => `${getSaleCurrencyLabel(sale)} ${formatMoneyValue(value)}`;
 
 const Sales = () => {
   const [activeTab, setActiveTab] = useState('record');
@@ -30,76 +89,49 @@ const Sales = () => {
   const [shareInvoice, setShareInvoice] = useState(null);
   const sharePrintRef = useRef(null);
   const [formData, setFormData] = useState({
-    // Product Details
-    productType: 'eggs', // eggs, chickens, feeds, medicine, equipment
-    eggType: '',
-    productName: 'EGGS',
-    quantity: '',
-    unit: 'tray', // tray, piece, kg, gram, liter, packet, box, dozen
-    price: '',
-    description: '',
-    
-    // Customer Information
-    customerName: '',
-    customerType: 'individual', // individual, business, wholesale
-    phone: '',
-    email: '',
-    
-    // Payment Details
-    paymentMethod: 'cash', // cash, bank_transfer, mobile_money, cheque, credit_card
-    bank: '',
-    accountNumber: '',
-    referenceId: '',
-    mobileProvider: '', // mpesa, tigopesa, airtelmoney
-    transactionId: '',
-    chequeNumber: '',
-    creditCardNumber: '',
-    
-    // Sale Details
-    saleType: 'retail', // retail, wholesale, bulk
-    discount: 0,
-    discountType: 'percentage', // percentage, fixed
-    taxRate: 0,
-    notes: '',
+
     
   });
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem('selectedProductForSale') || '';
-      if (!raw) return;
-      const sel = JSON.parse(raw);
-      if (!sel || typeof sel !== 'object') return;
-      const productType = String(sel.productType || '').trim();
-      const productName = String(sel.productName || '').trim();
-      const unit = String(sel.unit || '').trim();
-      const price = sel.price;
-      setFormData((prev) => ({
-        ...prev,
-        ...(productType ? { productType } : {}),
-        ...(productName ? { productName } : {}),
-        ...(unit ? { unit } : {}),
-        ...(price !== null && price !== undefined && String(price).trim() ? { price: String(price) } : {})
-      }));
-      localStorage.removeItem('selectedProductForSale');
-    } catch {}
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const sel = await getStoredJson('selectedProductForSale', null);
+        if (!alive) return;
+        if (!sel || typeof sel !== 'object') return;
+        const productType = String(sel.productType || '').trim();
+        const productName = String(sel.productName || '').trim();
+        const unit = String(sel.unit || '').trim();
+        const price = sel.price;
+        setFormData((prev) => ({
+          ...prev,
+          ...(productType ? { productType } : {}),
+          ...(productName ? { productName } : {}),
+          ...(unit ? { unit } : {}),
+          ...(price !== null && price !== undefined && String(price).trim() ? { price: String(price) } : {})
+        }));
+        void setStoredJson('selectedProductForSale', null).catch(() => {});
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
     const loadCompanyInfo = () => {
-      try {
-        const saved = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-        setCompanyInfo(saved && typeof saved === 'object' ? saved : {});
-      } catch {
-        setCompanyInfo({});
-      }
+      Promise.resolve()
+        .then(async () => {
+          const saved = await getStoredJson('companyInfo', {});
+          setCompanyInfo(saved && typeof saved === 'object' ? saved : {});
+        })
+        .catch(() => setCompanyInfo({}));
     };
     loadCompanyInfo();
     const onUpdate = () => loadCompanyInfo();
-    window.addEventListener('storage', onUpdate);
     window.addEventListener('companyInfoUpdated', onUpdate);
     return () => {
-      window.removeEventListener('storage', onUpdate);
       window.removeEventListener('companyInfoUpdated', onUpdate);
     };
   }, []);
@@ -121,6 +153,8 @@ const Sales = () => {
     const quantity = parseFloat(formData.quantity) || 0;
     const price = parseFloat(formData.price) || 0;
     const amount = quantity * price;
+    const currencyLabel = normalizeCurrencyLabel(formData.currency || formData.currencyLabel);
+    const exchangeRate = parseFloat(formData.usdRate || formData.exchangeRate || 0) || 0;
     const now = new Date();
     const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
     const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
@@ -145,7 +179,9 @@ const Sales = () => {
       taxRate: 0,
       taxTotal: 0,
       total: amount,
-      currencyLabel: 'TZS'
+      currencyLabel,
+      exchangeRate,
+      convertedCurrencyLabel: currencyLabel === 'USD' && exchangeRate > 0 ? 'TZS' : currencyLabel
     };
   };
 
@@ -193,49 +229,63 @@ const Sales = () => {
   };
 
 
-  // Load recent sales from localStorage
   useEffect(() => {
-    const existingSales = JSON.parse(localStorage.getItem('sales') || '[]');
-    const recent = existingSales.slice(-10).reverse();
-    setRecentSales(recent);
-    try {
-      const savedItems = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-      setInventoryItems(Array.isArray(savedItems) ? savedItems : []);
-    } catch {
-      setInventoryItems([]);
-    }
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const [sales, items] = await Promise.all([
+          salesApi.list().catch(() => getStoredJson('sales', [])),
+          productsApi.list().catch(() => getStoredJson('inventoryItems', []))
+        ]);
+        if (!alive) return;
+        const list = Array.isArray(sales) ? sales : [];
+        setRecentSales(list);
+        setInventoryItems(Array.isArray(items) ? items : []);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
     const handler = () => {
-      try {
-        const savedItems = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        setInventoryItems(Array.isArray(savedItems) ? savedItems : []);
-      } catch {
-        setInventoryItems([]);
-      }
+      Promise.resolve()
+        .then(async () => {
+          const [sales, items] = await Promise.all([
+            salesApi.list().catch(() => getStoredJson('sales', [])),
+            productsApi.list().catch(() => getStoredJson('inventoryItems', []))
+          ]);
+          setRecentSales(Array.isArray(sales) ? sales : []);
+          setInventoryItems(Array.isArray(items) ? items : []);
+        })
+        .catch(() => {
+          setRecentSales([]);
+          setInventoryItems([]);
+        });
     };
     window.addEventListener('dataUpdated', handler);
     return () => window.removeEventListener('dataUpdated', handler);
   }, []);
 
-  const units = useMemo(() => ['kg', 'gram', 'piece', 'tray', 'box', 'packet', 'bottle', 'item', 'set', 'liter'], []);
+  const units = useMemo(() => ['kg', 'gram', 'piece', 'tray', 'crt', 'crate', 'box', 'packet', 'bottle', 'item', 'set', 'liter'], []);
 
   const salesItemOptions = useMemo(() => {
-    const type = formData.productType;
     const map = new Map();
-    const upsert = (name, unit, price, date) => {
+    const upsert = (name, unit, price, date, category) => {
       const key = (name || '').trim();
       if (!key) return;
       const existing = map.get(key);
       const nextDate = String(date || '');
       const next = {
         name: key,
+        category: String(category || existing?.category || 'general').trim() || 'general',
         unit: unit ? String(unit) : (existing?.unit || ''),
         price: Number.isFinite(Number(price)) ? Number(price) : (existing?.price ?? null),
         lastDate: nextDate || (existing?.lastDate || '')
       };
       if (existing?.lastDate && nextDate && nextDate < existing.lastDate) {
+        next.category = existing.category;
         next.unit = existing.unit;
         next.price = existing.price;
         next.lastDate = existing.lastDate;
@@ -243,17 +293,26 @@ const Sales = () => {
       map.set(key, next);
     };
 
-    (inventoryItems || []).forEach((it) => upsert(it?.name, it?.unit, (it?.sellingPrice ?? it?.sellPrice ?? it?.price), it?.updatedAt || it?.createdAt || ''));
-
-    try {
-      const stockIn = JSON.parse(localStorage.getItem(`stockIn_${type}`) || '[]');
-      (Array.isArray(stockIn) ? stockIn : []).forEach((r) => {
-        upsert(r?.itemName, r?.unit, r?.pricePerItem, r?.date || '');
-      });
-    } catch {}
+    (inventoryItems || []).forEach((it) => {
+      if (it?.isStoreOnly) return;
+      upsert(
+        it?.name,
+        it?.unit,
+        it?.sellingPrice ?? it?.sellPrice ?? it?.price,
+        it?.updatedAt || it?.createdAt || '',
+        it?.category || it?.itemType || 'general'
+      );
+    });
 
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [inventoryItems, formData.productType]);
+  }, [inventoryItems]);
+
+  const salesItemOptionsForType = useMemo(() => {
+    const type = String(formData.productType || '').trim();
+    if (!type || type === 'eggs' || type === 'chickens') return [];
+    const wanted = String(type).toLowerCase();
+    return salesItemOptions.filter((x) => String(x.category || 'general').toLowerCase() === wanted);
+  }, [formData.productType, salesItemOptions]);
 
   const openAddNewItem = () => {
     setNewItem({ name: '', unit: 'kg', price: '' });
@@ -264,6 +323,10 @@ const Sales = () => {
     const chosen = salesItemOptions.find((x) => x.name === name);
     setFormData((prev) => {
       const next = { ...prev, productName: name };
+      if (prev.productType !== 'eggs' && prev.productType !== 'chickens') {
+        const cat = String(chosen?.category || prev.productType || 'general').trim() || 'general';
+        next.productType = cat;
+      }
       if (chosen?.unit) next.unit = chosen.unit;
       if (chosen?.price !== null && chosen?.price !== undefined && String(next.price || '').trim() === '') {
         next.price = String(chosen.price);
@@ -272,49 +335,23 @@ const Sales = () => {
     });
   };
 
-  const saveNewSalesItem = () => {
+  const saveNewSalesItem = async () => {
     const type = formData.productType;
     const name = (newItem.name || '').trim();
     if (!name) return;
     const sellingPrice = parseFloat(newItem.price || '0') || 0;
-    const record = {
-      id: `ITEM-${Date.now()}`,
+    await productsApi.create({
       name,
+      category: String(type || 'general').trim() || 'general',
+      productType: String(type || 'general').trim() || 'general',
       unit: (newItem.unit || 'kg').trim() || 'kg',
       sellingPrice,
-      price: sellingPrice,
-      createdAt: new Date().toISOString()
-    };
-    try {
-      const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-      const list = Array.isArray(existing) ? existing : [];
-      const has = list.some((x) => String(x?.name || '').trim().toLowerCase() === name.toLowerCase());
-      const next = has ? list : [...list, record];
-      localStorage.setItem('inventoryItems', JSON.stringify(next));
-      setInventoryItems(next);
-    } catch {
-      const next = [...inventoryItems, record];
-      localStorage.setItem('inventoryItems', JSON.stringify(next));
-      setInventoryItems(next);
-    }
-    try {
-      const stockInKey = `stockIn_${type}`;
-      const stockIn = JSON.parse(localStorage.getItem(stockInKey) || '[]');
-      const list = Array.isArray(stockIn) ? stockIn : [];
-      list.push({
-        id: Date.now() + Math.random(),
-        quantity: '0',
-        unit: record.unit,
-        supplier: 'Manual',
-        pricePerItem: String(record.price),
-        date: new Date().toISOString().slice(0, 10),
-        itemType: type,
-        note: 'Item created',
-        itemName: record.name
-      });
-      localStorage.setItem(stockInKey, JSON.stringify(list));
-    } catch {}
-    window.dispatchEvent(new CustomEvent('dataUpdated'));
+      costPrice: 0,
+      stockQuantity: 0,
+      metadata: { source: 'sales-manual-item' }
+    });
+    const nextItems = await productsApi.list().catch(() => getStoredJson('inventoryItems', []));
+    setInventoryItems(Array.isArray(nextItems) ? nextItems : []);
     applySelectedItem(name);
     setShowAddItem(false);
   };
@@ -335,7 +372,9 @@ const Sales = () => {
           newData.productName = 'CHICKEN MEAT';
           newData.unit = 'kg';
         } else {
-          newData.productName = '';
+          const allowed = new Set(salesItemOptions.filter((x) => String(x.category || 'general') === String(value || 'general')).map((x) => x.name));
+          const cur = String(prev.productName || '').trim();
+          newData.productName = allowed.has(cur) ? cur : '';
         }
       }
       
@@ -343,228 +382,150 @@ const Sales = () => {
     });
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    
-    
-    
+
     setIsLoading(true);
-    
-    setTimeout(() => {
-      // Check stock availability before allowing sale for all product types
-      const itemType = formData.productType;
-      const stockInRecords = JSON.parse(localStorage.getItem(`stockIn_${itemType}`) || '[]');
-      const stockOutRecords = JSON.parse(localStorage.getItem(`stockOut_${itemType}`) || '[]');
-      
-      const totalStockIn = stockInRecords.reduce((sum, record) => sum + parseFloat(record.quantity || 0), 0);
-      const totalStockOut = stockOutRecords.reduce((sum, record) => sum + parseFloat(record.quantity || 0), 0);
-      const availableStock = totalStockIn - totalStockOut;
-      
-      const requestedQuantity = parseFloat(formData.quantity) || 0;
-      
-      let requestedStock = requestedQuantity;
-      if (itemType === 'eggs' && formData.unit !== 'tray') {
-        requestedStock = Math.ceil(requestedQuantity / 30);
-      }
-      
-      if (availableStock <= 0) {
-        setIsLoading(false);
-        return;
-      }
-      
-      if (requestedStock > availableStock) {
-        setIsLoading(false);
-        return;
-      }
-      
-    if (formData.productType !== 'eggs' && formData.productType !== 'chickens') {
-      try {
-        const name = String(formData.productName || '').trim();
-        if (name) {
-          const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-          const list = Array.isArray(existing) ? existing : [];
-          const has = list.some((x) => String(x?.name || '').trim().toLowerCase() === name.toLowerCase());
-          if (!has) {
-            const next = [...list, { id: `ITEM-${Date.now()}-${Math.random()}`, name, unit: String(formData.unit || 'kg'), price: parseFloat(formData.price || '0') || 0, createdAt: new Date().toISOString() }];
-            localStorage.setItem('inventoryItems', JSON.stringify(next));
-            setInventoryItems(next);
+    try {
+      const quantity = parseFloat(formData.quantity) || 0;
+      const unitPrice = parseFloat(formData.price) || 0;
+      const amount = quantity * unitPrice;
+
+      // Automatically create invoice
+      const generateInvoiceNumber = () => {
+        const now = new Date();
+        const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+        const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+        return `INV-${dateStr}-${randomNum}`;
+      };
+
+      const generatePONumber = () => {
+        const now = new Date();
+        const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+        const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+        return `PO-${dateStr}-${randomNum}`;
+      };
+
+      const savedSale = await salesApi.create({
+        ...formData,
+        date: new Date().toISOString().split('T')[0],
+        productName: formData.productType === 'eggs' ? 'EGGS' : formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName,
+        quantity,
+        price: unitPrice,
+        amount,
+        subtotal: amount,
+        finalTotal: amount,
+        amountPaid: amount,
+        balanceDue: 0,
+        status: 'Completed',
+        paymentTerms: 'Net 30',
+        dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        description: formData.description || `${formData.productType} sale`
+      });
+
+      const invoiceData = {
+        id: savedSale?.id || Date.now(),
+        invoiceNumber: savedSale?.invoiceNumber || generateInvoiceNumber(),
+        poNumber: savedSale?.poNumber || generatePONumber(),
+        customerName: formData.customerName,
+        customerEmail: formData.email,
+        customerPhone: formData.phone,
+        customerAddress: '',
+        date: new Date().toISOString().split('T')[0],
+        paymentTerms: 'Net 30',
+        dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        items: [
+          {
+            item: formData.productType === 'eggs' ? 'EGGS' : formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName,
+            qty: formData.quantity,
+            unit: formData.unit,
+            price: formData.price,
+            total: amount
           }
-        }
-      } catch {}
-    }
-
-    const quantity = parseFloat(formData.quantity) || 0;
-    const price = parseFloat(formData.price) || 0;
-    const amount = quantity * price;
-    
-    // Create sale data with all necessary fields for reports
-    const newSale = {
-      id: Date.now(),
-      ...formData,
-      date: new Date().toISOString().split('T')[0],
-      amount: amount,
-      finalTotal: amount, // For compatibility with reports
-      productName: formData.productType === 'eggs' ? 'EGGS' : (formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName),
-      productType: formData.productType,
-      category: formData.productType, // For filtering in reports
-      subcategory: formData.productType === 'eggs' ? 'EGGS' : (formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName),
-      description: formData.description || `${formData.productType} sale`,
-      paymentMethod: formData.paymentMethod,
-      customerName: formData.customerName,
-      customerEmail: formData.email,
-      customerPhone: formData.phone,
-      saleType: formData.saleType,
-      discount: formData.discount || 0,
-      taxRate: formData.taxRate || 0,
-      notes: formData.notes || ''
-    };
-    
-    // Save to sales localStorage
-    const sales = JSON.parse(localStorage.getItem('sales') || '[]');
-    sales.push(newSale);
-    localStorage.setItem('sales', JSON.stringify(sales));
-    
-    // Update recent sales state
-    const updatedSales = [...sales].slice(-10).reverse();
-    setRecentSales(updatedSales);
-    
-    // Reduce stock when sale is made for all product types
-    // Create stock out record for the sale
-    const stockOutRecord = {
-      id: Date.now(),
-      date: new Date().toISOString().split('T')[0],
-      quantity: itemType === 'eggs' && formData.unit !== 'tray' 
-        ? Math.ceil(formData.quantity / 30) // Convert pieces to trays for eggs
-        : formData.quantity,
-      unit: itemType === 'eggs' ? 'tray' : (itemType === 'chickens' ? 'kg' : formData.unit),
-      reason: 'Sale',
-      description: `Sale to ${formData.customerName}`,
-      saleId: newSale.id,
-      itemType: itemType,
-      itemName: formData.productType === 'eggs' ? 'EGGS' : formData.productName
-    };
-    
-    // Reuse stockOutRecords from earlier check
-    stockOutRecords.push(stockOutRecord);
-    localStorage.setItem(`stockOut_${itemType}`, JSON.stringify(stockOutRecords));
-    
-    // Trigger data update event for dashboard
-    window.dispatchEvent(new CustomEvent('dataUpdated'));
-    
-    // Automatically create invoice
-    const generateInvoiceNumber = () => {
-      const now = new Date();
-      const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-      const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-      return `INV-${dateStr}-${randomNum}`;
-    };
-
-    const generatePONumber = () => {
-      const now = new Date();
-      const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-      const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-      return `PO-${dateStr}-${randomNum}`;
-    };
-
-    const invoiceData = {
-      id: Date.now(),
-      invoiceNumber: generateInvoiceNumber(),
-      poNumber: generatePONumber(),
-      customerName: formData.customerName,
-      customerEmail: formData.email,
-      customerPhone: formData.phone,
-      customerAddress: '',
-      date: new Date().toISOString().split('T')[0],
-      paymentTerms: 'Net 30',
-      dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-      items: [{
-        item: formData.productType === 'eggs' ? 'EGGS' : (formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName),
-        qty: formData.quantity,
+        ],
+        subtotal: amount,
+        tax: 0,
+        shipping: 0,
+        finalTotal: amount,
+        amountPaid: amount,
+        balanceDue: 0,
+        currency: savedSale?.currency || normalizeCurrencyLabel(formData.currency || formData.currencyLabel),
+        currencyLabel: savedSale?.currency || normalizeCurrencyLabel(formData.currency || formData.currencyLabel),
+        usdRate: savedSale?.usdRate || parseFloat(formData.usdRate || formData.exchangeRate || 0) || 0,
+        exchangeRate: savedSale?.exchangeRate || parseFloat(formData.usdRate || formData.exchangeRate || 0) || 0,
+        status: 'Unpaid',
+        // Additional fields for filtering and display
+        paymentMethod: formData.paymentMethod,
+        productType: formData.productType,
+        productName: formData.productType === 'eggs' ? 'EGGS' : formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName,
+        quantity: formData.quantity,
         unit: formData.unit,
-        price: formData.price,
-        total: amount
-      }],
-      subtotal: amount,
-      tax: 0,
-      shipping: 0,
-      finalTotal: amount,
-      amountPaid: amount,
-      balanceDue: 0,
-      status: 'Unpaid',
-      // Additional fields for filtering and display
-      paymentMethod: formData.paymentMethod,
-      productType: formData.productType,
-      productName: formData.productType === 'eggs' ? 'EGGS' : (formData.productType === 'chickens' ? 'CHICKEN MEAT' : formData.productName),
-      quantity: formData.quantity,
-      unit: formData.unit,
-      unitPrice: formData.price,
-      saleType: formData.saleType,
-      discount: formData.discount || 0,
-      taxRate: formData.taxRate || 0,
-      notes: formData.notes || '',
-      description: formData.description || `${formData.productType} sale`
-    };
+        unitPrice: formData.price,
+        saleType: formData.saleType,
+        discount: formData.discount || 0,
+        taxRate: formData.taxRate || 0,
+        notes: formData.notes || '',
+        description: formData.description || `${formData.productType} sale`
+      };
 
-    // Save invoice to localStorage
-    const invoicedSales = JSON.parse(localStorage.getItem('invoicedSales') || '[]');
-    invoicedSales.push(invoiceData);
-    localStorage.setItem('invoicedSales', JSON.stringify(invoicedSales));
-    
-    
-    
-    // Trigger data update event for reports and dashboard
-    window.dispatchEvent(new CustomEvent('dataUpdated'));
-    
-    // Reset form
-    setFormData({
-      // Product Details
-      productType: 'eggs',
-      eggType: '',
-      productName: 'EGGS',
-      quantity: '',
-      unit: 'tray',
-      price: '',
-      description: '',
-      
-      // Customer Information
-      customerName: '',
-      customerType: 'individual',
-      phone: '',
-      email: '',
-      
-      // Payment Details
-      paymentMethod: 'cash',
-      bank: '',
-      accountNumber: '',
-      referenceId: '',
-      mobileProvider: '',
-      transactionId: '',
-      chequeNumber: '',
-      creditCardNumber: '',
-      
-      // Sale Details
-      saleType: 'retail',
-      discount: 0,
-      discountType: 'percentage',
-      taxRate: 0,
-      notes: '',
-      
-    });
-    
-    // Switch to recent sales tab
-    setActiveTab('recent');
-    
-    setIsLoading(false);
-    
-    
-    }, 5000); // 5 seconds loading
+      const invoicedSales = Array.isArray(await getStoredJson('invoicedSales', [])) ? await getStoredJson('invoicedSales', []) : [];
+      invoicedSales.push(invoiceData);
+      void setStoredJson('invoicedSales', invoicedSales).catch(() => {});
+
+      // Trigger data update event for reports and dashboard
+      window.dispatchEvent(new CustomEvent('dataUpdated'));
+
+      // Reset form
+      setFormData({
+        // Product Details
+        productType: 'eggs',
+        eggType: '',
+        productName: 'EGGS',
+        quantity: '',
+        unit: 'tray',
+        price: '',
+        description: '',
+
+        // Customer Information
+        customerName: '',
+        customerType: 'individual',
+        phone: '',
+        email: '',
+
+        // Payment Details
+        paymentMethod: 'cash',
+        bank: '',
+        accountNumber: '',
+        referenceId: '',
+        mobileProvider: '',
+        transactionId: '',
+        chequeNumber: '',
+        creditCardNumber: '',
+
+        // Sale Details
+        saleType: 'retail',
+        discount: 0,
+        discountType: 'percentage',
+        taxRate: 0,
+        notes: ''
+      });
+
+      // Switch to recent sales tab
+      setActiveTab('recent');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // Load recent sales data
   useEffect(() => {
     const loadSales = () => {
-      const sales = JSON.parse(localStorage.getItem('sales') || '[]');
-      setRecentSales(sales);
+      Promise.resolve()
+        .then(async () => {
+          const sales = await salesApi.list().catch(() => getStoredJson('sales', []));
+          setRecentSales(Array.isArray(sales) ? sales : []);
+        })
+        .catch(() => setRecentSales([]));
     };
     loadSales();
     
@@ -605,6 +566,10 @@ const Sales = () => {
 
   // Handle edit sale
   const handleEditSale = (sale) => {
+    if (sale?.persisted) {
+      alert('Editing synced sales is not supported yet.');
+      return;
+    }
     if (!isWithin24Hours(sale.date)) {
       alert('This record cannot be edited. Staff accounts can only edit records within 24 hours.');
       return;
@@ -617,32 +582,67 @@ const Sales = () => {
   const handleCancelEdit = () => {
     setIsEditLoading(true);
     setLoadingAction('cancel');
-    setTimeout(() => {
-      setEditingSaleId(null);
-      setEditFormData({});
-      setIsEditLoading(false);
-      setLoadingAction(null);
-    }, 5000);
+    setEditingSaleId(null);
+    setEditFormData({});
+    setIsEditLoading(false);
+    setLoadingAction(null);
   };
 
   // Handle save edit
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     setIsEditLoading(true);
     setLoadingAction('save');
-    setTimeout(() => {
-      const sales = JSON.parse(localStorage.getItem('sales') || '[]');
-      const updatedSales = sales.map(sale => 
-        sale.id === editingSaleId ? { ...editFormData } : sale
-      );
-      localStorage.setItem('sales', JSON.stringify(updatedSales));
+    try {
+      const sales = Array.isArray(await getStoredJson('sales', [])) ? await getStoredJson('sales', []) : [];
+      const prevSale = sales.find((sale) => sale.id === editingSaleId) || null;
+      if (prevSale?.persisted) {
+        alert('Editing synced sales is not supported yet.');
+        return;
+      }
+      const updatedSales = sales.map((sale) => (sale.id === editingSaleId ? { ...editFormData } : sale));
+      void setStoredJson('sales', updatedSales).catch(() => {});
       setRecentSales(updatedSales);
+      try {
+        if (prevSale) {
+          productsApi.removeLocalMovementsByReference(prevSale.id);
+        }
+
+        const itemType = String(editFormData.productType || '').trim() || 'eggs';
+        const qtyRaw = Number(editFormData.quantity) || 0;
+        const qty = itemType === 'eggs' && String(editFormData.unit || '').trim() !== 'tray' ? Math.ceil(qtyRaw / 30) : qtyRaw;
+        productsApi.appendLocalMovements([
+          {
+            referenceId: editingSaleId,
+            saleId: editingSaleId,
+            movementType: 'stock_out',
+            itemType,
+            itemName: itemType === 'eggs' ? 'EGGS' : String(editFormData.productName || ''),
+            quantity: qty,
+            unit: itemType === 'eggs' ? 'tray' : itemType === 'chickens' ? 'kg' : String(editFormData.unit || ''),
+            pricePerItem: Number(editFormData.price) || 0,
+            reason: 'Sale Edit',
+            description: `Edited sale to ${String(editFormData.customerName || '').trim()}`,
+            date: String(editFormData.date || new Date().toISOString().split('T')[0])
+          }
+        ]);
+      } catch {}
       window.dispatchEvent(new CustomEvent('dataUpdated'));
+      try {
+        appendSystemActivity(
+          'sale_edit',
+          'Sale updated',
+          `${String(editFormData.productName || editFormData.productType || '').trim() || 'Sale'} • TSH ${Number(editFormData.amount || editFormData.finalTotal || 0).toLocaleString()}`,
+          'POS Sales',
+          'success',
+          { saleId: editingSaleId }
+        );
+      } catch {}
       setEditingSaleId(null);
       setEditFormData({});
+    } finally {
       setIsEditLoading(false);
       setLoadingAction(null);
-      
-    }, 5000);
+    }
   };
 
   // Handle delete sale
@@ -660,20 +660,31 @@ const Sales = () => {
       return;
     }
     if (isEditLoading && loadingAction === 'delete') return;
+    const saleId = editingSaleId;
+    const startedAt = Date.now();
     setIsEditLoading(true);
     setLoadingAction('delete');
-    setTimeout(() => {
-      const sales = JSON.parse(localStorage.getItem('sales') || '[]');
-      const updatedSales = sales.filter(sale => sale.id !== editingSaleId);
-      localStorage.setItem('sales', JSON.stringify(updatedSales));
-      setRecentSales(updatedSales.slice(-10).reverse());
-      window.dispatchEvent(new CustomEvent('dataUpdated'));
-      setEditingSaleId(null);
-      setEditFormData({});
-      setIsEditLoading(false);
-      setLoadingAction(null);
-      setDeleteSaleOpen(false);
-    }, 5000);
+    (async () => {
+      try {
+        await salesApi.remove(saleId);
+        const updatedSales = Array.isArray(await getStoredJson('sales', [])) ? await getStoredJson('sales', []) : [];
+        setRecentSales(updatedSales.slice(-10).reverse());
+        try {
+          appendSystemActivity('sale_delete', 'Sale deleted', `Sale #${String(saleId || '')}`, 'POS Sales', 'warning', { saleId });
+        } catch {}
+        setEditingSaleId(null);
+        setEditFormData({});
+      } catch (error) {
+        alert(String(error?.message || 'Unable to delete sale.'));
+      } finally {
+        const elapsed = Date.now() - startedAt;
+        const remaining = 5000 - elapsed;
+        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+        setIsEditLoading(false);
+        setLoadingAction(null);
+        setDeleteSaleOpen(false);
+      }
+    })();
   };
 
   // Handle edit form change
@@ -786,7 +797,7 @@ const Sales = () => {
                     await new Promise((r) => requestAnimationFrame(() => r()));
                     const file = await elementToPdfFile(sharePrintRef.current, `${invoice.invoiceNumber}.pdf`);
                     const customer = normalizeTzPhone(formData.phone);
-                    const text = `Sales Invoice ${invoice.invoiceNumber}\nTotal: TZS ${Number(invoice.total || 0).toLocaleString()}`;
+                    const text = `Sales Invoice ${invoice.invoiceNumber}\nTotal: ${invoice.currencyLabel} ${Number(invoice.total || 0).toLocaleString()}`;
                     const canShareFiles = Boolean(navigator?.canShare && navigator.canShare({ files: [file] }));
                     if (canShareFiles) {
                       await navigator.share({ files: [file], title: invoice.invoiceNumber, text });
@@ -877,7 +888,7 @@ const Sales = () => {
                     >
                       <option value="">Select item</option>
                       <option value="__add_new_item__">+ Add new item</option>
-                      {salesItemOptions.map((x)=> <option key={x.name} value={x.name}>{x.name}</option>)}
+                      {salesItemOptionsForType.map((x)=> <option key={x.name} value={x.name}>{x.name}</option>)}
                     </select>
                   )}
                 </div>
@@ -1327,8 +1338,8 @@ const Sales = () => {
                   taxTotal={shareInvoice.taxTotal}
                   total={shareInvoice.total}
                   currencyLabel={shareInvoice.currencyLabel}
-                  exchangeRate={null}
-                  convertedCurrencyLabel="TZS"
+                  exchangeRate={shareInvoice.exchangeRate}
+                  convertedCurrencyLabel={shareInvoice.convertedCurrencyLabel}
                 />
               </div>
             ) : null}
@@ -1556,7 +1567,7 @@ const Sales = () => {
                           className="w-full px-2 py-1 border border-gray-300"
                         />
                       ) : (
-                        `TSH ${(sale.amount || sale.finalTotal || 0).toLocaleString()}`
+                        formatSaleMoney(sale, sale.amount || sale.finalTotal || 0)
                       )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
@@ -1588,16 +1599,13 @@ const Sales = () => {
                           </button>
                           {isAdmin() ? (
                             <button
+                              data-delete-trigger="true"
                               onClick={handleDeleteSale}
-                              disabled={isEditLoading}
-                              className={`${isEditLoading && loadingAction === 'delete' ? 'opacity-50 cursor-not-allowed' : 'text-red-600 hover:text-red-900'}`}
+                              disabled={Boolean(isEditLoading && loadingAction !== 'delete')}
+                              className={`${isEditLoading && loadingAction !== 'delete' ? 'opacity-50 cursor-not-allowed' : 'text-red-600 hover:text-red-900'}`}
                               title="Delete"
                             >
-                              {isEditLoading && loadingAction === 'delete' ? (
-                                <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full loading-spin"></div>
-                              ) : (
-                                <Trash2 className="w-4 h-4" />
-                              )}
+                              <Trash2 className="w-4 h-4" />
                             </button>
                           ) : null}
                         </div>
@@ -1662,8 +1670,12 @@ const Sales = () => {
                     <p className="mt-1 text-sm text-gray-900">{selectedSale.quantity} {selectedSale.unit}</p>
                   </div>
                   <div>
+                    <label className="block text-sm font-medium text-gray-700">Currency</label>
+                    <p className="mt-1 text-sm text-gray-900">{getSaleCurrencyLabel(selectedSale)}</p>
+                  </div>
+                  <div>
                     <label className="block text-sm font-medium text-gray-700">Unit Price</label>
-                    <p className="mt-1 text-sm text-gray-900">TSH {parseFloat(selectedSale.price || 0).toLocaleString()}</p>
+                    <p className="mt-1 text-sm text-gray-900">{formatSaleMoney(selectedSale, parseFloat(selectedSale.price || 0))}</p>
                   </div>
                 </div>
 
@@ -1735,13 +1747,13 @@ const Sales = () => {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-700">Subtotal</label>
-                      <p className="mt-1 text-sm text-gray-900">TSH {(selectedSale.amount || selectedSale.finalTotal || 0).toLocaleString()}</p>
+                      <p className="mt-1 text-sm text-gray-900">{formatSaleMoney(selectedSale, selectedSale.amount || selectedSale.finalTotal || 0)}</p>
                     </div>
                     {selectedSale.discount > 0 && (
                       <div>
                         <label className="block text-sm font-medium text-gray-700">Discount</label>
                         <p className="mt-1 text-sm text-gray-900">
-                          {selectedSale.discountType === 'percentage' ? `${selectedSale.discount}%` : `TSH ${selectedSale.discount.toLocaleString()}`}
+                          {selectedSale.discountType === 'percentage' ? `${selectedSale.discount}%` : formatSaleMoney(selectedSale, selectedSale.discount)}
                         </p>
                       </div>
                     )}
@@ -1751,9 +1763,15 @@ const Sales = () => {
                         <p className="mt-1 text-sm text-gray-900">{selectedSale.taxRate}%</p>
                       </div>
                     )}
+                    {selectedSale.exchangeRate > 0 && getSaleCurrencyLabel(selectedSale) === 'USD' && (
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700">Exchange Rate</label>
+                        <p className="mt-1 text-sm text-gray-900">USD/TZS {formatMoneyValue(selectedSale.exchangeRate)}</p>
+                      </div>
+                    )}
                     <div>
                       <label className="block text-sm font-medium text-gray-700">Total Amount</label>
-                      <p className="mt-1 text-lg font-semibold text-green-600">TSH {(selectedSale.amount || selectedSale.finalTotal || 0).toLocaleString()}</p>
+                      <p className="mt-1 text-lg font-semibold text-green-600">{formatSaleMoney(selectedSale, selectedSale.amount || selectedSale.finalTotal || 0)}</p>
                     </div>
                   </div>
                 </div>

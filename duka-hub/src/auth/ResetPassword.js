@@ -1,9 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, KeyRound, Phone } from 'lucide-react';
-import { RiShoppingCart2Line } from 'react-icons/ri';
 import { sendOtp } from '../services/otpService';
-import { authApi } from '../services/backendApi';
+import { requestPasswordReset, resetOwnerPassword } from '../services/authApi';
 
 const ResetPassword = () => {
   const [step, setStep] = useState(1);
@@ -14,12 +13,13 @@ const ResetPassword = () => {
   });
   const [errors, setErrors] = useState({});
   const [otp, setOtp] = useState('');
-  const [generatedOtp, setGeneratedOtp] = useState('');
+  const [challengeId, setChallengeId] = useState('');
   const [otpSentTo, setOtpSentTo] = useState('');
+  const [normalizedPhone, setNormalizedPhone] = useState('');
   const [resendCountdown, setResendCountdown] = useState(0);
   const otpRefs = useRef([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [success, setSuccess] = useState('');
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
   const [apiError, setApiError] = useState('');
 
   const normalizeTzPhone = (raw) => {
@@ -42,6 +42,12 @@ const ResetPassword = () => {
     return `+255 ${local}`;
   };
 
+  const generateOtpCode = () => {
+    const array = new Uint32Array(1);
+    window.crypto.getRandomValues(array);
+    return String(array[0] % 1000000).padStart(6, '0');
+  };
+
   const handleChange = (e) => {
     const { name, value } = e.target;
     const nextValue =
@@ -62,7 +68,6 @@ const ResetPassword = () => {
     }));
     if (name === 'phone') setOtpSentTo('');
     if (name === 'phone') setApiError('');
-    if (name === 'newPassword' || name === 'confirmPassword') setSuccess('');
     
     // Clear error when user starts typing
     if (errors[name]) {
@@ -97,12 +102,12 @@ const ResetPassword = () => {
       }
       setIsSubmitting(true);
       setApiError('');
-      setSuccess('');
       try {
-        const code = String(Math.floor(100000 + Math.random() * 900000));
-        await authApi.passwordResetRequest({ phone: normalized, otp: code });
+        const code = generateOtpCode();
+        const challenge = await requestPasswordReset({ phone: normalized, otp: code });
         await sendOtp({ phone: normalized, otp: code });
-        setGeneratedOtp(code);
+        setChallengeId(String(challenge?.challengeId || ''));
+        setNormalizedPhone(normalized);
         setOtp('');
         setOtpSentTo(formatTzDisplay(normalized));
         setStep(2);
@@ -128,26 +133,84 @@ const ResetPassword = () => {
     }
   }, [step, resendCountdown]);
 
+  useEffect(() => {
+    if (step !== 2) return;
+    if (!navigator?.credentials?.get) return;
+    const ac = new AbortController();
+    Promise.resolve()
+      .then(() => navigator.credentials.get({ otp: { transport: ['sms'] }, signal: ac.signal }))
+      .then((cred) => {
+        const code = String(cred?.code || '').replace(/[^0-9]/g, '').slice(0, 6);
+        if (code.length !== 6) return;
+        setOtp(code);
+        setErrors((prev) => ({ ...prev, otp: '' }));
+        const el = otpRefs.current[Math.min(5, code.length)];
+        if (el && typeof el.focus === 'function') el.focus();
+      })
+      .catch(() => {});
+    return () => ac.abort();
+  }, [step]);
+
   const handleOtpSubmit = (e) => {
     e.preventDefault();
+    if (isVerifyingOtp) return;
     const trimmed = (otp || '').replace(/\D/g, '').slice(0, 6);
+    const nextErrors = {};
+    if (!trimmed || trimmed.length !== 6) nextErrors.otp = 'Enter the 6-digit code';
+    setErrors((prev) => ({ ...prev, ...nextErrors }));
+    if (Object.keys(nextErrors).length > 0) return;
+    setApiError('');
+    setIsVerifyingOtp(true);
+    setIsVerifyingOtp(false);
+    setStep(3);
+    setTimeout(() => {
+      const el = document.getElementById('newPassword');
+      if (el && typeof el.focus === 'function') el.focus();
+    }, 0);
+  };
+
+  const handlePasswordSubmit = (e) => {
+    e.preventDefault();
+    if (isSubmitting) return;
     const p1 = String(formData.newPassword || '');
     const p2 = String(formData.confirmPassword || '');
     const nextErrors = {};
-    if (!trimmed || trimmed.length !== 6) nextErrors.otp = 'Enter the 6-digit code';
     if (!p1) nextErrors.newPassword = 'New password is required';
     if (!p2) nextErrors.confirmPassword = 'Please confirm your password';
     if (p1 && p2 && p1 !== p2) nextErrors.confirmPassword = 'Passwords do not match';
-    if (trimmed && trimmed.length === 6 && generatedOtp && trimmed !== generatedOtp) nextErrors.otp = 'Invalid code. Try again';
     setErrors((prev) => ({ ...prev, ...nextErrors }));
     if (Object.keys(nextErrors).length > 0) return;
+    const phone255 = normalizeTzPhone(String(formData.phone || '').trim()) || normalizedPhone;
+    if (!phone255) {
+      setStep(1);
+      setErrors((prev) => ({ ...prev, phone: 'Phone number is invalid' }));
+      return;
+    }
+    const otpCode = String(otp || '').replace(/[^0-9]/g, '').slice(0, 6);
+    if (otpCode.length !== 6) {
+      setStep(2);
+      setErrors((prev) => ({ ...prev, otp: 'Enter the 6-digit code' }));
+      return;
+    }
+    if (!String(challengeId || '').trim()) {
+      setStep(1);
+      setApiError('Your reset session expired. Please request a new OTP code.');
+      return;
+    }
     setIsSubmitting(true);
     setApiError('');
-    setSuccess('');
     Promise.resolve()
-      .then(() => authApi.passwordResetConfirm({ phone: String(formData.phone || '').trim(), otp: trimmed, newPassword: p1 }))
-      .then(() => setSuccess('Password updated successfully. You can now login.'))
-      .catch((err) => setApiError(String(err?.message || 'Unable to reset password. Try again.')))
+      .then(() => resetOwnerPassword({ challengeId, phone: phone255, otp: otpCode, newPassword: p1 }))
+      .then(() => setStep(4))
+      .catch((err) => {
+        const code = String(err?.code || '');
+        if (code.startsWith('RESET_')) {
+          setStep(2);
+          setErrors((prev) => ({ ...prev, otp: String(err?.message || 'Unable to verify the OTP code.') }));
+        } else {
+          setApiError(String(err?.message || 'Unable to reset password. Try again.'));
+        }
+      })
       .finally(() => setIsSubmitting(false));
   };
 
@@ -155,19 +218,19 @@ const ResetPassword = () => {
     if (resendCountdown !== 0) return;
     if (isSubmitting) return;
     const phone = String(formData.phone || '').trim();
-    const normalized = normalizeTzPhone(phone);
+    const normalized = normalizeTzPhone(phone) || normalizedPhone;
     if (!normalized) {
       setErrors((prev) => ({ ...prev, phone: 'Phone number is required' }));
       return;
     }
     setIsSubmitting(true);
     setApiError('');
-    setSuccess('');
     try {
-      const code = String(Math.floor(100000 + Math.random() * 900000));
-      await authApi.passwordResetRequest({ phone: normalized, otp: code });
+      const code = generateOtpCode();
+      const challenge = await requestPasswordReset({ phone: normalized, otp: code });
       await sendOtp({ phone: normalized, otp: code });
-      setGeneratedOtp(code);
+      setChallengeId(String(challenge?.challengeId || ''));
+      setNormalizedPhone(normalized);
       setOtp('');
       setResendCountdown(60);
       setErrors((prev) => ({ ...prev, otp: '' }));
@@ -183,12 +246,16 @@ const ResetPassword = () => {
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 via-white to-emerald-100 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
       <div className="max-w-md w-full space-y-8">
-        {/* Logo */}
         <div className="text-center">
           <div className="flex justify-center mb-4">
-            <div className="w-32 h-32 rounded-full bg-green-600 flex items-center justify-center">
-              <RiShoppingCart2Line className="text-white drop-shadow-sm" size={92} />
-            </div>
+            <img
+              src={encodeURI(`${String(process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '')}/DUKAHUB 3.png`)}
+              alt="Logo"
+              className="h-24 w-auto max-w-full object-contain"
+              onError={(e) => {
+                e.currentTarget.src = `${String(process.env.PUBLIC_URL || '').trim().replace(/\/+$/, '')}/favicon-96x96.png`;
+              }}
+            />
           </div>
         </div>
 
@@ -229,164 +296,210 @@ const ResetPassword = () => {
                 className={isSubmitting ? 'w-full bg-green-600/70 text-white py-3 px-4 rounded-lg cursor-not-allowed font-medium' : 'w-full bg-green-600 text-white py-3 px-4 rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 font-medium'}
               >
                 <span className="inline-flex items-center justify-center gap-2">
-                  {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
                   <span>Send OTP Code</span>
                 </span>
               </button>
             </form>
           </div>
         ) : step === 2 ? (
-          // Step 2: Enter OTP
-          <div>
-            <div className="space-y-8">
-              <div className="flex items-start gap-4">
-                <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
-                  <KeyRound className="w-6 h-6 text-green-700" />
-                </div>
-                <div className="pt-1">
-                  <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Verify OTP Code</div>
-                  <div className="mt-2 text-sm text-gray-600">
-                    Enter the 6-digit code sent to <span className="text-green-700 font-semibold">{otpSentTo || formData.phone}</span>
-                  </div>
+          <div className="space-y-8">
+            <div className="flex items-start gap-4">
+              <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
+                <KeyRound className="w-6 h-6 text-green-700" />
+              </div>
+              <div className="pt-1">
+                <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">Verify Code</div>
+                <div className="mt-2 text-sm text-gray-600">
+                  Code sent to <span className="text-green-700 font-semibold">{otpSentTo || formData.phone}</span>
                 </div>
               </div>
+            </div>
 
-              <form onSubmit={handleOtpSubmit} className="space-y-6">
-                <div
-                  className="grid grid-cols-6 gap-3"
-                  onPaste={(e) => {
-                    const pasted = String(e.clipboardData?.getData('text') || '').replace(/[^0-9]/g, '').slice(0, 6);
-                    if (!pasted) return;
-                    e.preventDefault();
-                    setOtp(pasted);
-                    setErrors((prev) => ({ ...prev, otp: '' }));
-                    const idx = Math.min(5, pasted.length);
-                    const el = otpRefs.current[idx];
+            <form onSubmit={handleOtpSubmit} className="space-y-6">
+              <div
+                className="grid grid-cols-6 gap-3"
+                onPaste={(e) => {
+                  const pasted = String(e.clipboardData?.getData('text') || '').replace(/[^0-9]/g, '').slice(0, 6);
+                  if (!pasted) return;
+                  e.preventDefault();
+                  setOtp(pasted);
+                  setErrors((prev) => ({ ...prev, otp: '' }));
+                  const idx = Math.min(5, pasted.length);
+                  const el = otpRefs.current[idx];
+                  if (el && typeof el.focus === 'function') el.focus();
+                }}
+              >
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <input
+                    key={i}
+                    ref={(el) => {
+                      otpRefs.current[i] = el;
+                    }}
+                    value={(otp || '')[i] || ''}
+                    onChange={(e) => {
+                      const raw = String(e.target.value || '');
+                      const digits = raw.replace(/[^0-9]/g, '');
+                      if (!digits) {
+                        const next = String(otp || '').padEnd(6, ' ').split('');
+                        next[i] = '';
+                        setOtp(next.join('').replace(/\s/g, '').slice(0, 6));
+                        return;
+                      }
+                      const d = digits.slice(-1);
+                      const next = String(otp || '').padEnd(6, ' ').split('');
+                      next[i] = d;
+                      const merged = next.join('').replace(/\s/g, '').slice(0, 6);
+                      setOtp(merged);
+                      setErrors((prev) => ({ ...prev, otp: '' }));
+                      const el = otpRefs.current[Math.min(5, i + 1)];
+                      if (el && typeof el.focus === 'function') el.focus();
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Backspace' && !((otp || '')[i] || '')) {
+                        const el = otpRefs.current[Math.max(0, i - 1)];
+                        if (el && typeof el.focus === 'function') el.focus();
+                      }
+                    }}
+                    className={`h-14 w-full rounded-2xl border text-center text-xl font-semibold outline-none focus:ring-2 focus:ring-green-500 ${
+                      errors.otp ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
+                    }`}
+                    inputMode="numeric"
+                    maxLength={1}
+                  />
+                ))}
+              </div>
+              {errors.otp ? <div className="text-red-600 text-sm -mt-4">{errors.otp}</div> : null}
+              {apiError ? <div className="text-red-600 text-sm -mt-2">{apiError}</div> : null}
+
+              <div className="text-center text-sm text-gray-600">
+                Didn&apos;t receive code?{' '}
+                <button
+                  type="button"
+                  className="text-green-700 font-semibold hover:text-green-800 disabled:text-green-300"
+                  disabled={resendCountdown > 0 || isSubmitting || isVerifyingOtp}
+                  onClick={() => {
+                    if (resendCountdown > 0) return;
+                    handleResendOtp();
+                    const el = otpRefs.current[0];
                     if (el && typeof el.focus === 'function') el.focus();
                   }}
                 >
-                  {Array.from({ length: 6 }).map((_, i) => (
-                    <input
-                      key={i}
-                      ref={(el) => {
-                        otpRefs.current[i] = el;
-                      }}
-                      value={(otp || '')[i] || ''}
-                      onChange={(e) => {
-                        const raw = String(e.target.value || '');
-                        const digits = raw.replace(/[^0-9]/g, '');
-                        if (!digits) {
-                          const next = String(otp || '').padEnd(6, ' ').split('');
-                          next[i] = '';
-                          setOtp(next.join('').replace(/\s/g, '').slice(0, 6));
-                          return;
-                        }
-                        const d = digits.slice(-1);
-                        const next = String(otp || '').padEnd(6, ' ').split('');
-                        next[i] = d;
-                        const merged = next.join('').replace(/\s/g, '').slice(0, 6);
-                        setOtp(merged);
-                        setErrors((prev) => ({ ...prev, otp: '' }));
-                        const el = otpRefs.current[Math.min(5, i + 1)];
-                        if (el && typeof el.focus === 'function') el.focus();
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Backspace' && !((otp || '')[i] || '')) {
-                          const el = otpRefs.current[Math.max(0, i - 1)];
-                          if (el && typeof el.focus === 'function') el.focus();
-                        }
-                      }}
-                      className={`h-14 w-full rounded-2xl border text-center text-xl font-semibold outline-none focus:ring-2 focus:ring-green-500 ${
-                        errors.otp ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
-                      }`}
-                      inputMode="numeric"
-                      maxLength={1}
-                    />
-                  ))}
-                </div>
-                {errors.otp ? <div className="text-red-600 text-sm -mt-4">{errors.otp}</div> : null}
-                {apiError ? <div className="text-red-600 text-sm -mt-2">{apiError}</div> : null}
-                {success ? <div className="text-green-700 text-sm -mt-2">{success}</div> : null}
-
-                <div className="text-center text-sm text-gray-600">
-                  Didn&apos;t receive code?{' '}
-                  <button
-                    type="button"
-                    className="text-green-700 font-semibold hover:text-green-800 disabled:text-green-300"
-                    disabled={resendCountdown > 0 || isSubmitting}
-                    onClick={() => {
-                      if (resendCountdown > 0) return;
-                      handleResendOtp();
-                      const el = otpRefs.current[0];
-                      if (el && typeof el.focus === 'function') el.focus();
-                    }}
-                  >
-                    {resendCountdown > 0 ? `Resend in 00:${String(resendCountdown).padStart(2, '0')}` : 'Resend'}
-                  </button>
-                </div>
-
-                <div>
-                  <label htmlFor="newPassword" className="block text-sm font-semibold text-gray-900 mb-2">
-                    New Password <span className="text-red-500">*</span>
-                  </label>
-                  <input
-                    id="newPassword"
-                    name="newPassword"
-                    type="password"
-                    value={formData.newPassword}
-                    onChange={handleChange}
-                    className={`w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 focus:ring-green-500 ${
-                      errors.newPassword ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
-                    }`}
-                    placeholder="Enter new password"
-                  />
-                  {errors.newPassword ? <div className="mt-2 text-sm text-red-600">{errors.newPassword}</div> : null}
-                </div>
-
-                <div>
-                  <label htmlFor="confirmPassword" className="block text-sm font-semibold text-gray-900 mb-2">
-                    Confirm Password <span className="text-red-500">*</span>
-                  </label>
-                  <input
-                    id="confirmPassword"
-                    name="confirmPassword"
-                    type="password"
-                    value={formData.confirmPassword}
-                    onChange={handleChange}
-                    className={`w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 focus:ring-green-500 ${
-                      errors.confirmPassword ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
-                    }`}
-                    placeholder="Confirm new password"
-                  />
-                  {errors.confirmPassword ? <div className="mt-2 text-sm text-red-600">{errors.confirmPassword}</div> : null}
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className={isSubmitting ? 'w-full px-5 py-3 rounded-2xl bg-green-600/70 text-white cursor-not-allowed flex items-center justify-center gap-2 text-lg font-semibold' : 'w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold'}
-                >
-                  {isSubmitting ? <span className="w-5 h-5 rounded-full border-2 border-white/70 border-t-white animate-spin" /> : null}
-                  <span>Reset Password</span>
-                  <ArrowRight className="w-5 h-5" />
+                  {resendCountdown > 0 ? `Resend in 00:${String(resendCountdown).padStart(2, '0')}` : 'Resend'}
                 </button>
-                <button
-                  type="button"
-                  className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
-                  onClick={() => {
-                    setStep(1);
-                    setOtp('');
-                    setGeneratedOtp('');
-                    setErrors((prev) => ({ ...prev, otp: '' }));
-                    setApiError('');
-                    setSuccess('');
-                  }}
-                >
-                  <ArrowLeft className="w-5 h-5" />
-                  <span>Back</span>
-                </button>
-              </form>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isVerifyingOtp}
+                className={isVerifyingOtp ? 'w-full px-5 py-3 rounded-2xl bg-green-600/70 text-white cursor-not-allowed flex items-center justify-center gap-2 text-lg font-semibold' : 'w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold'}
+              >
+                <span>{isVerifyingOtp ? 'Verifying...' : 'Verify'}</span>
+                <ArrowRight className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
+                onClick={() => {
+                  setStep(1);
+                  setOtp('');
+                  setChallengeId('');
+                  setErrors((prev) => ({ ...prev, otp: '' }));
+                  setApiError('');
+                }}
+              >
+                <ArrowLeft className="w-5 h-5" />
+                <span>Back</span>
+              </button>
+            </form>
+          </div>
+        ) : step === 3 ? (
+          <div className="space-y-8">
+            <div className="flex items-start gap-4">
+              <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center">
+                <KeyRound className="w-6 h-6 text-green-700" />
+              </div>
+              <div className="pt-1">
+                <div className="mt-2 text-3xl font-extrabold text-gray-900 tracking-tight">New Password</div>
+                <div className="mt-2 text-sm text-gray-600">Set a new password for your account.</div>
+              </div>
             </div>
+
+            <form onSubmit={handlePasswordSubmit} className="space-y-6">
+              <div>
+                <label htmlFor="newPassword" className="block text-sm font-semibold text-gray-900 mb-2">
+                  New Password <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="newPassword"
+                  name="newPassword"
+                  type="password"
+                  value={formData.newPassword}
+                  onChange={handleChange}
+                  className={`w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 focus:ring-green-500 ${
+                    errors.newPassword ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
+                  }`}
+                  placeholder="Enter new password"
+                />
+                {errors.newPassword ? <div className="mt-2 text-sm text-red-600">{errors.newPassword}</div> : null}
+              </div>
+
+              <div>
+                <label htmlFor="confirmPassword" className="block text-sm font-semibold text-gray-900 mb-2">
+                  Confirm Password <span className="text-red-500">*</span>
+                </label>
+                <input
+                  id="confirmPassword"
+                  name="confirmPassword"
+                  type="password"
+                  value={formData.confirmPassword}
+                  onChange={handleChange}
+                  className={`w-full px-4 py-3 rounded-2xl border outline-none focus:ring-2 focus:ring-green-500 ${
+                    errors.confirmPassword ? 'border-red-300 bg-red-50/40' : 'border-green-200 bg-white'
+                  }`}
+                  placeholder="Confirm new password"
+                />
+                {errors.confirmPassword ? <div className="mt-2 text-sm text-red-600">{errors.confirmPassword}</div> : null}
+              </div>
+
+              {apiError ? <div className="text-red-600 text-sm -mt-2">{apiError}</div> : null}
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className={isSubmitting ? 'w-full px-5 py-3 rounded-2xl bg-green-600/70 text-white cursor-not-allowed flex items-center justify-center gap-2 text-lg font-semibold' : 'w-full px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 flex items-center justify-center gap-2 text-lg font-semibold'}
+              >
+                <span>Change Password</span>
+                <ArrowRight className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                className="w-full px-5 py-3 rounded-2xl bg-white border border-green-200 text-gray-900 hover:bg-green-50 flex items-center justify-center gap-2 text-lg font-semibold"
+                onClick={() => {
+                  setStep(2);
+                  setErrors((prev) => ({ ...prev, newPassword: '', confirmPassword: '' }));
+                  setApiError('');
+                }}
+                disabled={isSubmitting}
+              >
+                <ArrowLeft className="w-5 h-5" />
+                <span>Back</span>
+              </button>
+            </form>
+          </div>
+        ) : step === 4 ? (
+          <div className="text-center space-y-6">
+            <div className="flex justify-center">
+              <div className="w-16 h-16 rounded-2xl bg-green-50 flex items-center justify-center">
+                <KeyRound className="w-7 h-7 text-green-700" />
+              </div>
+            </div>
+            <div>
+              <div className="text-3xl font-extrabold text-gray-900 tracking-tight">Password changed!</div>
+              <div className="mt-2 text-sm text-gray-600">You can now log in with your new password.</div>
+            </div>
+            <Link to="/login" className="inline-flex w-full justify-center px-5 py-3 rounded-2xl bg-green-600 text-white hover:bg-green-700 text-lg font-semibold">
+              Log in now
+            </Link>
           </div>
         ) : null}
 

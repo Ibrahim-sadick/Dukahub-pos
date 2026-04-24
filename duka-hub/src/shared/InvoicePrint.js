@@ -48,12 +48,13 @@ export default function InvoicePrint({
   const cur = (currencyLabel || 'TZS').toString().trim() || 'TZS';
   const details = companyDetails && typeof companyDetails === 'object' ? companyDetails : {};
   const companyLines = [
+    details.poBox ? `P.O. Box: ${details.poBox}` : '',
+    details.email ? `Email: ${details.email}` : '',
+    details.phone ? `Phone: ${details.phone}` : '',
+    details.fax ? `Fax: ${details.fax}` : '',
     details.tin ? `TIN: ${details.tin}` : '',
     details.location ? `Location: ${details.location}` : '',
-    details.phone ? `Phone: ${details.phone}` : '',
-    details.email ? `Email: ${details.email}` : '',
     details.website ? `Website: ${details.website}` : '',
-    details.poBox ? `P.O. Box: ${details.poBox}` : ''
   ].filter(Boolean);
   const exRate = toNumber(exchangeRate);
   const exLabel = (exchangeLabel || `${cur}/TZS`).toString().trim() || `${cur}/TZS`;
@@ -67,18 +68,12 @@ export default function InvoicePrint({
       <div className="pl-0 pr-10 pt-6 pb-12">
         <div className="flex items-start justify-between gap-12">
           <div className="flex-1 min-w-0">
-            <div className="w-64 h-64 rounded-full bg-amber-400 flex items-center justify-center overflow-hidden">
-              {logoUrl ? (
-                <img src={logoUrl} alt="" className="w-full h-full object-contain bg-white/90 scale-[1.7]" />
-              ) : (
-                <div className="w-12 h-12 rounded-full bg-white/90" />
-              )}
-            </div>
+            {logoUrl ? <img src={logoUrl} alt="" className="h-20 w-auto object-contain" /> : null}
             <div className="mt-6">
-              <div className="text-[28px] leading-tight font-extrabold text-gray-900 tracking-wide">{displayCompany.toUpperCase()}</div>
+              <div className="text-[34px] leading-tight font-extrabold text-gray-900 tracking-wide">{displayCompany.toUpperCase()}</div>
             </div>
             {companyLines.length ? (
-              <div className="mt-3 text-sm text-gray-600 space-y-1">
+              <div className="mt-2 text-[11px] text-gray-600 space-y-1">
                 {companyLines.map((line) => (
                   <div key={line} className="leading-snug">{line}</div>
                 ))}
@@ -150,9 +145,13 @@ export default function InvoicePrint({
                   const rate = toNumber(it?.rate ?? it?.price);
                   const amount = toNumber(it?.amount ?? it?.total ?? qty * rate);
                   const name = (it?.item || it?.name || '').toString().trim() || '—';
+                  const desc = (it?.description || it?.desc || it?.note || '').toString().trim();
                   return (
                     <div key={`${name}-${idx}`} className="grid grid-cols-[1fr_120px_120px_140px_160px] text-sm border-t border-gray-200">
-                      <div className="px-7 py-4 font-semibold text-gray-900 break-words">{name}</div>
+                      <div className="px-7 py-4 break-words">
+                        <div className="font-semibold text-gray-900">{name}</div>
+                        {desc ? <div className="mt-1 text-xs text-gray-600">{desc}</div> : null}
+                      </div>
                       <div className="px-7 py-4 text-right text-gray-900">{qty ? qty.toLocaleString() : '0'}</div>
                       <div className="px-7 py-4 text-right text-gray-900">{unit || '—'}</div>
                       <div className="px-7 py-4 text-right text-gray-900">{cur} {money2(rate)}</div>
@@ -191,4 +190,3 @@ export default function InvoicePrint({
     </div>
   );
 }
-

@@ -1,6 +1,10 @@
+/* eslint-disable react-hooks/exhaustive-deps */
+/* eslint-disable no-unused-vars */
 /* eslint-disable no-undef */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Navigate, useLocation } from 'react-router-dom';
+import { appendSystemActivity } from '../utils/systemActivity';
+import { elementToPdfFile } from '../utils/pdf';
 import {
   Printer,
   Mail,
@@ -14,8 +18,7 @@ import {
   Search,
   Download,
   Upload,
-  // eslint-disable-next-line no-unused-vars
-  Lightbulb,
+  MessageCircle,
   ClipboardList,
   HandCoins,
   Building2,
@@ -25,24 +28,94 @@ import {
   FileText,
   Truck,
   PackageCheck,
+  AlertTriangle,
+  XCircle,
   CheckCircle2,
   HelpCircle,
   ArrowRight,
-  ArrowDown
+  ArrowDown,
+  Loader2
 } from 'lucide-react';
 import { formatDisplayDate } from '../utils/date';
 import { UNIT_OPTIONS } from '../utils/units';
+import { withMinimumDelay } from '../utils/loadingDelay';
 import DateInput from '../shared/DateInput';
 import SalesOrderPrint from '../shared/SalesOrderPrint';
 import ConfirmDeleteModal from '../shared/ConfirmDeleteModal';
 import SystemPreferences from './SystemPreferences';
 import { canDeleteRecords } from '../utils/deletePassword';
-import { downloadCsvFile, printWithTitle } from '../utils/reportActions';
+import { downloadExcelFile, printWithTitle } from '../utils/reportActions';
 import SalesReport from './reports/SalesReport';
 import ExpensesReport from './reports/ExpensesReport';
 import PurchaseReport from './reports/PurchaseReport';
+import SystemLogsPage from './SystemLogs';
+import { customersApi } from '../services/customersApi';
+import { damageStocksApi } from '../services/damageStocksApi';
+import { expensesApi } from '../services/expensesApi';
+import { productsApi } from '../services/productsApi';
+import { salesApi } from '../services/salesApi';
+import { listRuntimeCacheKeys, readRuntimeCache, removeRuntimeCache, writeRuntimeCache } from '../services/runtimeCache';
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
 
-export default function Placeholder() {
+const localStore = {
+  get(key, fallback) {
+    return readRuntimeCache(String(key || ''), fallback);
+  },
+  set(key, value, options) {
+    const k = String(key || '');
+    if (!k) return false;
+    writeRuntimeCache(k, value);
+    if (!options?.silent) {
+      try {
+        window.dispatchEvent(new CustomEvent('dataUpdated'));
+      } catch {}
+    }
+    return true;
+  },
+  del(key, options) {
+    removeRuntimeCache(String(key || ''));
+    if (!options?.silent) {
+      try {
+        window.dispatchEvent(new CustomEvent('dataUpdated'));
+      } catch {}
+    }
+  },
+  list() {
+    return listRuntimeCacheKeys().sort();
+  }
+};
+
+const getStoredJson = (key, fallback) => localStore.get(key, fallback);
+const setStoredJson = (key, value) => Promise.resolve(localStore.set(key, value));
+
+const mapCustomerToContactFields = (customer) => ({
+  name: customer?.name || customer?.company || '',
+  email: customer?.mainEmail || customer?.email || customer?.ccEmail || '',
+  phone: customer?.mainPhone || customer?.phone || customer?.mobile || customer?.workPhone || '',
+  billTo: customer?.billTo || customer?.address || '',
+  shipTo: customer?.shipTo || customer?.address || ''
+});
+
+const getInventoryMovementDirection = (movement) => {
+  const rawType = String(movement?.rawMovementType || movement?.movementType || '').trim().toUpperCase();
+  if (rawType === 'STOCK_OUT' || rawType.endsWith('_OUT')) return 'stock_out';
+  if (rawType === 'STOCK_IN' || rawType.endsWith('_IN') || rawType === 'OPENING_BALANCE') return 'stock_in';
+  const quantityDelta = Number(movement?.quantityDelta);
+  if (Number.isFinite(quantityDelta)) return quantityDelta < 0 ? 'stock_out' : 'stock_in';
+  return rawType.toLowerCase().includes('out') ? 'stock_out' : 'stock_in';
+};
+
+const isInventoryMovementOut = (movement) => getInventoryMovementDirection(movement) === 'stock_out';
+const isInventoryMovementIn = (movement) => getInventoryMovementDirection(movement) === 'stock_in';
+
+function PlaceholderInner({ __localStore }) {
+  const localStorage = __localStore;
   const { page } = useParams();
   const navigate = useNavigate();
   const currentUser = useMemo(() => {
@@ -50,34 +123,11 @@ export default function Placeholder() {
       const local = JSON.parse(localStorage.getItem('currentUser') || 'null');
       if (local) return local;
     } catch {}
-    try {
-      const session = JSON.parse(sessionStorage.getItem('currentUser') || 'null');
-      if (session) return session;
-    } catch {}
     return null;
-  }, []);
-  const isAdmin = String(currentUser?.role || '').toLowerCase() === 'admin';
+  }, [localStorage]);
+  const isAdmin = true;
   const canDelete = canDeleteRecords();
-  const restrictedForStaff = !isAdmin && (String(page || '') === 'settings-preferences' || String(page || '').startsWith('reports-') || String(page || '') === 'system-logs');
-  const lockedForAll = [
-    'accounting',
-    'income-overview',
-    'expense-overview',
-    'stock-value',
-    'period-closing',
-    'audit-trail',
-    'banking',
-    'banking-accounts',
-    'banking-transfers',
-    'banking-reconciliation',
-    'alerts-expiry',
-    'reports-inventory',
-    'reports-kpis',
-    'integrations',
-    'integration-mobile-money',
-    'integration-sms',
-    'integration-export'
-  ].includes(String(page || ''));
+  const restrictedForStaff = false;
   const [activeBusiness, setActiveBusiness] = React.useState(() => {
     try {
       const v = JSON.parse(localStorage.getItem('activeBusiness') || '"eggs"');
@@ -97,39 +147,7 @@ export default function Placeholder() {
     };
     window.addEventListener('activeBusinessChanged', handler);
     return () => window.removeEventListener('activeBusinessChanged', handler);
-  }, []);
-
-  if (lockedForAll) {
-    return (
-      <div className="space-y-6">
-        <div className="bg-white border border-gray-300 rounded-xl p-6">
-          <div className="text-lg font-semibold text-gray-900">Access denied</div>
-          <div className="text-sm text-gray-600 mt-1">This module is locked and cannot be accessed.</div>
-          <div className="mt-4">
-            <button className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={() => navigate('/dashboard')}>
-              Back to Dashboard
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (restrictedForStaff) {
-    return (
-      <div className="space-y-6">
-        <div className="bg-white border border-gray-300 rounded-xl p-6">
-          <div className="text-lg font-semibold text-gray-900">Access denied</div>
-          <div className="text-sm text-gray-600 mt-1">You do not have permission to access this module.</div>
-          <div className="mt-4">
-            <button className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={() => navigate('/dashboard')}>
-              Back to Dashboard
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  }, [localStorage]);
 
   const NotAvailable = ({ forBusiness }) => (
     <div className="bg-white border border-red-200 rounded-xl p-6">
@@ -137,6 +155,443 @@ export default function Placeholder() {
       <div className="text-xs text-red-600 mt-1">This module is only available for {forBusiness} business type.</div>
     </div>
   );
+
+  const AccountingHome = () => {
+    const tiles = [
+      { id: 'income', title: 'Income Overview', desc: 'Sales summary and trends', to: '/placeholder/income-overview' },
+      { id: 'expense', title: 'Expense Overview', desc: 'Expense summary and categories', to: '/placeholder/expense-overview' },
+      { id: 'stock', title: 'Stock Value', desc: 'Inventory valuation', to: '/placeholder/stock-value' },
+      { id: 'closing', title: 'Period Closing', desc: 'Close months and keep snapshots', to: '/placeholder/period-closing' },
+      { id: 'audit', title: 'Audit Trail', desc: 'System activity log', to: '/placeholder/audit-trail' }
+    ];
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Accounting</div>
+          <div className="text-sm text-gray-600 mt-1">Admin-only tools for summaries and audit.</div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {tiles.map((t) => (
+            <button key={t.id} type="button" className="text-left bg-white border border-gray-200 rounded-xl p-5 hover:bg-gray-50" onClick={() => navigate(t.to)}>
+              <div className="text-base text-gray-900">{t.title}</div>
+              <div className="text-sm text-gray-600 mt-1">{t.desc}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const IncomeOverview = () => {
+    const [fromDate, setFromDate] = useState(() => {
+      const d = new Date();
+      return new Date(d.getFullYear(), d.getMonth(), d.getDate() - 30).toISOString().slice(0, 10);
+    });
+    const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
+    const [q, setQ] = useState('');
+    const readArray = (key) => {
+      const v = localStore.get(key, []);
+      return Array.isArray(v) ? v : [];
+    };
+    const rows = useMemo(() => {
+      const start = Date.parse(`${String(fromDate || '').slice(0, 10)}T00:00:00`);
+      const end = Date.parse(`${String(toDate || '').slice(0, 10)}T23:59:59`);
+      const term = String(q || '').trim().toLowerCase();
+      const salesAll = [...readArray('sales'), ...readArray('salesOrders')];
+      const list = salesAll
+        .map((s) => {
+          const date = String(s?.date || s?.createdAt || s?.timestamp || '');
+          const ts = Date.parse(date);
+          const amount = Number(s?.amount ?? s?.finalTotal ?? s?.total ?? 0) || 0;
+          const customer = String(s?.customer || s?.customerName || '').trim();
+          const id = String(s?.id || s?.invoiceNo || s?.invoiceNumber || '').trim();
+          return { id: id || `${ts}-${Math.random().toString(16).slice(2)}`, date, ts, amount, customer };
+        })
+        .filter((r) => Number.isFinite(r.ts))
+        .filter((r) => (!Number.isFinite(start) ? true : r.ts >= start) && (!Number.isFinite(end) ? true : r.ts <= end))
+        .filter((r) => (term ? `${r.id} ${r.customer}`.toLowerCase().includes(term) : true))
+        .sort((a, b) => b.ts - a.ts);
+      const total = list.reduce((s, r) => s + Number(r.amount || 0), 0);
+      return { list, total, count: list.length };
+    }, [fromDate, q, toDate]);
+    const bars = useMemo(() => {
+      const start = Date.parse(`${String(fromDate || '').slice(0, 10)}T00:00:00`);
+      const end = Date.parse(`${String(toDate || '').slice(0, 10)}T00:00:00`);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
+      const map = new Map();
+      rows.list.forEach((r) => {
+        const k = String(r.date || '').slice(0, 10);
+        if (!k) return;
+        map.set(k, (map.get(k) || 0) + Number(r.amount || 0));
+      });
+      const days = Math.min(60, Math.floor((end - start) / (24 * 60 * 60 * 1000)) + 1);
+      const out = [];
+      for (let i = 0; i < days; i += 1) {
+        const d = new Date(start + i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        out.push({ day: d, value: map.get(d) || 0 });
+      }
+      const max = out.reduce((m, x) => Math.max(m, x.value), 0) || 1;
+      return out.map((x) => ({ ...x, pct: Math.max(0, Math.min(100, (x.value / max) * 100)) }));
+    }, [fromDate, rows.list, toDate]);
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Income Overview</div>
+          <div className="text-sm text-gray-600 mt-1">Based on sales recorded in the system.</div>
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            <div>
+              <div className="text-xs text-gray-600">From</div>
+              <DateInput value={fromDate} onChange={setFromDate} />
+            </div>
+            <div>
+              <div className="text-xs text-gray-600">To</div>
+              <DateInput value={toDate} onChange={setToDate} />
+            </div>
+            <div className="flex-1 min-w-[220px]">
+              <div className="text-xs text-gray-600">Search</div>
+              <input className="w-full px-3 py-2 border border-gray-300 rounded-lg" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Customer or invoice..." />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Total income</div>
+            <div className="mt-1 text-xl text-gray-900">TZS {Number(rows.total || 0).toLocaleString()}</div>
+          </div>
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Transactions</div>
+            <div className="mt-1 text-xl text-gray-900">{Number(rows.count || 0).toLocaleString()}</div>
+          </div>
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Average</div>
+            <div className="mt-1 text-xl text-gray-900">TZS {(rows.count ? rows.total / rows.count : 0).toFixed(0)}</div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-sm text-gray-900">Daily income</div>
+          <div className="mt-4 grid grid-cols-10 gap-2">
+            {bars.map((b) => (
+              <div key={b.day} className="h-28 flex items-end">
+                <div className="w-full bg-green-600/80 rounded" style={{ height: `${b.pct}%` }} title={`${b.day} • TZS ${Number(b.value || 0).toLocaleString()}`} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const ExpenseOverview = () => {
+    const [fromDate, setFromDate] = useState(() => {
+      const d = new Date();
+      return new Date(d.getFullYear(), d.getMonth(), d.getDate() - 30).toISOString().slice(0, 10);
+    });
+    const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
+    const [q, setQ] = useState('');
+    const readArray = (key) => {
+      const v = localStore.get(key, []);
+      return Array.isArray(v) ? v : [];
+    };
+    const rows = useMemo(() => {
+      const start = Date.parse(`${String(fromDate || '').slice(0, 10)}T00:00:00`);
+      const end = Date.parse(`${String(toDate || '').slice(0, 10)}T23:59:59`);
+      const term = String(q || '').trim().toLowerCase();
+      const expenses = readArray('expenses');
+      const list = expenses
+        .map((e) => {
+          const date = String(e?.date || e?.createdAt || '');
+          const ts = Date.parse(date);
+          const amount = Number(e?.amount ?? 0) || 0;
+          const category = String(e?.category || e?.type || '').trim();
+          const desc = String(e?.description || e?.note || '').trim();
+          const id = String(e?.id || '').trim();
+          return { id: id || `${ts}-${Math.random().toString(16).slice(2)}`, date, ts, amount, category, desc };
+        })
+        .filter((r) => Number.isFinite(r.ts))
+        .filter((r) => (!Number.isFinite(start) ? true : r.ts >= start) && (!Number.isFinite(end) ? true : r.ts <= end))
+        .filter((r) => (term ? `${r.category} ${r.desc}`.toLowerCase().includes(term) : true))
+        .sort((a, b) => b.ts - a.ts);
+      const total = list.reduce((s, r) => s + Number(r.amount || 0), 0);
+      const byCat = {};
+      list.forEach((r) => {
+        const k = String(r.category || 'General');
+        byCat[k] = (byCat[k] || 0) + Number(r.amount || 0);
+      });
+      const cats = Object.entries(byCat)
+        .map(([category, amount]) => ({ category, amount }))
+        .sort((a, b) => b.amount - a.amount);
+      return { list, total, count: list.length, cats };
+    }, [fromDate, q, toDate]);
+    const maxCat = rows.cats.reduce((m, x) => Math.max(m, x.amount), 0) || 1;
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Expense Overview</div>
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            <div>
+              <div className="text-xs text-gray-600">From</div>
+              <DateInput value={fromDate} onChange={setFromDate} />
+            </div>
+            <div>
+              <div className="text-xs text-gray-600">To</div>
+              <DateInput value={toDate} onChange={setToDate} />
+            </div>
+            <div className="flex-1 min-w-[220px]">
+              <div className="text-xs text-gray-600">Search</div>
+              <input className="w-full px-3 py-2 border border-gray-300 rounded-lg" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Category or description..." />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Total expenses</div>
+            <div className="mt-1 text-xl text-gray-900">TZS {Number(rows.total || 0).toLocaleString()}</div>
+          </div>
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Records</div>
+            <div className="mt-1 text-xl text-gray-900">{Number(rows.count || 0).toLocaleString()}</div>
+          </div>
+          <div className="bg-white border border-gray-200 rounded-xl p-5">
+            <div className="text-xs text-gray-600">Average</div>
+            <div className="mt-1 text-xl text-gray-900">TZS {(rows.count ? rows.total / rows.count : 0).toFixed(0)}</div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-sm text-gray-900">By category</div>
+          <div className="mt-4 space-y-3">
+            {rows.cats.map((c) => (
+              <div key={c.category} className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm text-gray-900">{c.category}</div>
+                  <div className="text-sm text-gray-900">TZS {Number(c.amount || 0).toLocaleString()}</div>
+                </div>
+                <div className="h-3 rounded-full bg-gray-100 border border-gray-200 overflow-hidden">
+                  <div className="h-full rounded-full bg-red-500" style={{ width: `${Math.max(0, Math.min(100, (c.amount / maxCat) * 100))}%` }} />
+                </div>
+              </div>
+            ))}
+            {rows.cats.length === 0 ? <div className="text-sm text-gray-600">No expenses found</div> : null}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const StockValueAccounting = () => {
+    const [q, setQ] = useState('');
+    const rows = useMemo(() => {
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const term = norm(q);
+      const itemsRaw = (() => {
+        const v = localStore.get('inventoryItems', []);
+        return Array.isArray(v) ? v : [];
+      })();
+      const list = itemsRaw
+        .map((it) => {
+          const name = String(it?.name || it?.itemName || '').trim();
+          const qtyRaw = String(it?.qty ?? it?.quantity ?? 0).replace(/,/g, '');
+          const qty = parseFloat(qtyRaw);
+          const unitCost = Number(it?.buyingPrice ?? it?.buyPrice ?? it?.costPrice ?? 0) || 0;
+          return { id: String(it?.id || name || Math.random()), name, qty: Number.isFinite(qty) ? qty : 0, unitCost, totalValue: (Number.isFinite(qty) ? qty : 0) * unitCost };
+        })
+        .filter((r) => r.name)
+        .filter((r) => (term ? norm(r.name).includes(term) : true))
+        .sort((a, b) => b.totalValue - a.totalValue);
+      const totalValue = list.reduce((s, r) => s + Number(r.totalValue || 0), 0);
+      const totalUnits = list.reduce((s, r) => s + Math.max(0, Number(r.qty || 0)), 0);
+      return { list, totalValue, totalUnits };
+    }, [q]);
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Stock Value</div>
+          <div className="text-sm text-gray-600 mt-1">Based on inventory item quantities and buying price.</div>
+          <div className="mt-4 flex flex-wrap items-end gap-3">
+            <div className="flex-1 min-w-[220px]">
+              <div className="text-xs text-gray-600">Search</div>
+              <input className="w-full px-3 py-2 border border-gray-300 rounded-lg" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search product..." />
+            </div>
+            <div className="bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700">
+              Value: TZS {Number(rows.totalValue || 0).toLocaleString()}
+            </div>
+            <div className="bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-700">
+              Units: {Number(rows.totalUnits || 0).toLocaleString()}
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs text-gray-600">Product</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Qty</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Unit Cost</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Total</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {rows.list.map((r) => (
+                  <tr key={r.id}>
+                    <td className="px-4 py-3 text-sm text-gray-900">{r.name}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.qty || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.unitCost || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.totalValue || 0).toLocaleString()}</td>
+                  </tr>
+                ))}
+                {rows.list.length === 0 ? (
+                  <tr>
+                    <td className="px-4 py-6 text-sm text-gray-600" colSpan={4}>No items found</td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const PeriodClosing = () => {
+    const [period, setPeriod] = useState(() => new Date().toISOString().slice(0, 7));
+    const [rows, setRows] = useState([]);
+    const [saving, setSaving] = useState(false);
+    const readArray = (key) => {
+      const v = localStore.get(key, []);
+      return Array.isArray(v) ? v : [];
+    };
+    useEffect(() => {
+      setRows(readArray('dh_periodClosings'));
+    }, []);
+    const computeSnapshot = useCallback(() => {
+      const m = String(period || '').trim();
+      if (!/^\d{4}-\d{2}$/.test(m)) return null;
+      const [yy, mm] = m.split('-');
+      const y = Number(yy);
+      const month = Number(mm);
+      if (!Number.isFinite(y) || !Number.isFinite(month)) return null;
+      const start = Date.parse(`${yy}-${mm}-01T00:00:00`);
+      const end = Date.parse(new Date(y, month, 0, 23, 59, 59).toISOString());
+      const salesAll = [...readArray('sales'), ...readArray('salesOrders')].map((s) => ({ date: String(s?.date || s?.createdAt || ''), amount: Number(s?.amount ?? s?.finalTotal ?? s?.total ?? 0) || 0 }));
+      const expenses = readArray('expenses').map((e) => ({ date: String(e?.date || e?.createdAt || ''), amount: Number(e?.amount ?? 0) || 0 }));
+      const income = salesAll.filter((r) => {
+        const ts = Date.parse(r.date);
+        return Number.isFinite(ts) && ts >= start && ts <= end;
+      }).reduce((s, r) => s + r.amount, 0);
+      const expense = expenses.filter((r) => {
+        const ts = Date.parse(r.date);
+        return Number.isFinite(ts) && ts >= start && ts <= end;
+      }).reduce((s, r) => s + r.amount, 0);
+      const items = readArray('inventoryItems');
+      const stockValue = items.reduce((s, it) => {
+        const qty = parseFloat(String(it?.qty ?? it?.quantity ?? 0).replace(/,/g, ''));
+        const unitCost = Number(it?.buyingPrice ?? it?.buyPrice ?? it?.costPrice ?? 0) || 0;
+        return s + (Number.isFinite(qty) ? qty : 0) * unitCost;
+      }, 0);
+      return { id: `CLOSE-${Date.now()}-${Math.random().toString(16).slice(2)}`, period: m, income, expense, profit: income - expense, stockValue, createdAt: new Date().toISOString() };
+    }, [period]);
+    const closePeriod = async () => {
+      if (saving) return;
+      const snap = computeSnapshot();
+      if (!snap) return;
+      setSaving(true);
+      try {
+        const existing = readArray('dh_periodClosings');
+        const next = [snap, ...existing].slice(0, 200);
+        localStore.set('dh_periodClosings', next);
+        setRows(next);
+      } finally {
+        setSaving(false);
+      }
+    };
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Period Closing</div>
+          <div className="text-sm text-gray-600 mt-1">Creates a snapshot for a month (income, expense, profit, stock value).</div>
+          <div className="mt-4 flex items-end gap-3 flex-wrap">
+            <div>
+              <div className="text-xs text-gray-600">Month</div>
+              <input className="px-3 py-2 border border-gray-300 rounded-lg" type="month" value={period} onChange={(e) => setPeriod(e.target.value)} />
+            </div>
+            <button type="button" className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-60" onClick={closePeriod} disabled={saving}>
+              {saving ? 'Closing...' : 'Close Period'}
+            </button>
+          </div>
+        </div>
+
+        <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs text-gray-600">Period</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Income</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Expense</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Profit</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Stock Value</th>
+                  <th className="px-4 py-3 text-right text-xs text-gray-600">Created</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {rows.map((r) => (
+                  <tr key={r.id}>
+                    <td className="px-4 py-3 text-sm text-gray-900">{r.period}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.income || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.expense || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.profit || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-900">{Number(r.stockValue || 0).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-right text-gray-700">{formatDisplayDate(r.createdAt)}</td>
+                  </tr>
+                ))}
+                {rows.length === 0 ? (
+                  <tr>
+                    <td className="px-4 py-6 text-sm text-gray-600" colSpan={6}>No period closings yet</td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const AuditTrail = () => {
+    return <SystemLogsPage />;
+  };
+
+  const SupportPage = () => {
+    return (
+      <div className="space-y-6">
+        <div className="bg-white border border-gray-200 rounded-xl p-6">
+          <div className="text-lg text-gray-900">Support</div>
+          <div className="text-sm text-gray-600 mt-1">Get help, report issues, or request features.</div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700"
+              onClick={() => {
+                const subject = encodeURIComponent('DukaHub Support');
+                const body = encodeURIComponent('Hello support team,\n\nI need help with:\n\n');
+                window.location.href = `mailto:?subject=${subject}&body=${body}`;
+              }}
+            >
+              Email Support
+            </button>
+            <button type="button" className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-50" onClick={() => navigate('/placeholder/notifications')}>
+              Open Activity
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   const ChickenProcessing = () => {
     const [records, setRecords] = React.useState(() => JSON.parse(localStorage.getItem('production_chicken_processing') || '[]'));
@@ -347,282 +802,7 @@ export default function Placeholder() {
     );
   };
 
-  const LowStockAlerts = () => {
-    const businessId = React.useMemo(() => {
-      const role = String(currentUser?.role || '').toLowerCase();
-      if (role === 'staff') return String(currentUser?.businessId || '');
-      return String(currentUser?.id || '');
-    }, []);
-    const prefsKey = React.useMemo(() => `systemPreferences:${businessId || 'default'}`, [businessId]);
-    const prefs = React.useMemo(() => {
-      try {
-        return JSON.parse(localStorage.getItem(prefsKey) || 'null') || null;
-      } catch {
-        return null;
-      }
-    }, [prefsKey]);
-    const defaultMin = React.useMemo(() => {
-      const raw = String(prefs?.inventory?.defaultReorderLevel || '10').trim();
-      const n = parseInt(raw, 10);
-      return Number.isFinite(n) && n > 0 ? n : 10;
-    }, [prefs]);
-    const [query, setQuery] = React.useState('');
-    const [categoryFilter, setCategoryFilter] = React.useState('all');
-    const [statusFilter, setStatusFilter] = React.useState('all');
-    const [refreshing, setRefreshing] = React.useState(false);
-    const [markAllLoading, setMarkAllLoading] = React.useState(false);
-    const [nonce, setNonce] = React.useState(0);
-    const toNumber = (v) => {
-      const n = parseFloat(v);
-      return isNaN(n) ? 0 : n;
-    };
-    const data = React.useMemo(() => {
-      void nonce;
-      const qtyByName = new Map();
-      const unitByName = new Map();
-      const minByName = new Map();
-      const categoryByName = new Map();
-      const priceByName = new Map();
-      try {
-        const items = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        (Array.isArray(items) ? items : []).forEach((it) => {
-          const name = String(it?.name || '').trim();
-          if (!name) return;
-          unitByName.set(name, String(it?.unit || '').trim());
-          const category = String(it?.category || it?.itemType || 'general').trim() || 'general';
-          categoryByName.set(name, category);
-          const price = toNumber(it?.buyingPrice ?? it?.buyPrice ?? it?.costPrice ?? it?.price);
-          if (price) priceByName.set(name, price);
-          const minRaw = parseInt(String(it?.reorderLevel || '').trim(), 10);
-          if (Number.isFinite(minRaw) && minRaw > 0) minByName.set(name, minRaw);
-        });
-      } catch {}
-      try {
-        Object.keys(localStorage || {}).forEach((k) => {
-          if (!/^stockIn_/.test(k)) return;
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = String(r?.itemName || r?.name || '').trim();
-            if (!name) return;
-            const qty = toNumber(r?.quantity);
-            qtyByName.set(name, (qtyByName.get(name) || 0) + qty);
-            if (r?.unit && !unitByName.get(name)) unitByName.set(name, String(r.unit));
-            if (r?.category && !categoryByName.get(name)) categoryByName.set(name, String(r.category));
-            const p = toNumber(r?.pricePerItem || r?.price);
-            if (p && !priceByName.get(name)) priceByName.set(name, p);
-          });
-        });
-        Object.keys(localStorage || {}).forEach((k) => {
-          if (!/^stockOut_/.test(k)) return;
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = String(r?.itemName || r?.name || '').trim();
-            if (!name) return;
-            const qty = toNumber(r?.quantity);
-            qtyByName.set(name, (qtyByName.get(name) || 0) - qty);
-          });
-        });
-      } catch {}
-      const entries = Array.from(qtyByName.entries()).map(([name, qty]) => {
-        const minLevel = minByName.get(name) || defaultMin;
-        const percent = minLevel > 0 ? Math.round(Math.max(0, Math.min(100, (qty / minLevel) * 100))) : 0;
-        const status = qty <= minLevel ? 'critical' : qty <= Math.ceil(minLevel * 1.5) ? 'warning' : 'ok';
-        const price = priceByName.get(name) || 0;
-        const reorderQty = qty < minLevel ? Math.max(0, Math.ceil(minLevel - qty)) : 0;
-        const reorderValue = reorderQty * price;
-        return {
-          name,
-          unit: unitByName.get(name) || '',
-          category: categoryByName.get(name) || 'general',
-          price,
-          qty: Math.max(0, Math.round(qty)),
-          minLevel,
-          percent,
-          status,
-          reorderQty,
-          reorderValue
-        };
-      });
-      const filtered = entries
-        .filter((e) => !query || e.name.toLowerCase().includes(query.toLowerCase()))
-        .filter((e) => categoryFilter === 'all' ? true : String(e.category || 'general') === String(categoryFilter))
-        .filter((e) => statusFilter === 'all' ? true : e.status === statusFilter)
-        .sort((a, b) => a.status.localeCompare(b.status) || a.name.localeCompare(b.name));
-      const critical = filtered.filter((e) => e.status === 'critical');
-      const warning = filtered.filter((e) => e.status === 'warning');
-      const ok = filtered.filter((e) => e.status === 'ok');
-      const reorderTotal = critical.reduce((s, e) => s + e.reorderValue, 0);
-      const categories = Array.from(new Set(entries.map((e) => String(e.category || 'general')))).sort((a, b) => a.localeCompare(b));
-      return { filtered, critical, warning, ok, reorderTotal, categories };
-    }, [defaultMin, nonce, query, categoryFilter, statusFilter]);
-    const money = (n) => {
-      const v = Number(n || 0);
-      try {
-        return new Intl.NumberFormat(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(v);
-      } catch {
-        return String(v.toFixed ? v.toFixed(2) : v);
-      }
-    };
-    const onRefresh = () => {
-      setRefreshing(true);
-      setNonce((n) => n + 1);
-      setTimeout(() => setRefreshing(false), 800);
-    };
-    const exportCSV = () => {
-      const rows = [
-        ['Product', 'Category', 'Unit', 'Qty', 'MinLevel', 'Status', 'LevelPct', 'ReorderQty', 'UnitPrice', 'ReorderValue']
-      ];
-      data.filtered.forEach((e) => {
-        rows.push([e.name, e.category || '', e.unit || '', String(e.qty), String(e.minLevel), e.status, String(e.percent), String(e.reorderQty || 0), String(e.price || 0), String(e.reorderValue || 0)]);
-      });
-      const csv = rows.map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'low_stock_alerts.csv';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    };
-    const markAllRead = () => {
-      setMarkAllLoading(true);
-      setTimeout(() => {
-        const ts = new Date().toISOString();
-        try {
-          localStorage.setItem('lowStockAlertsReadAt', ts);
-        } catch {}
-        setMarkAllLoading(false);
-      }, 600);
-    };
-    return (
-      <div className="space-y-6">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div>
-            <div className="text-xs text-gray-500">Notifications <span className="mx-1">›</span> Low Stock Alerts</div>
-            <div className="text-2xl md:text-3xl font-extrabold text-gray-900 mt-1">Low Stock Alerts</div>
-            <div className="text-sm text-gray-600">{data.critical.length + data.warning.length + data.ok.length} items are below minimum required level</div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button type="button" className={markAllLoading ? 'px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold cursor-not-allowed' : 'px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold hover:bg-gray-50'} onClick={markAllRead} disabled={markAllLoading}>
-              {markAllLoading ? 'Marking…' : '✓ Mark All Read'}
-            </button>
-            <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold hover:bg-gray-50 flex items-center gap-2" onClick={exportCSV}>
-              <span className="inline-flex w-4 h-4 items-center justify-center"><svg viewBox="0 0 24 24" className="w-4 h-4"><path fill="currentColor" d="M12 3v12l4-4h-3V3h-2v8H8l4 4zm-7 8v7h14v-7h2v9H3v-9h2z"/></svg></span>
-              Export
-            </button>
-            <button type="button" className={refreshing ? 'px-4 py-2 rounded-xl bg-green-600/80 text-white text-sm font-semibold flex items-center gap-2 cursor-not-allowed' : 'px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-semibold hover:bg-green-700 flex items-center gap-2'} onClick={onRefresh} disabled={refreshing}>
-              {refreshing ? <span className="w-4 h-4 rounded-full border-2 border-white/60 border-t-white animate-spin" /> : <span className="w-4 h-4 rounded-full border-2 border-white/60" style={{ borderTopColor: 'transparent' }} />}
-              Refresh
-            </button>
-          </div>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="rounded-2xl border border-red-200 bg-red-50 p-4">
-            <div className="text-xs font-semibold text-red-700">CRITICAL</div>
-            <div className="mt-2 text-3xl font-extrabold text-red-700">{data.critical.length}</div>
-            <div className="text-xs text-red-700 mt-1">Need immediate reorder</div>
-          </div>
-          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
-            <div className="text-xs font-semibold text-amber-700">WARNING</div>
-            <div className="mt-2 text-3xl font-extrabold text-amber-700">{data.warning.length}</div>
-            <div className="text-xs text-amber-700 mt-1">Order soon</div>
-          </div>
-          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
-            <div className="text-xs font-semibold text-emerald-700">ITEMS OK</div>
-            <div className="mt-2 text-3xl font-extrabold text-emerald-700">{data.ok.length}</div>
-            <div className="text-xs text-emerald-700 mt-1">Well-stocked</div>
-          </div>
-          <div className="rounded-2xl border border-blue-200 bg-blue-50 p-4">
-            <div className="text-xs font-semibold text-blue-700">REORDER VALUE</div>
-            <div className="mt-2 text-3xl font-extrabold text-blue-700">TZS {money(data.reorderTotal)}</div>
-            <div className="text-xs text-blue-700 mt-1">Estimated total cost</div>
-          </div>
-        </div>
-        <div className="bg-white border border-gray-200 rounded-2xl p-4">
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div className="flex items-center gap-2">
-              <select className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
-                <option value="all">All Categories</option>
-                {data.categories.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-              <select className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-                <option value="all">All Status</option>
-                <option value="critical">Critical</option>
-                <option value="warning">Warning</option>
-                <option value="ok">OK</option>
-              </select>
-              
-            </div>
-            <div className="relative">
-              <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search product..."
-                className="w-60 pl-9 pr-3 py-2 rounded-xl border border-gray-200 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500"
-              />
-            </div>
-          </div>
-          <div className="mt-3 overflow-auto">
-            <div className="min-w-[880px]">
-              <div className="grid grid-cols-[minmax(0,1fr)_160px_160px_140px_140px] px-3 py-2 text-[13px] text-gray-700 font-semibold">
-                <div>Product</div>
-                <div>Category</div>
-                <div>Stock Level</div>
-                <div>Current / Min</div>
-                <div>Status</div>
-              </div>
-              <div className="divide-y divide-gray-100">
-                {data.filtered.length ? (
-                  data.filtered.map((it) => (
-                    <div key={it.name} className="px-3 py-3 grid grid-cols-[minmax(0,1fr)_160px_160px_140px_140px] items-center gap-3">
-                      <div className="min-w-0 flex items-center gap-3">
-                        <span className="shrink-0 w-9 h-9 rounded-lg bg-pink-100 border border-pink-200 flex items-center justify-center text-pink-700 text-xs font-bold">
-                          {String(it.name || 'P').slice(0,1).toUpperCase()}
-                        </span>
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-gray-900 truncate">{it.name}</div>
-                          <div className="text-xs text-gray-600">{it.unit || 'unit'}</div>
-                        </div>
-                      </div>
-                      <div className="text-sm text-gray-700 truncate">{it.category || 'general'}</div>
-                      <div className="flex items-center gap-3">
-                        <div className="flex-1 h-2 rounded-full bg-gray-100 overflow-hidden">
-                          <div className={it.status === 'critical' ? 'h-2 bg-red-500' : it.status === 'warning' ? 'h-2 bg-amber-500' : 'h-2 bg-emerald-500'} style={{ width: `${Math.max(0, Math.min(100, it.percent))}%` }} />
-                        </div>
-                        <div className="text-xs text-gray-700 w-10 text-right">{it.percent}%</div>
-                      </div>
-                      <div className="text-sm">
-                        <span className={it.qty <= it.minLevel ? 'text-red-600 font-semibold' : 'text-gray-900 font-medium'}>{it.qty}</span>
-                        <span className="text-gray-500"> / {it.minLevel} {it.unit ? String(it.unit).toLowerCase() : 'units'}</span>
-                      </div>
-                      <div>
-                        <span className={it.status === 'critical' ? 'px-2 py-1 rounded-full bg-red-100 text-red-700 text-xs font-semibold' : it.status === 'warning' ? 'px-2 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold' : 'px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-semibold'}>
-                          {it.status === 'critical' ? 'Critical' : it.status === 'warning' ? 'Warning' : 'OK'}
-                        </span>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="py-6 text-sm text-gray-600 text-center">No items match</div>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
   const PaymentDueAlerts = () => {
-    const [q, setQ] = useState('');
-    const [planFilter, setPlanFilter] = useState('all');
-    const [unsubLoading, setUnsubLoading] = useState(false);
-    const [showUnsub, setShowUnsub] = useState(false);
-    const [unsubDesc, setUnsubDesc] = useState('');
     const [nonce, setNonce] = useState(0);
     const toMoney = (n) => {
       try {
@@ -634,7 +814,7 @@ export default function Placeholder() {
     };
     const currentUser = (() => {
       try {
-        return JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
+        return JSON.parse(localStorage.getItem('currentUser') || 'null');
       } catch {
         return null;
       }
@@ -664,7 +844,7 @@ export default function Placeholder() {
         // Fallback: if there is an active plan but no history stored, compose one virtual entry
         let out = list.slice();
         try {
-          const ci = JSON.parse(localStorage.getItem('companyInfo') || '{}') || {};
+          const ci = localStore.get('companyInfo', {}) || {};
           const planId = String(ci.subscriptionPlan || '').trim();
           if (planId && out.length === 0) {
             out = [
@@ -689,372 +869,161 @@ export default function Placeholder() {
         return [];
       }
     }, [businessId, nonce]);
-    const formatTs = (iso) => {
+    const companyInfo = useMemo(() => {
+      void nonce;
+      return localStore.get('companyInfo', {}) || {};
+    }, [nonce]);
+
+    const formatDate = (iso) => {
       if (!iso) return '—';
-      try {
-        const d = new Date(iso);
-        const yyyy = d.getFullYear();
-        const mm = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        const hh = String(d.getHours()).padStart(2, '0');
-        const mi = String(d.getMinutes()).padStart(2, '0');
-        return `${yyyy}/${mm}/${dd} ${hh}:${mi}`;
-      } catch {
-        return iso;
-      }
-    };
-    const buildInvoiceHtml = (rec) => {
-      const safe = (v) => String(v == null ? '' : v);
-      const esc = (s) =>
-        safe(s)
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#039;');
-      const ci = (() => {
-        try {
-          return JSON.parse(localStorage.getItem('companyInfo') || '{}') || {};
-        } catch {
-          return {};
-        }
-      })();
-      const companyName = esc(ci.companyName || ci.name || 'Dukahub');
-      const companyEmail = esc(ci.email || '');
-      const invoiceId = esc(rec.id || 'RECEIPT');
-      const planName = esc(rec.planTitle || rec.planId || '');
-      const provider = esc(rec.provider || '');
-      const phone = esc(rec.phone || '');
-      const amount = esc(`TSh ${toMoney(rec.amount)}`);
-      const paidAt = esc(formatTs(rec.paidAt));
-      const endsAt = esc(formatTs(rec.endsAt));
-      const period = esc(rec.period || '');
-      const months = esc(rec.months || '');
-      const issuedAt = esc(formatTs(new Date().toISOString()));
-      const receiptTitle = 'Receipt from Dukahub';
-      return `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>${esc(receiptTitle)}</title>
-    <style>
-      @page { size: A4; margin: 14mm; }
-      * { box-sizing: border-box; }
-      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color: #111827; }
-      .bg { min-height: 100vh; padding: 28px; background: #0ea5e9; }
-      .sheet { max-width: 760px; margin: 0 auto; }
-      .card { background: #fff; border: 2px solid rgba(59,130,246,.35); border-radius: 14px; overflow: hidden; }
-      .card + .card { margin-top: 18px; }
-      .p { padding: 18px 20px; }
-      .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
-      .title { font-size: 14px; font-weight: 700; color: #111827; }
-      .amount { font-size: 34px; font-weight: 900; letter-spacing: -0.02em; margin-top: 6px; }
-      .muted { color: #64748b; font-size: 12px; margin-top: 4px; }
-      .chip { width: 56px; height: 44px; border-radius: 10px; border: 1px solid #e5e7eb; background: linear-gradient(135deg, #f8fafc, #eef2ff); }
-      .hr { height: 1px; background: #e5e7eb; }
-      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px; margin-top: 14px; }
-      .k { font-size: 12px; color: #64748b; }
-      .v { font-size: 12px; font-weight: 700; color: #111827; text-align: right; }
-      .left { text-align: left; }
-      .sectionTitle { font-size: 13px; font-weight: 800; color: #111827; }
-      .row { display: flex; justify-content: space-between; gap: 14px; }
-      .row + .row { margin-top: 8px; }
-      .line { height: 1px; background: #e5e7eb; margin: 12px 0; }
-      .foot { font-size: 11px; color: #64748b; padding: 14px 20px; }
-      .foot a { color: #2563eb; text-decoration: none; font-weight: 700; }
-      @media print {
-        .bg { background: #fff; padding: 0; }
-        .card { border-color: #e5e7eb; }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="bg">
-      <div class="sheet">
-        <div class="card">
-          <div class="p">
-            <div class="top">
-              <div>
-                <div class="title">${esc(receiptTitle)}</div>
-                <div class="amount">${amount}</div>
-                <div class="muted">Paid ${paidAt}</div>
-              </div>
-              <div class="chip" aria-hidden="true"></div>
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div class="p">
-            <div class="grid2">
-              <div class="k left">Receipt number</div><div class="v">${invoiceId}</div>
-              <div class="k left">Invoice number</div><div class="v">${invoiceId}</div>
-              <div class="k left">Payment method</div><div class="v">${provider || '—'}${phone ? ` - ${phone}` : ''}</div>
-              <div class="k left">Issued</div><div class="v">${issuedAt}</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="p">
-            <div class="sectionTitle">Receipt #${invoiceId}</div>
-            <div class="muted" style="margin-top:6px;">${paidAt} — ${endsAt}</div>
-            <div class="line"></div>
-            <div class="row">
-              <div style="font-size:13px; font-weight:800;">${planName || 'Subscription'}</div>
-              <div style="font-size:13px; font-weight:800;">${amount}</div>
-            </div>
-            <div class="muted">Period: ${period || '—'} ${months ? `(${months} month(s))` : ''}</div>
-            <div class="line"></div>
-            <div class="row">
-              <div class="k left">Total</div>
-              <div class="v">${amount}</div>
-            </div>
-            <div class="row">
-              <div class="k left">Amount paid</div>
-              <div class="v">${amount}</div>
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div class="foot">
-            Questions? Contact us at ${companyEmail ? `<a href="mailto:${companyEmail}">${companyEmail}</a>` : `<span>${companyName}</span>`}
-          </div>
-        </div>
-      </div>
-    </div>
-  </body>
-</html>`;
+      const t = Date.parse(String(iso));
+      if (!Number.isFinite(t)) return String(iso || '—');
+      const d = new Date(t);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     };
 
-    const downloadInvoice = (rec) => {
-      const html = buildInvoiceHtml(rec);
-      const iframe = document.createElement('iframe');
-      iframe.style.position = 'fixed';
-      iframe.style.right = '0';
-      iframe.style.bottom = '0';
-      iframe.style.width = '0';
-      iframe.style.height = '0';
-      iframe.style.border = '0';
-      iframe.srcdoc = html;
-      iframe.onload = () => {
-        try {
-          iframe.contentWindow.focus();
-          iframe.contentWindow.print();
-        } catch {}
-        setTimeout(() => {
-          try {
-            iframe.remove();
-          } catch {}
-        }, 800);
-      };
-      document.body.appendChild(iframe);
-    };
-    const planTypeLabel = (id) => {
-      const s = String(id || '').trim();
-      if (!s) return '—';
-      return s.charAt(0).toUpperCase() + s.slice(1);
-    };
-    const companyInfo = (() => {
-      try {
-        return JSON.parse(localStorage.getItem('companyInfo') || '{}') || {};
-      } catch {
-        return {};
-      }
+    const currentBill = useMemo(() => {
+      const arr = billingHistory.slice().sort((a, b) => String(b.paidAt || '').localeCompare(String(a.paidAt || '')));
+      return arr[0] || null;
+    }, [billingHistory]);
+
+    const statusRaw = String(companyInfo?.subscriptionPaymentStatus || currentUser?.subscriptionPaymentStatus || '').trim().toLowerCase();
+    const planType = String(companyInfo?.subscriptionPlan || currentUser?.subscriptionPlan || currentBill?.planId || '').trim().toLowerCase();
+    const planTitle = planType ? planType.charAt(0).toUpperCase() + planType.slice(1) : '—';
+    const paidAt = String(companyInfo?.subscriptionStartedAt || currentUser?.subscriptionStartedAt || currentBill?.paidAt || '').trim();
+    const endsAt = String(companyInfo?.subscriptionEndsAt || currentUser?.subscriptionEndsAt || currentBill?.endsAt || '').trim();
+    const trialEndsAtStored = String(companyInfo?.subscriptionTrialEndsAt || currentUser?.subscriptionTrialEndsAt || '').trim();
+    const provider = String(companyInfo?.paymentProvider || currentUser?.paymentProvider || currentBill?.provider || '').trim();
+    const paymentPhone = String(companyInfo?.paymentPhone || currentUser?.paymentPhone || currentBill?.phone || '').trim();
+    const months = (() => {
+      const v = Number(companyInfo?.subscriptionMonths ?? currentUser?.subscriptionMonths ?? currentBill?.months ?? (statusRaw === 'trial' ? 0 : 1));
+      if (statusRaw === 'trial') return Number.isFinite(v) && v >= 0 ? v : 0;
+      return Number.isFinite(v) && v > 0 ? v : 1;
     })();
-    const currentPlanId = String(companyInfo.subscriptionPlan || '').trim();
-    React.useEffect(() => {
-      if (currentPlanId) {
-        setPlanFilter(currentPlanId.toLowerCase());
-      }
-    }, [currentPlanId]);
-    const billingFiltered = useMemo(() => {
-      const ql = (q || '').trim().toLowerCase();
-      let arr = billingHistory.slice();
-      if (planFilter !== 'all') {
-        arr = arr.filter((r) => String(r.planId || r.planTitle || '').toLowerCase() === String(planFilter));
-      }
-      if (ql) {
-        arr = arr.filter((r) => {
-          const hay = [r.planTitle, r.planId, r.amount, r.paidAt, r.endsAt].map((x) => String(x || '').toLowerCase()).join(' ');
-          return hay.includes(ql);
-        });
-      }
-      arr.sort((a, b) => String(b.paidAt || '').localeCompare(String(a.paidAt || '')));
-      return arr;
-    }, [billingHistory, planFilter, q]);
-    const openUnsubscribe = () => {
-      const latest = (billingFiltered && billingFiltered[0]) || (billingHistory && billingHistory[0]) || null;
-      const lines = [];
-      if (latest) {
-        lines.push(`Plan: ${planTypeLabel(latest.planId || latest.planTitle)}`);
-        if (latest.amount !== undefined) lines.push(`Last Amount: TSh ${toMoney(latest.amount)}`);
-        if (latest.paidAt) lines.push(`Paid At: ${formatTs(latest.paidAt)}`);
-        if (latest.endsAt) lines.push(`Ending: ${formatTs(latest.endsAt)}`);
-        if (latest.provider) lines.push(`Provider: ${latest.provider}`);
-        if (latest.phone) lines.push(`Phone: ${latest.phone}`);
-      } else {
-        lines.push('Current plan details not found.');
-      }
-      setUnsubDesc(lines.join(' • '));
-      setShowUnsub(true);
-    };
-    const unsubscribePlan = () => {
-      if (unsubLoading) return;
-      setUnsubLoading(true);
-      setTimeout(() => {
-        try {
-          const userLocal = JSON.parse(localStorage.getItem('currentUser') || 'null');
-          const userSession = JSON.parse(sessionStorage.getItem('currentUser') || 'null');
-          const user = userLocal || userSession || null;
-          if (user) {
-            const nextUser = {
-              ...user,
-              subscriptionPlan: '',
-              subscriptionUserLimit: 0,
-              subscriptionPrice: 0,
-              subscriptionPricePerMonth: 0,
-              subscriptionPeriod: '',
-              subscriptionMonths: 0,
-              subscriptionDiscountPercent: 0,
-              subscriptionTrialDays: 0,
-              subscriptionStartedAt: '',
-              subscriptionEndsAt: '',
-              subscriptionTrialEndsAt: '',
-              subscriptionPaymentStatus: ''
-            };
-            if (userLocal) localStorage.setItem('currentUser', JSON.stringify(nextUser));
-            if (userSession && !userLocal) sessionStorage.setItem('currentUser', JSON.stringify(nextUser));
-            try {
-              const all = JSON.parse(localStorage.getItem('users') || '[]');
-              const list = Array.isArray(all) ? all : [];
-              const idx = list.findIndex((u) => String(u?.id || '') === String(nextUser.id || '') && String(u?.role || '').toLowerCase() === 'admin');
-              if (idx >= 0) {
-                list[idx] = { ...list[idx], ...nextUser };
-                localStorage.setItem('users', JSON.stringify(list));
-              }
-            } catch {}
-          }
-        } catch {}
-        try {
-          const existingCompany = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-          const updatedCompany = {
-            ...existingCompany,
-            subscriptionPlan: '',
-            subscriptionUserLimit: 0,
-            subscriptionPrice: 0,
-            subscriptionPricePerMonth: 0,
-            subscriptionPeriod: '',
-            subscriptionMonths: 0,
-            subscriptionDiscountPercent: 0,
-            subscriptionTrialDays: 0,
-            subscriptionStartedAt: '',
-            subscriptionEndsAt: '',
-            subscriptionTrialEndsAt: '',
-            subscriptionPaymentStatus: ''
-          };
-          localStorage.setItem('companyInfo', JSON.stringify(updatedCompany));
-          try {
-            window.dispatchEvent(new CustomEvent('companyInfoUpdated'));
-          } catch {}
-        } catch {}
-        setUnsubLoading(false);
-        setShowUnsub(false);
-        setNonce((n) => n + 1);
-      }, 600);
-    };
+    const planPrices = { starter: 15000, professional: 35000, enterprise: 60000 };
+    const rawMonthly = (() => {
+      const v = Number(companyInfo?.subscriptionRawMonthlyPrice ?? currentUser?.subscriptionRawMonthlyPrice ?? planPrices[planType] ?? 0);
+      return Number.isFinite(v) && v >= 0 ? v : 0;
+    })();
+    const discountedMonthly = rawMonthly;
+    const amountDue = Math.round(rawMonthly * months);
+    const paidAmount = (() => {
+      const v = Number(companyInfo?.subscriptionAmountPaid ?? currentUser?.subscriptionAmountPaid ?? currentBill?.amount ?? 0);
+      return Number.isFinite(v) && v >= 0 ? v : 0;
+    })();
+
+    const trialEndsAt = useMemo(() => {
+      if (statusRaw !== 'trial') return '';
+      const base = String(paidAt || currentUser?.createdAt || '').trim();
+      const t = Date.parse(base);
+      if (!Number.isFinite(t)) return trialEndsAtStored || '';
+      const maxTrial = t + 7 * 24 * 60 * 60 * 1000;
+      const storedT = Date.parse(trialEndsAtStored);
+      if (Number.isFinite(storedT)) return new Date(Math.min(storedT, maxTrial)).toISOString();
+      return new Date(maxTrial).toISOString();
+    }, [currentUser?.createdAt, paidAt, statusRaw, trialEndsAtStored]);
+
+    const effectiveDueAt = statusRaw === 'trial' ? trialEndsAt : endsAt;
+
+    const daysRemain = useMemo(() => {
+      const t = Date.parse(effectiveDueAt);
+      if (!Number.isFinite(t)) return null;
+      const msLeft = t - Date.now();
+      return Math.ceil(msLeft / (24 * 60 * 60 * 1000));
+    }, [effectiveDueAt]);
+
+    const status = useMemo(() => {
+      if (statusRaw === 'trial') return 'Free Trial';
+      if (!effectiveDueAt) return 'Unknown';
+      if (daysRemain == null) return 'Unknown';
+      if (daysRemain <= 0) return 'Expired';
+      if (daysRemain <= 7) return 'Due Soon';
+      return 'Active';
+    }, [daysRemain, effectiveDueAt, statusRaw]);
+
+    const periodLabel = useMemo(() => {
+      if (statusRaw === 'trial') return '7 Days';
+      if (months === 12) return '1 Year (360 days)';
+      const days = months * 30;
+      return `${months} Month(s) (${days} days)`;
+    }, [months, statusRaw]);
+
+    const statusPill =
+      status === 'Expired'
+        ? 'bg-red-50 border border-red-200 text-red-700'
+        : status === 'Due Soon'
+        ? 'bg-orange-50 border border-orange-200 text-orange-700'
+        : status === 'Active'
+        ? 'bg-green-50 border border-green-200 text-green-700'
+        : status === 'Free Trial'
+        ? 'bg-blue-50 border border-blue-200 text-blue-700'
+        : 'bg-gray-50 border border-gray-200 text-gray-700';
+
     return (
       <div className="space-y-6">
-        <ConfirmDeleteModal
-          open={showUnsub}
-          title="Unsubscribe Plan?"
-          description={unsubDesc || 'This will remove your active subscription.'}
-          confirmText="Unsubscribe"
-          cancelText="No"
-          loading={unsubLoading}
-          onCancel={() => (unsubLoading ? null : setShowUnsub(false))}
-          onConfirm={unsubscribePlan}
-        />
-        <div className="bg-white border border-gray-200 rounded-2xl p-4">
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div className="text-sm font-semibold text-gray-900">Billing History</div>
-            <div className="flex items-center gap-2">
-              <div className="inline-flex items-center gap-2 px-3 py-2 rounded-full border border-gray-200 bg-white text-sm">
-                <Search className="w-4 h-4 text-gray-500" />
-                <input
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                  placeholder="Search plan, date…"
-                  className="w-56 bg-transparent outline-none"
-                />
-              </div>
-              <div className="inline-flex items-center gap-2">
-                {['all', 'starter', 'professional', 'enterprise'].map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => setPlanFilter(p)}
-                    className={
-                      planFilter === p
-                        ? 'px-3 py-1.5 rounded-full bg-green-600 text-white text-xs font-semibold'
-                        : 'px-3 py-1.5 rounded-full bg-white border border-gray-200 text-xs hover:bg-gray-50'
-                    }
-                  >
-                    {p === 'all' ? 'All' : planTypeLabel(p)}
-                  </button>
-                ))}
-              </div>
+        <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between gap-3 flex-wrap">
+            <div className="text-base font-semibold text-gray-900">Payment Due Alert</div>
+            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold ${statusPill}`}>{status}</span>
+          </div>
+
+          <div className="p-6 grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+              <div className="text-xs text-gray-600">Plan type</div>
+              <div className="mt-1 text-lg text-gray-900">{planTitle}</div>
+            </div>
+            <div className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+              <div className="text-xs text-gray-600">{statusRaw === 'trial' ? 'Trial' : 'Amount due'}</div>
+              <div className="mt-1 text-lg text-gray-900">{statusRaw === 'trial' ? 'Free' : `TZS ${toMoney(amountDue)}`}</div>
+            </div>
+            <div className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+              <div className="text-xs text-gray-600">Due date</div>
+              <div className="mt-1 text-lg text-gray-900">{formatDate(effectiveDueAt)}</div>
+            </div>
+            <div className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+              <div className="text-xs text-gray-600">{statusRaw === 'trial' ? 'Trial days remain' : 'Days remain'}</div>
+              <div className="mt-1 text-lg text-gray-900">{daysRemain == null ? '—' : String(Math.max(0, daysRemain))}</div>
             </div>
           </div>
-          <div className="mt-3 overflow-auto">
-            <table className="min-w-[720px] w-full">
-              <thead className="bg-gray-50 border-b border-gray-200 text-[12px] text-gray-600">
-                <tr className="grid grid-cols-[minmax(0,1fr)_120px_140px_200px_200px_240px] px-4 py-2">
-                  <th className="text-left">Name</th>
-                  <th className="text-left">Type</th>
-                  <th className="text-left">Amount</th>
-                  <th className="text-left">Date</th>
-                  <th className="text-left">Ending</th>
-                  <th className="text-left">Operation</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {billingFiltered.map((r) => (
-                  <tr key={r.id} className="grid grid-cols-[minmax(0,1fr)_120px_140px_200px_200px_240px] px-4 py-3 items-center">
-                    <td className="text-sm text-gray-900">{r.planTitle || r.planId}</td>
-                    <td className="text-sm text-gray-900">{planTypeLabel(r.planId || r.planTitle)}</td>
-                    <td className="text-sm text-gray-900">TSh {toMoney(r.amount)}</td>
-                    <td className="text-sm text-gray-700">{formatTs(r.paidAt)}</td>
-                    <td className="text-sm text-gray-700">{formatTs(r.endsAt)}</td>
-                    <td className="text-sm">
-                      <button
-                        type="button"
-                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-green-600 text-white hover:bg-green-700 font-semibold"
-                        onClick={() => downloadInvoice(r)}
-                        data-no-loading="true"
-                      >
-                        <Download className="w-4 h-4" />
-                        Download
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {billingFiltered.length === 0 ? (
+
+          <div className="px-6 pb-6">
+            <div className="overflow-auto rounded-2xl border border-gray-200">
+              <table className="min-w-[840px] w-full text-sm">
+                <thead className="bg-gray-50 text-gray-600">
                   <tr>
-                    <td className="px-4 py-8 text-sm text-gray-600" colSpan={6}>
-                      No billing history found.
+                    <th className="text-left px-4 py-3 font-semibold">Plan type</th>
+                    <th className="text-left px-4 py-3 font-semibold">Period</th>
+                    <th className="text-left px-4 py-3 font-semibold">Discount</th>
+                    <th className="text-left px-4 py-3 font-semibold">Amount</th>
+                    <th className="text-left px-4 py-3 font-semibold">Payment date</th>
+                    <th className="text-left px-4 py-3 font-semibold">Due date</th>
+                    <th className="text-left px-4 py-3 font-semibold">Days remain</th>
+                    <th className="text-left px-4 py-3 font-semibold">Other</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  <tr>
+                    <td className="px-4 py-3 text-gray-900">{planTitle}</td>
+                    <td className="px-4 py-3 text-gray-700">{periodLabel}</td>
+                    <td className="px-4 py-3 text-gray-700">{discountPercent ? `${discountPercent}%` : '—'}</td>
+                    <td className="px-4 py-3 text-gray-900">
+                      {statusRaw === 'trial'
+                        ? amountDue > 0
+                          ? `Free (After trial: TZS ${toMoney(amountDue)})`
+                          : 'Free (Choose plan after trial)'
+                        : `TZS ${toMoney(amountDue)}`}
+                    </td>
+                    <td className="px-4 py-3 text-gray-700">{formatDate(paidAt)}</td>
+                    <td className="px-4 py-3 text-gray-700">{formatDate(effectiveDueAt)}</td>
+                    <td className="px-4 py-3 text-gray-700">{daysRemain == null ? '—' : String(Math.max(0, daysRemain))}</td>
+                    <td className="px-4 py-3 text-gray-700">
+                      {provider ? `${provider}${paymentPhone ? ` - ${paymentPhone}` : ''}` : '—'}
+                      {paidAmount ? ` • Paid: TZS ${toMoney(paidAmount)}` : ''}
                     </td>
                   </tr>
-                ) : null}
-              </tbody>
-            </table>
-          </div>
-          <div className="mt-4 flex items-center justify-end">
-            <button
-              type="button"
-              className={unsubLoading ? 'px-4 py-2 rounded-xl bg-red-600/70 text-white text-sm cursor-not-allowed' : 'px-4 py-2 rounded-xl bg-red-600 text-white text-sm hover:bg-red-700'}
-              onClick={openUnsubscribe}
-              disabled={unsubLoading}
-            >
-              {unsubLoading ? 'Unsubscribing…' : 'Unsubscribe Plan'}
-            </button>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
@@ -1376,6 +1345,529 @@ export default function Placeholder() {
     }
   };
 
+  const InventoryReport = () => {
+    const [version, setVersion] = useState(0);
+    const [tab, setTab] = useState('all');
+    const [query, setQuery] = useState('');
+    const [categoryFilter, setCategoryFilter] = useState('all');
+    const [sortBy, setSortBy] = useState('name');
+    const [inventoryItemsForReport, setInventoryItemsForReport] = useState([]);
+    const [stockMovementsForReport, setStockMovementsForReport] = useState([]);
+
+    useEffect(() => {
+      let alive = true;
+      const load = async () => {
+        try {
+          const snapshot = await productsApi.loadInventorySnapshot();
+          const items = snapshot?.items;
+          if (!alive) return;
+          setInventoryItemsForReport(Array.isArray(items) ? items : []);
+        } catch {
+          if (!alive) return;
+          setInventoryItemsForReport([]);
+        }
+        try {
+          const snapshot = await productsApi.loadInventorySnapshot();
+          const rows = snapshot?.movements;
+          if (!alive) return;
+          setStockMovementsForReport(Array.isArray(rows) ? rows : []);
+        } catch {
+          if (!alive) return;
+          setStockMovementsForReport([]);
+        }
+      };
+      const onData = () => {
+        setVersion((v) => v + 1);
+        void load();
+      };
+      void load();
+      window.addEventListener('dataUpdated', onData);
+      return () => {
+        alive = false;
+        window.removeEventListener('dataUpdated', onData);
+      };
+    }, []);
+
+    const colors = useMemo(() => ['#10B981', '#3B82F6', '#F59E0B', '#EF4444', '#8B5CF6', '#06B6D4', '#22C55E', '#F97316'], []);
+
+    const computed = useMemo(() => {
+      const cacheBuster = version;
+      const norm = (s) => String(s || '').trim().toLowerCase();
+      const items = (Array.isArray(inventoryItemsForReport) ? inventoryItemsForReport : []).filter((it) =>
+        String(it?.name || it?.itemName || it?.productName || '').trim()
+      );
+      const knownKeys = new Set(items.map((it) => norm(it?.name || it?.itemName || it?.productName)));
+      const stockAll = Array.isArray(stockMovementsForReport) ? stockMovementsForReport : [];
+
+      const inByName = {};
+      const outByName = {};
+      stockAll.forEach((r) => {
+        const key = norm(r?.itemName || r?.name || r?.productName);
+        if (!key) return;
+        const qty = Number(r?.quantity || 0) || 0;
+        if (!qty) return;
+        if (isInventoryMovementOut(r)) outByName[key] = (outByName[key] || 0) + qty;
+        else if (isInventoryMovementIn(r)) inByName[key] = (inByName[key] || 0) + qty;
+      });
+
+      const defaultMin = (() => {
+        try {
+          const stored = localStore.get('systemPreferences:default', null);
+          const v = stored?.inventory?.lowStockThreshold ?? stored?.inventory?.defaultLowStockThreshold ?? null;
+          const n = Number(v);
+          return Number.isFinite(n) && n > 0 ? n : 10;
+        } catch {
+          return 10;
+        }
+      })();
+
+      const rows = items.map((it) => {
+        const name = String(it.name || it.itemName || it.productName || '').trim();
+        const category = String(it.category || it.itemType || it.group || '').trim();
+        const unit = String(it.unit || it.unitName || it.measurementUnit || '').trim();
+        const baseQty = Number(it.qty ?? it.quantity ?? it.stock ?? it.stockLevel ?? 0);
+        const minLevelRaw = Number(it.reorderLevel ?? it.minLevel ?? it.lowStockLevel ?? defaultMin);
+        const minLevel = Number.isFinite(minLevelRaw) && minLevelRaw >= 0 ? minLevelRaw : defaultMin;
+        const selling = Number(it.sellingPrice ?? it.unitPrice ?? it.price ?? 0);
+        const key = norm(name);
+        const movementKnown = Object.prototype.hasOwnProperty.call(inByName, key) || Object.prototype.hasOwnProperty.call(outByName, key);
+        const qty = movementKnown ? (inByName[key] || 0) - (outByName[key] || 0) : baseQty;
+        const unitPrice = Number.isFinite(selling) ? selling : 0;
+        const totalValue = Math.max(0, Number(qty || 0)) * unitPrice;
+        const status = qty <= 0 ? 'out' : qty <= minLevel ? 'low' : 'in';
+        return {
+          id: String(it.id || it.sku || it.barcode || name || Math.random()),
+          name,
+          category: category || 'Uncategorized',
+          unit,
+          qty: Number.isFinite(qty) ? qty : 0,
+          minLevel,
+          unitPrice,
+          totalValue,
+          status
+        };
+      });
+
+      const totals = rows.reduce(
+        (acc, r) => {
+          acc.products += r.name ? 1 : 0;
+          acc.units += Math.max(0, r.qty);
+          acc.low += r.status === 'low' ? 1 : 0;
+          acc.out += r.status === 'out' ? 1 : 0;
+          acc.value += r.totalValue;
+          return acc;
+        },
+        { products: 0, units: 0, low: 0, out: 0, value: 0 }
+      );
+
+      const categories = {};
+      rows.forEach((r) => {
+        const k = r.category || 'Other';
+        if (!categories[k]) categories[k] = { category: k, count: 0, value: 0 };
+        categories[k].count += 1;
+        categories[k].value += r.totalValue;
+      });
+      const categoryList = Object.values(categories).sort((a, b) => b.count - a.count);
+
+      const toMonthId = (d) => {
+        const t = Date.parse(String(d || ''));
+        const dt = Number.isFinite(t) ? new Date(t) : null;
+        if (!dt) return '';
+        return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      };
+
+      const now = new Date();
+      const monthIds = Array.from({ length: 6 }).map((_, i) => {
+        const dt = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1);
+        return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+      });
+
+      const trend = monthIds.map((m) => ({ month: m, stockIn: 0, stockOut: 0, net: 0 }));
+      const idx = Object.fromEntries(trend.map((t, i) => [t.month, i]));
+
+      stockAll.forEach((r) => {
+        const m = toMonthId(r.date || r.createdAt || r.timestamp || r.ts);
+        const i = idx[m];
+        if (i == null) return;
+        const qty = Number(r?.quantity || 0) || 0;
+        if (!qty) return;
+        if (isInventoryMovementOut(r)) trend[i].stockOut += qty;
+        else if (isInventoryMovementIn(r)) trend[i].stockIn += qty;
+      });
+      trend.forEach((t) => {
+        t.net = t.stockIn - t.stockOut;
+      });
+
+      const currentMonth = monthIds[monthIds.length - 1];
+      const fastestMap = {};
+      stockAll.forEach((r) => {
+        if (!isInventoryMovementOut(r)) return;
+        const m = toMonthId(r.date || r.createdAt || r.timestamp || r.ts);
+        if (m !== currentMonth) return;
+        const key = norm(r?.itemName || r?.name || r?.productName);
+        if (!key || !knownKeys.has(key)) return;
+        if (!fastestMap[key]) fastestMap[key] = { name: String(r?.itemName || r?.name || r?.productName || '').trim(), qty: 0, category: '' };
+        fastestMap[key].qty += Number(r.quantity || 0);
+      });
+      const fastest = Object.values(fastestMap)
+        .filter((x) => x.name)
+        .sort((a, b) => b.qty - a.qty)
+        .slice(0, 6);
+
+      return { rows, totals, categoryList, trend, fastest, cacheBuster };
+    }, [inventoryItemsForReport, stockMovementsForReport, version]);
+
+    const donut = useMemo(() => {
+      const total = computed.categoryList.reduce((s, c) => s + c.count, 0) || 1;
+      let acc = 0;
+      const segments = computed.categoryList.slice(0, 6).map((c, i) => {
+        const start = (acc / total) * 100;
+        acc += c.count;
+        const end = (acc / total) * 100;
+        return `${colors[i % colors.length]} ${start.toFixed(2)}% ${end.toFixed(2)}%`;
+      });
+      const used = computed.categoryList.slice(0, 6).reduce((s, c) => s + c.count, 0);
+      if (used < total) segments.push(`#E5E7EB ${(used / total) * 100}% 100%`);
+      return `conic-gradient(${segments.join(', ')})`;
+    }, [computed.categoryList, colors]);
+
+    const filteredRows = useMemo(() => {
+      const q = String(query || '').trim().toLowerCase();
+      return computed.rows
+        .filter((r) => {
+          if (!r.name) return false;
+          if (categoryFilter !== 'all' && String(r.category || '') !== categoryFilter) return false;
+          if (tab === 'in' && r.status !== 'in') return false;
+          if (tab === 'low' && r.status !== 'low') return false;
+          if (tab === 'out' && r.status !== 'out') return false;
+          if (q && !String(r.name || '').toLowerCase().includes(q) && !String(r.category || '').toLowerCase().includes(q)) return false;
+          return true;
+        })
+        .sort((a, b) => {
+          if (sortBy === 'stock') return b.qty - a.qty;
+          if (sortBy === 'value') return b.totalValue - a.totalValue;
+          return String(a.name || '').localeCompare(String(b.name || ''));
+        });
+    }, [computed.rows, categoryFilter, query, sortBy, tab]);
+
+    const productsBar = useMemo(() => {
+      const list = (computed.rows || []).filter((r) => String(r?.name || '').trim());
+      const sorted = list.slice().sort((a, b) => Number(b.qty || 0) - Number(a.qty || 0));
+      const maxQty = sorted.reduce((m, r) => Math.max(m, Number(r.qty || 0)), 0) || 1;
+      return { rows: sorted, maxQty };
+    }, [computed.rows]);
+
+    const money = (n) => {
+      const v = Number(n || 0);
+      if (!Number.isFinite(v)) return '0';
+      return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    };
+
+    const exportCsv = () => {
+      const rows = filteredRows.map((r) => ({
+        Product: r.name,
+        Category: r.category,
+        Stock: r.qty,
+        UnitPrice: r.unitPrice,
+        TotalValue: r.totalValue,
+        Status: r.status === 'in' ? 'In Stock' : r.status === 'low' ? 'Low Stock' : 'Out of Stock'
+      }));
+      const cols = ['Product', 'Category', 'Stock', 'UnitPrice', 'TotalValue', 'Status'];
+      const esc = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
+      const csv = [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `inventory-report.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    return (
+      <div className="inventory-report space-y-6">
+        <style>{`
+          .report-print-only { display: none; }
+          @media print {
+            @page { size: landscape; margin: 12mm; }
+            body * { visibility: hidden !important; }
+            .report-print-scope, .report-print-scope * { visibility: visible !important; }
+            .report-print-scope { position: absolute !important; inset: 0 !important; padding: 16px !important; background: white !important; }
+            .report-no-print { display: none !important; }
+            .report-print-only { display: block !important; }
+          }
+        `}</style>
+        <div className="flex items-center justify-end gap-2 flex-wrap">
+            <button type="button" className="px-4 py-2 rounded-xl bg-white border border-gray-200 text-gray-800 font-semibold hover:bg-gray-50" onClick={exportCsv}>
+              Export
+            </button>
+            <button type="button" className="px-4 py-2 rounded-xl bg-green-600 text-white font-semibold hover:bg-green-700" onClick={() => window.print()}>
+              Print
+            </button>
+        </div>
+
+        <div className="bg-gray-50 border border-gray-200 rounded-3xl p-6">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div className="text-lg font-extrabold text-gray-900">Stock Overview</div>
+              <div className="text-xs text-gray-500">Last updated: {new Date().toLocaleString()}</div>
+            </div>
+            <div className="flex items-center gap-2 bg-white border border-gray-200 rounded-2xl p-1">
+              {[
+                { id: 'all', label: 'All Items' },
+                { id: 'in', label: 'In Stock' },
+                { id: 'low', label: 'Low Stock' },
+                { id: 'out', label: 'Out of Stock' }
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  className={tab === t.id ? 'px-4 py-2 rounded-2xl bg-gray-900 text-white text-sm font-semibold' : 'px-4 py-2 rounded-2xl text-sm font-semibold text-gray-700 hover:bg-gray-50'}
+                  onClick={() => setTab(t.id)}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-6 grid grid-cols-1 md:grid-cols-5 gap-4">
+            <div className="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-green-50 border border-green-200 flex items-center justify-center text-green-700">
+                <PackageCheck className="w-5 h-5" />
+              </div>
+              <div className="mt-4 text-2xl font-extrabold text-gray-900">{money(computed.totals.products)}</div>
+              <div className="text-xs text-gray-600">Total Products</div>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-blue-50 border border-blue-200 flex items-center justify-center text-blue-700">
+                <Scale className="w-5 h-5" />
+              </div>
+              <div className="mt-4 text-2xl font-extrabold text-gray-900">{money(computed.totals.units)}</div>
+              <div className="text-xs text-gray-600">Total Units In Stock</div>
+            </div>
+            <div className="bg-white rounded-2xl border border-orange-200 p-5 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-orange-50 border border-orange-200 flex items-center justify-center text-orange-700">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="mt-4 text-2xl font-extrabold text-gray-900">{money(computed.totals.low)}</div>
+              <div className="text-xs text-orange-700 font-semibold">Low Stock Items</div>
+            </div>
+            <div className="bg-white rounded-2xl border border-red-200 p-5 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-red-50 border border-red-200 flex items-center justify-center text-red-700">
+                <XCircle className="w-5 h-5" />
+              </div>
+              <div className="mt-4 text-2xl font-extrabold text-gray-900">{money(computed.totals.out)}</div>
+              <div className="text-xs text-red-700 font-semibold">Out of Stock</div>
+            </div>
+            <div className="bg-white rounded-2xl border border-purple-200 p-5 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-purple-50 border border-purple-200 flex items-center justify-center text-purple-700">
+                <HandCoins className="w-5 h-5" />
+              </div>
+              <div className="mt-4 text-2xl font-extrabold text-gray-900">{money(computed.totals.value)}</div>
+              <div className="text-xs text-gray-600">Total Stock Value (TZS)</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="report-print-scope lg:col-span-2 bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <div className="report-print-only">
+                  <div className="text-lg font-semibold text-gray-900">Inventory Report</div>
+                </div>
+                <div className="report-no-print text-base font-extrabold text-gray-900">Product Inventory</div>
+              </div>
+              <div className="report-no-print text-sm text-gray-600 font-semibold">View all →</div>
+            </div>
+            <div className="p-5">
+              <div className="report-no-print flex items-center gap-3 flex-wrap">
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search products..."
+                  className="flex-1 min-w-[220px] px-4 py-3 rounded-2xl border border-gray-200 outline-none focus:ring-2 focus:ring-green-500"
+                />
+                <select
+                  value={categoryFilter}
+                  onChange={(e) => setCategoryFilter(e.target.value)}
+                  className="px-4 py-3 rounded-2xl border border-gray-200 bg-white text-sm font-semibold text-gray-800"
+                >
+                  <option value="all">All Categories</option>
+                  {computed.categoryList.map((c) => (
+                    <option key={c.category} value={c.category}>
+                      {c.category}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value)}
+                  className="px-4 py-3 rounded-2xl border border-gray-200 bg-white text-sm font-semibold text-gray-800"
+                >
+                  <option value="name">Sort by: Name</option>
+                  <option value="stock">Sort by: Stock</option>
+                  <option value="value">Sort by: Value</option>
+                </select>
+              </div>
+
+              <div className="mt-4 overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-gray-500 tracking-wider">
+                      <th className="text-left py-3 px-2 font-extrabold">PRODUCT</th>
+                      <th className="text-left py-3 px-2 font-extrabold">CATEGORY</th>
+                      <th className="text-left py-3 px-2 font-extrabold">STOCK LEVEL</th>
+                      <th className="text-right py-3 px-2 font-extrabold">UNIT PRICE</th>
+                      <th className="text-right py-3 px-2 font-extrabold">TOTAL VALUE</th>
+                      <th className="text-right py-3 px-2 font-extrabold">STATUS</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {filteredRows.slice(0, 10).map((r) => {
+                      const pct = r.minLevel > 0 ? Math.max(0, Math.min(100, (r.qty / (r.minLevel * 2)) * 100)) : 0;
+                      const barColor = r.status === 'out' ? 'bg-red-500' : r.status === 'low' ? 'bg-orange-500' : 'bg-green-500';
+                      const statusPill =
+                        r.status === 'in'
+                          ? 'bg-green-50 border border-green-200 text-green-700'
+                          : r.status === 'low'
+                          ? 'bg-orange-50 border border-orange-200 text-orange-700'
+                          : 'bg-red-50 border border-red-200 text-red-700';
+                      return (
+                        <tr key={r.id} className="hover:bg-gray-50">
+                          <td className="py-3 px-2">
+                            <div className="font-extrabold text-gray-900">{r.name || '—'}</div>
+                            <div className="text-xs text-gray-500">{r.unit ? `Unit: ${r.unit}` : ''}</div>
+                          </td>
+                          <td className="py-3 px-2">
+                            <span className="inline-flex items-center px-3 py-1 rounded-full bg-blue-50 border border-blue-100 text-blue-700 text-xs font-semibold">
+                              {r.category}
+                            </span>
+                          </td>
+                          <td className="py-3 px-2">
+                            <div className="flex items-center gap-3">
+                              <div className="text-sm font-extrabold text-gray-900 whitespace-nowrap">{money(r.qty)} {r.unit || ''}</div>
+                              <div className="flex-1 max-w-[180px] h-2 rounded-full bg-gray-100 overflow-hidden">
+                                <div className={`h-2 ${barColor}`} style={{ width: `${pct}%` }} />
+                              </div>
+                            </div>
+                          </td>
+                          <td className="py-3 px-2 text-right font-semibold text-gray-900">TZS {money(r.unitPrice)}</td>
+                          <td className="py-3 px-2 text-right font-extrabold text-gray-900">TZS {money(r.totalValue)}</td>
+                          <td className="py-3 px-2 text-right">
+                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-extrabold ${statusPill}`}>
+                              {r.status === 'in' ? 'In Stock' : r.status === 'low' ? 'Low Stock' : 'Out of Stock'}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {!filteredRows.length ? (
+                      <tr>
+                        <td colSpan={6} className="py-10 text-center text-sm text-gray-600">
+                          No products found. Add products in Products & Store.
+                        </td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <div className="text-base font-extrabold text-gray-900">Stock by Category</div>
+              <div className="text-sm text-gray-600 font-semibold">{money(computed.totals.products)} Products</div>
+            </div>
+            <div className="p-6">
+              <div className="flex items-center justify-center">
+                <div className="relative w-44 h-44 rounded-full" style={{ background: donut }}>
+                  <div className="absolute inset-5 rounded-full bg-white flex items-center justify-center">
+                    <div className="text-center">
+                      <div className="text-2xl font-extrabold text-gray-900">{money(computed.totals.products)}</div>
+                      <div className="text-xs text-gray-600 font-semibold">Products</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-6 space-y-2">
+                {computed.categoryList.slice(0, 6).map((c, i) => (
+                  <div key={c.category} className="flex items-center justify-between text-sm">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: colors[i % colors.length] }} />
+                      <span className="text-gray-700 font-semibold truncate">{c.category}</span>
+                    </div>
+                    <div className="text-gray-700 font-semibold">{money(c.count)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <div className="text-base font-extrabold text-gray-900">Stock by Product</div>
+              <div className="text-sm text-gray-600 font-semibold">{money(computed.totals.products)} products</div>
+            </div>
+            <div className="p-6">
+              <div className="max-h-[320px] overflow-auto pr-2 space-y-3">
+                {productsBar.rows.map((r) => {
+                  const qty = Math.max(0, Number(r.qty || 0));
+                  const pct = Math.max(0, Math.min(100, (qty / productsBar.maxQty) * 100));
+                  return (
+                    <div key={r.id} className="space-y-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0 text-sm font-extrabold text-gray-900 truncate">{r.name}</div>
+                        <div className="text-sm font-extrabold text-gray-900">{money(qty)}</div>
+                      </div>
+                      <div className="h-3 rounded-full bg-gray-100 border border-gray-200 overflow-hidden">
+                        <div className="h-full rounded-full bg-green-600" style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  );
+                })}
+                {productsBar.rows.length === 0 ? <div className="text-sm text-gray-600">No products found</div> : null}
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+              <div className="text-base font-extrabold text-gray-900">Fastest Moving Items</div>
+              <div className="text-sm text-green-700 font-semibold">This month</div>
+            </div>
+            <div className="p-6">
+              <div className="space-y-3">
+                {computed.fastest.length ? (
+                  computed.fastest.map((x, i) => (
+                    <div key={`${x.name}-${i}`} className="flex items-center justify-between">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-7 h-7 rounded-xl bg-gray-50 border border-gray-200 flex items-center justify-center text-xs font-extrabold text-gray-700">
+                          {i + 1}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-sm font-extrabold text-gray-900 truncate">{x.name}</div>
+                          <div className="text-xs text-gray-500">Units/month</div>
+                        </div>
+                      </div>
+                      <div className="text-sm font-extrabold text-gray-900">{money(x.qty)} sold</div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-gray-600">No stock-out records yet. Sales and stock-out updates will appear here.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const SalesOrder = () => {
     const navigate = useNavigate();
     const SO_PAD = 6;
@@ -1419,7 +1911,9 @@ export default function Placeholder() {
     });
     const [usdRate, setUsdRate] = useState(() => {
       try {
-        return localStorage.getItem('usdToTzsRate') || '';
+        const now = new Date();
+        const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        return localStorage.getItem(`usdToTzsRate:${ym}`) || localStorage.getItem('usdToTzsRate') || '';
       } catch {
         return '';
       }
@@ -1427,7 +1921,6 @@ export default function Placeholder() {
     const [customers, setCustomers] = useState([]);
     const [showCustomerModal, setShowCustomerModal] = useState(false);
     const [showCustomerMenu, setShowCustomerMenu] = useState(false);
-    const [showShareMenu, setShowShareMenu] = useState(false);
     const [customerSearch, setCustomerSearch] = useState('');
     const [paymentMethod, setPaymentMethod] = useState('cash');
     const [newCustomer, setNewCustomer] = useState({
@@ -1463,9 +1956,10 @@ export default function Placeholder() {
     const [items, setItems] = useState([
       { item: '', description: '', unit: 'try', qty: 1, rate: 0 }
     ]);
-    const [productPickerOpen, setProductPickerOpen] = useState(false);
+    const [productMenu, setProductMenu] = useState({ visible: false, row: -1, direction: 'down', x: 0, y: 0, width: 320 });
     const [productQuery, setProductQuery] = useState('');
     const [productCatalog, setProductCatalog] = useState([]);
+    const [salesOrderStockMovements, setSalesOrderStockMovements] = useState([]);
     const [clipboard, setClipboard] = useState(null);
     const [contextMenu, setContextMenu] = useState({ visible: false, x: 0, y: 0, row: -1, key: '' });
     const [clipboardRow, setClipboardRow] = useState(null);
@@ -1477,15 +1971,60 @@ export default function Placeholder() {
         return 'eggs';
       }
     });
+    const loadCustomers = useCallback(async () => {
+      try {
+        const list = await customersApi.list();
+        setCustomers(Array.isArray(list) ? list : []);
+      } catch {
+        setCustomers([]);
+      }
+    }, []);
     const [editingOrderId, setEditingOrderId] = useState(null);
     const [paid, setPaid] = useState(false);
+    const [saveLoading, setSaveLoading] = useState('');
     const unitOptions = UNIT_OPTIONS;
+    const usdRateMonthId = useMemo(() => {
+      const d = String(header?.orderDate || '').slice(0, 10);
+      const t = Date.parse(`${d}T00:00:00`);
+      const dt = Number.isFinite(t) ? new Date(t) : new Date();
+      return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+    }, [header?.orderDate]);
+    const usdRateStorageKey = useMemo(() => `usdToTzsRate:${usdRateMonthId}`, [usdRateMonthId]);
+    const prevUsdRateMonthId = useMemo(() => {
+      const m = String(usdRateMonthId || '').match(/^(\d{4})-(\d{2})$/);
+      if (!m) return '';
+      const y = Number(m[1]);
+      const mm = Number(m[2]);
+      if (!Number.isFinite(y) || !Number.isFinite(mm) || mm < 1 || mm > 12) return '';
+      const prevMm = mm === 1 ? 12 : mm - 1;
+      const prevY = mm === 1 ? y - 1 : y;
+      return `${prevY}-${String(prevMm).padStart(2, '0')}`;
+    }, [usdRateMonthId]);
+    const usdRateKeyRef = React.useRef(usdRateStorageKey);
+    React.useEffect(() => {
+      usdRateKeyRef.current = usdRateStorageKey;
+    }, [usdRateStorageKey]);
     const exchangeRate = useMemo(() => {
       const raw = String(usdRate || '').replace(/,/g, '');
       const n = Number(raw);
       return Number.isFinite(n) ? n : 0;
     }, [usdRate]);
     const currencyPrefix = usdEnabled ? 'USD' : 'TSH';
+    const businessIdForPrefs = useMemo(() => {
+      const role = String(currentUser?.role || '').toLowerCase();
+      if (role === 'staff') return String(currentUser?.businessId || '');
+      return String(currentUser?.id || '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentUser?.businessId, currentUser?.id, currentUser?.role]);
+    const allowNegativeStock = useMemo(() => {
+      const key = `systemPreferences:${businessIdForPrefs || 'default'}`;
+      try {
+        const prefs = localStore.get(key, null);
+        return Boolean(prefs?.sales?.allowNegativeStock);
+      } catch {
+        return false;
+      }
+    }, [businessIdForPrefs]);
     const totals = useMemo(() => {
       const subtotal = items.reduce((s, r) => s + (Number(r.qty) || 0) * (Number(r.rate) || 0), 0);
       const tax = vatEnabled ? subtotal * VAT_RATE : 0;
@@ -1507,13 +2046,38 @@ export default function Placeholder() {
       if (!exchangeRate) return `USD ${formatMoney(totals.total)} (TZS —)`;
       return `USD ${formatMoney(totals.total)} (TSH ${formatMoney(totalsTzs)} @ ${formatMoney(exchangeRate)})`;
     }, [exchangeRate, totals.total, totalsTzs, usdEnabled]);
+
+    const loadProductCatalogFromStorage = React.useCallback(() => {
+      Promise.resolve()
+        .then(async () => {
+          const items = await productsApi.list().catch(() => []);
+          const arr = Array.isArray(items) ? items : [];
+          const filtered = arr
+            .filter((p) => {
+              const name = String(p?.name || p?.itemName || '').trim();
+              return Boolean(name);
+            })
+            .filter((p) => !Boolean(p?.isStoreOnly));
+          setProductCatalog(filtered);
+        })
+        .catch(() => {
+          setProductCatalog([]);
+        });
+    }, []);
+
+    const loadSalesOrderMovementsFromStorage = React.useCallback(() => {
+      Promise.resolve()
+        .then(async () => {
+          const snapshot = await productsApi.loadInventorySnapshot();
+          const rows = Array.isArray(snapshot?.movements) ? snapshot.movements : [];
+          setSalesOrderStockMovements(rows);
+        })
+        .catch(() => {
+          setSalesOrderStockMovements([]);
+        });
+    }, []);
     const companyInfo = useMemo(() => {
-      try {
-        const info = JSON.parse(localStorage.getItem('companyInfo') || '{}');
-        return info || {};
-      } catch {
-        return {};
-      }
+      return localStore.get('companyInfo', {}) || {};
     }, []);
     const dueDate = useMemo(() => {
       const base = String(header.orderDate || '').slice(0, 10);
@@ -1539,24 +2103,13 @@ export default function Placeholder() {
     }, [items]);
 
     React.useEffect(() => {
-      try {
-        const list = JSON.parse(localStorage.getItem('customers') || '[]');
-        setCustomers(Array.isArray(list) ? list : []);
-      } catch {
-        setCustomers([]);
-      }
-    }, []);
+      void loadCustomers();
+    }, [loadCustomers]);
     React.useEffect(() => {
       try {
         const chosen = JSON.parse(localStorage.getItem('selectedCustomerForOrder') || 'null');
         if (chosen) {
-          setCustomer({
-            name: chosen.name || chosen.company || '',
-            email: chosen.mainEmail || chosen.ccEmail || '',
-            phone: chosen.mainPhone || chosen.mobile || chosen.workPhone || '',
-            billTo: chosen.billTo || chosen.address || '',
-            shipTo: chosen.shipTo || chosen.address || ''
-          });
+          setCustomer(mapCustomerToContactFields(chosen));
           localStorage.removeItem('selectedCustomerForOrder');
         }
       } catch {}
@@ -1593,47 +2146,118 @@ export default function Placeholder() {
     }, []);
     React.useEffect(() => {
       const handler = () => {
-        try {
-          const list = JSON.parse(localStorage.getItem('customers') || '[]');
-          setCustomers(Array.isArray(list) ? list : []);
-        } catch {
-          setCustomers([]);
-        }
+        void loadCustomers();
         try {
           const chosen = JSON.parse(localStorage.getItem('selectedCustomerForOrder') || 'null');
           if (chosen) {
-            setCustomer({
-              name: chosen.name || chosen.company || '',
-              email: chosen.mainEmail || chosen.ccEmail || '',
-              phone: chosen.mainPhone || chosen.mobile || chosen.workPhone || '',
-              billTo: chosen.billTo || chosen.address || '',
-              shipTo: chosen.shipTo || chosen.address || ''
-            });
+            setCustomer(mapCustomerToContactFields(chosen));
             localStorage.removeItem('selectedCustomerForOrder');
           }
         } catch {}
       };
       window.addEventListener('dataUpdated', handler);
       return () => window.removeEventListener('dataUpdated', handler);
-    }, []);
+    }, [loadCustomers]);
     React.useEffect(() => {
-      const load = () => {
-        try {
-          const list = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-          const arr = Array.isArray(list) ? list : [];
-          setProductCatalog(arr);
-        } catch {
-          setProductCatalog([]);
-        }
+      const onData = () => {
+        loadProductCatalogFromStorage();
+        loadSalesOrderMovementsFromStorage();
       };
-      load();
-      window.addEventListener('dataUpdated', load);
-      window.addEventListener('storage', load);
+      loadProductCatalogFromStorage();
+      loadSalesOrderMovementsFromStorage();
+      window.addEventListener('dataUpdated', onData);
       return () => {
-        window.removeEventListener('dataUpdated', load);
-        window.removeEventListener('storage', load);
+        window.removeEventListener('dataUpdated', onData);
       };
-    }, []);
+    }, [loadProductCatalogFromStorage, loadSalesOrderMovementsFromStorage]);
+    const productStock = useMemo(() => {
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const normalizeType = (raw) => {
+        const t = String(raw || '').trim().toLowerCase();
+        if (!t) return 'general';
+        if (t === 'meat') return 'chickens';
+        return t;
+      };
+
+      const metaByCompound = new Map();
+      const typeByNameKey = new Map();
+      const types = new Set();
+
+      (Array.isArray(productCatalog) ? productCatalog : []).forEach((p) => {
+        const displayName = String(p?.name || p?.itemName || '').trim();
+        const nameKey = norm(displayName);
+        if (!nameKey) return;
+        const typeKey = normalizeType(p?.category || p?.itemType || 'general');
+        types.add(typeKey);
+        if (!typeByNameKey.has(nameKey)) typeByNameKey.set(nameKey, typeKey);
+        const compound = `${typeKey}__${nameKey}`;
+        if (!metaByCompound.has(compound)) {
+          const baseQtyRaw = String(p?.qty ?? p?.quantity ?? 0).replace(/,/g, '');
+          const baseQty = parseFloat(baseQtyRaw);
+          metaByCompound.set(compound, {
+            name: displayName,
+            nameKey,
+            typeKey,
+            unit: String(p?.unit || '').trim(),
+            baseQty: Number.isFinite(baseQty) ? baseQty : 0
+          });
+        }
+      });
+
+      const inByCompound = new Map();
+      const outByCompound = new Map();
+      const seen = new Set();
+      const inAny = new Map();
+      const outAny = new Map();
+      const seenAny = new Set();
+
+      (Array.isArray(salesOrderStockMovements) ? salesOrderStockMovements : []).forEach((m) => {
+        const rawName = String(m?.itemName || '').trim();
+        const nameKey = norm(rawName);
+        if (!nameKey) return;
+        const qty = Number(m?.quantity || 0) || 0;
+        if (!qty) return;
+        const typeKey = normalizeType(m?.itemType || typeByNameKey.get(nameKey) || 'general');
+        const compound = `${typeKey}__${nameKey}`;
+        if (!metaByCompound.has(compound)) return;
+        if (isInventoryMovementOut(m)) outByCompound.set(compound, (outByCompound.get(compound) || 0) + qty);
+        else if (isInventoryMovementIn(m)) inByCompound.set(compound, (inByCompound.get(compound) || 0) + qty);
+        seen.add(compound);
+        if (isInventoryMovementOut(m)) outAny.set(nameKey, (outAny.get(nameKey) || 0) + qty);
+        else if (isInventoryMovementIn(m)) inAny.set(nameKey, (inAny.get(nameKey) || 0) + qty);
+        seenAny.add(nameKey);
+      });
+
+      const remainByCompound = new Map();
+      metaByCompound.forEach((m, compound) => {
+        const base = Number(m?.baseQty || 0) || 0;
+        const qtyIn = inByCompound.get(compound) || 0;
+        const qtyOut = outByCompound.get(compound) || 0;
+        const remain = seen.has(compound) ? qtyIn - qtyOut : base;
+        remainByCompound.set(compound, remain);
+      });
+
+      const getTypeForName = (name) => {
+        const key = norm(name);
+        return normalizeType(typeByNameKey.get(key) || 'general');
+      };
+      const getUnitForName = (name) => {
+        const nameKey = norm(name);
+        const typeKey = getTypeForName(name);
+        const compound = `${typeKey}__${nameKey}`;
+        return String(metaByCompound.get(compound)?.unit || '').trim();
+      };
+      const getRemain = (name, typeOverride) => {
+        const nameKey = norm(name);
+        const typeKey = normalizeType(typeOverride || getTypeForName(nameKey));
+        const compound = `${typeKey}__${nameKey}`;
+        if (seen.has(compound)) return remainByCompound.get(compound);
+        if (seenAny.has(nameKey)) return (inAny.get(nameKey) || 0) - (outAny.get(nameKey) || 0);
+        return remainByCompound.get(compound);
+      };
+
+      return { norm, normalizeType, getTypeForName, getUnitForName, getRemain, remainByCompound };
+    }, [productCatalog, salesOrderStockMovements]);
     React.useEffect(() => {
       const handler = () => {
         try {
@@ -1651,6 +2275,9 @@ export default function Placeholder() {
         const sel = JSON.parse(localStorage.getItem('selectedOrderForEdit') || 'null');
         if (sel) {
           setEditingOrderId(sel.id || null);
+          const isPersistedSale = sel._sourceType === 'sale' || Boolean(sel.persisted);
+          const isUsdSale = Boolean(sel.usdEnabled) || String(sel.currency || '').toUpperCase() === 'USD';
+          const selectedUsdRate = Number(sel.usdRate ?? sel.exchangeRate) || 0;
           const dateTime = String(sel.orderDateTime || sel.createdAt || sel.orderDate || '').trim();
           const timePart = (() => {
             if (!dateTime) return '';
@@ -1661,30 +2288,36 @@ export default function Placeholder() {
             return '';
           })();
           setHeader(prev => ({
-            orderNumber: sel.orderNumber || prev.orderNumber,
+            orderNumber: sel.orderNumber || sel.saleNumber || prev.orderNumber,
             orderDate: (sel.orderDate || '').slice(0,10) || prev.orderDate,
             orderTime: timePart || '00:00:00',
-            terms: sel.terms || prev.terms,
+            terms: sel.terms || sel.paymentTerms || prev.terms,
             invoiceNumber: sel.invoiceNumber || prev.invoiceNumber
           }));
           setPaid((sel.status || '') === 'Paid');
           setPaymentMethod(String(sel.paymentMethod || '').trim() || 'cash');
-          setUsdEnabled(Boolean(sel.usdEnabled) || String(sel.currency || '').toUpperCase() === 'USD');
-          if (sel.usdRate != null && sel.usdRate !== '') setUsdRate(String(sel.usdRate));
+          setUsdEnabled(isUsdSale);
+          setUsdRate(isUsdSale && selectedUsdRate > 0 ? String(selectedUsdRate) : '');
           setCustomer({
-            name: sel.name || '',
-            email: sel.email || '',
-            phone: sel.phone || '',
+            name: sel.customerName || sel.customer || sel.name || '',
+            email: sel.email || sel.customerEmail || '',
+            phone: sel.phone || sel.customerPhone || '',
             billTo: sel.billTo || '',
             shipTo: sel.shipTo || ''
           });
-          setItems((sel.items || []).map(it => ({
-            item: it.item || '',
-            description: it.description || '',
-            unit: it.unit || 'try',
-            qty: Number(it.qty) || 0,
-            rate: Number(it.rate) || 0
-          })));
+          const nextItems = (Array.isArray(sel.items) ? sel.items : []).map((it) => {
+            const quantity = Number(it?.qty ?? it?.quantity) || 0;
+            const storedRate = Number(it?.rate ?? it?.unitPrice ?? it?.price) || 0;
+            const rate = isPersistedSale && isUsdSale && selectedUsdRate > 0 ? storedRate / selectedUsdRate : storedRate;
+            return {
+              item: it?.item || it?.productName || '',
+              description: it?.description || '',
+              unit: it?.unit || 'try',
+              qty: quantity,
+              rate
+            };
+          });
+          setItems(nextItems.length ? nextItems : [{ item: '', description: '', unit: 'try', qty: 1, rate: 0 }]);
           localStorage.removeItem('selectedOrderForEdit');
         }
       } catch {}
@@ -1693,7 +2326,7 @@ export default function Placeholder() {
       if (editingOrderId) return;
       const id = window.setInterval(() => {
         setHeader((prev) => ({ ...prev, orderTime: getNowTime() }));
-      }, 1000);
+      }, 30000);
       return () => window.clearInterval(id);
     }, [editingOrderId]);
     React.useEffect(() => {
@@ -1702,7 +2335,27 @@ export default function Placeholder() {
       } catch {}
     }, [usdEnabled]);
     React.useEffect(() => {
+      if (editingOrderId) return;
+      if (!usdEnabled) return;
       try {
+        const currentKey = String(usdRateStorageKey || '').trim();
+        const prevKey = prevUsdRateMonthId ? `usdToTzsRate:${prevUsdRateMonthId}` : '';
+        let v = (currentKey ? localStorage.getItem(currentKey) : '') || '';
+        if (!String(v || '').trim()) {
+          v = (prevKey ? localStorage.getItem(prevKey) : '') || localStorage.getItem('usdToTzsRate') || '';
+          if (String(v || '').trim() && currentKey) {
+            try {
+              localStorage.setItem(currentKey, String(v));
+            } catch {}
+          }
+        }
+        setUsdRate(String(v || ''));
+      } catch {}
+    }, [editingOrderId, prevUsdRateMonthId, usdEnabled, usdRateStorageKey]);
+    React.useEffect(() => {
+      try {
+        const key = String(usdRateKeyRef.current || '').trim();
+        if (key) localStorage.setItem(key, String(usdRate || ''));
         localStorage.setItem('usdToTzsRate', String(usdRate || ''));
       } catch {}
     }, [usdRate]);
@@ -1713,26 +2366,30 @@ export default function Placeholder() {
       setItems(prev => prev.map((row, idx) => idx === i ? { ...row, [k]: v } : row));
     };
     const addItem = () => setItems(prev => [...prev, { item: '', description: '', unit: 'try', qty: 1, rate: 0 }]);
-    const addProductToOrder = (product) => {
+    const addProductToOrder = (product, targetRowIndex) => {
       const name = String(product?.name || product?.itemName || '').trim();
       if (!name) return;
+      const typeKey = productStock.normalizeType(product?.category || product?.itemType || 'general');
+      const remain = productStock.getRemain(name, typeKey);
+      const outOfStock = Number.isFinite(remain) ? remain <= 0 : false;
+      void outOfStock;
       const unit = String(product?.unit || '').trim() || 'try';
       const rate = (() => {
         const raw = product?.sellingPrice ?? product?.sellPrice ?? product?.price ?? 0;
         const n = typeof raw === 'number' ? raw : parseFloat(String(raw || '').replace(/,/g, ''));
         return Number.isFinite(n) ? n : 0;
       })();
-      const description = String(product?.description || '').trim();
       setItems((prev) => {
         const next = Array.isArray(prev) ? prev.slice() : [];
-        const idx = next.findIndex((r) => !String(r?.item || '').trim());
-        const row = { item: name, description, unit, qty: 1, rate };
+        const forcedIndex = Number.isFinite(targetRowIndex) && targetRowIndex >= 0 ? targetRowIndex : -1;
+        const idx = forcedIndex >= 0 ? forcedIndex : next.findIndex((r) => !String(r?.item || '').trim());
+        const row = { item: name, unit, qty: 1, rate };
         if (idx >= 0) next[idx] = { ...next[idx], ...row };
         else next.push(row);
         return next.length ? next : [row];
       });
-      setProductPickerOpen(false);
       setProductQuery('');
+      setProductMenu({ visible: false, row: -1, direction: 'down', x: 0, y: 0, width: 320 });
     };
     const removeItem = (i) => setItems(prev => prev.filter((_, idx) => idx !== i));
     const insertRowAt = (index) => {
@@ -1818,7 +2475,7 @@ export default function Placeholder() {
     };
     const pasteCell = () => {
       const { row, key } = contextMenu;
-      if (row < 0 || key === 'amount' || clipboard == null) return;
+      if (row < 0 || key === 'amount' || key === 'item' || clipboard == null) return;
       if (key === 'qty' || key === 'rate') {
         const num = Number(clipboard);
         updateItem(row, key, isNaN(num) ? 0 : num);
@@ -1832,6 +2489,7 @@ export default function Placeholder() {
       hideMenu();
     };
     const clearForm = () => {
+      setEditingOrderId(null);
       setHeader({
         orderNumber: String((() => { try { const v = parseInt(localStorage.getItem('nextSoNumber') || '1150', 10); return Number.isFinite(v) ? v : 1150; } catch { return 1150; } })()).padStart(SO_PAD, '0'),
         orderDate: new Date().toISOString().slice(0,10),
@@ -1843,8 +2501,62 @@ export default function Placeholder() {
       setItems([{ item: '', description: '', unit: 'try', qty: 1, rate: 0 }]);
       setPaid(false);
       setPaymentMethod('cash');
+      try {
+        localStorage.removeItem('selectedOrderForEdit');
+      } catch {}
     };
-    const saveOrder = () => {
+    const saveOrder = async () => {
+      const normName = (v) => String(v || '').trim().toLowerCase();
+      const catalogKeys = new Set((Array.isArray(productCatalog) ? productCatalog : []).map((p) => normName(p?.name || p?.itemName || '')));
+      const cleaned = (Array.isArray(items) ? items : [])
+        .map((r) => ({
+          item: String(r?.item || '').trim(),
+          description: String(r?.description || ''),
+          unit: String(r?.unit || 'try'),
+          qty: Number(r?.qty) || 0,
+          rate: Number(r?.rate) || 0
+        }))
+        .filter((r) => r.item || r.qty || r.rate || String(r.description || '').trim());
+
+      const invalidBlank = cleaned.find((r) => !r.item && (r.qty > 0 || r.rate > 0 || String(r.description || '').trim()));
+      if (invalidBlank) {
+        window.alert('Please select item from Products before saving.');
+        return false;
+      }
+      const invalidUnknown = cleaned.find((r) => r.item && !catalogKeys.has(normName(r.item)));
+      if (invalidUnknown) {
+        window.alert(`"${invalidUnknown.item}" is not in Products. Please select from Products.`);
+        return false;
+      }
+
+      const resolved = cleaned
+        .filter((r) => r.item)
+        .map((r) => {
+          const matchedProduct =
+            (Array.isArray(productCatalog) ? productCatalog : []).find((p) => normName(p?.name || p?.itemName || '') === normName(r.item)) || null;
+          const itemType = productStock.getTypeForName(r.item);
+          const unitFromProduct = productStock.getUnitForName(r.item);
+          return {
+            ...r,
+            itemType,
+            productId: String(matchedProduct?.id || '').trim(),
+            unit: unitFromProduct || r.unit
+          };
+        });
+      if (!allowNegativeStock) {
+        const insufficient = resolved.find((r) => {
+          if (!r.item) return false;
+          const remain = productStock.getRemain(r.item, r.itemType);
+          if (!Number.isFinite(remain)) return false;
+          return (Number(r.qty) || 0) > remain;
+        });
+        if (insufficient) {
+          const remain = productStock.getRemain(insufficient.item, insufficient.itemType);
+          window.alert(`"${insufficient.item}" is out of stock. Remaining: ${Number(remain || 0).toLocaleString()}`);
+          return false;
+        }
+      }
+
       const dateOnly = String(header.orderDate || '').slice(0, 10);
       const timeOnly = (() => {
         const raw = String(header.orderTime || '').trim();
@@ -1852,20 +2564,28 @@ export default function Placeholder() {
         if (!m) return '00:00:00';
         return `${m[1]}:${m[2]}:${m[3] || '00'}`;
       })();
-      const mappedType = activeBusiness === 'meat' ? 'chickens' : 'eggs';
       const orderDateTime = dateOnly ? `${dateOnly}T${timeOnly}` : '';
+      const orderItemType = (() => {
+        const first = String(resolved[0]?.itemType || '').trim();
+        if (!first) return 'mixed';
+        const allSame = resolved.every((r) => String(r?.itemType || '').trim() === first);
+        return allSame ? first : 'mixed';
+      })();
+      const customerName = String(customer?.name || '').trim() || 'Walk-in';
+      const customerPayload = { ...(customer || {}), name: customerName };
+      const orderId = editingOrderId || Date.now();
       const order = {
-        id: Date.now(),
+        id: orderId,
         ...header,
         orderDate: dateOnly,
         orderDateTime,
-        ...customer,
+        ...customerPayload,
         paymentMethod,
-        itemType: mappedType,
+        itemType: orderItemType,
         currency: usdEnabled ? 'USD' : 'TZS',
         usdEnabled: Boolean(usdEnabled),
         usdRate: usdEnabled ? exchangeRate : 0,
-        items: items.map(r => {
+        items: resolved.map((r) => {
           const amount = (Number(r.qty)||0) * (Number(r.rate)||0);
           const amountTzs = usdEnabled ? (exchangeRate ? amount * exchangeRate : null) : amount;
           return { ...r, amount, amountTzs };
@@ -1878,48 +2598,138 @@ export default function Placeholder() {
         status: paid ? 'Paid' : 'Open'
       };
       try {
-        const existing = JSON.parse(localStorage.getItem('salesOrders') || '[]');
-        const applyStockOut = () => {
-          if (!paid) return false;
-          if (order._stockApplied) return false;
-          const key = `stockOut_${mappedType}`;
-          const outRaw = JSON.parse(localStorage.getItem(key) || '[]');
-          const outList = Array.isArray(outRaw) ? outRaw : [];
-          (order.items || []).forEach((it) => {
-            const qty = Number(it?.qty) || 0;
-            const itemName = String(it?.item || '').trim();
-            if (!itemName || qty <= 0) return;
-            outList.push({
-              id: Date.now() + Math.random(),
-              date: String(order.orderDate || '').slice(0, 10),
-              quantity: String(qty),
-              unit: String(it?.unit || ''),
-              reason: 'Sales Order',
-              description: `Sales Order ${String(order.orderNumber || '')}`,
-              saleOrderId: order.id,
-              itemType: mappedType,
-              itemName
-            });
-          });
-          localStorage.setItem(key, JSON.stringify(outList));
-          return true;
+        const existingSales = await salesApi.list().catch(() => []);
+        const nowIso = new Date().toISOString();
+        let savedOrder = null;
+        let savedLocally = false;
+        const unitPriceTzs = (it) => {
+          if (!usdEnabled) return Number(it?.rate) || 0;
+          const qty = Number(it?.qty) || 0;
+          const amtTzs = Number(it?.amountTzs);
+          if (Number.isFinite(amtTzs) && qty > 0) return amtTzs / qty;
+          if (exchangeRate && Number(it?.rate)) return Number(it.rate) * Number(exchangeRate);
+          return 0;
         };
-        if (editingOrderId) {
-          const idx = existing.findIndex(o => o.id === editingOrderId);
-          if (idx >= 0) {
-            order.id = editingOrderId;
-            order._stockApplied = Boolean(existing[idx]?._stockApplied);
-            if (applyStockOut()) order._stockApplied = true;
-            existing[idx] = order;
-          } else {
-            order._stockApplied = false;
-            if (applyStockOut()) order._stockApplied = true;
-            existing.push(order);
-          }
+        const backendPayload = {
+          saleNumber: header.orderNumber,
+          orderNumber: header.orderNumber,
+          invoiceNumber: header.invoiceNumber,
+          customerName,
+          phone: String(customerPayload.phone || '').trim(),
+          email: String(customerPayload.email || '').trim(),
+          billTo: String(customerPayload.billTo || '').trim(),
+          shipTo: String(customerPayload.shipTo || '').trim(),
+          customerAddress: String(customerPayload.billTo || customerPayload.shipTo || '').trim(),
+          paymentMethod,
+          saleType: 'retail',
+          status: paid ? 'Paid' : 'Open',
+          paymentTerms: String(header.terms || '').trim(),
+          date: dateOnly,
+          orderDate: dateOnly,
+          orderDateTime,
+          currency: usdEnabled ? 'USD' : 'TZS',
+          usdEnabled: Boolean(usdEnabled),
+          usdRate: usdEnabled ? exchangeRate : 0,
+          subtotal: usdEnabled ? totalsTzs : totals.subtotal,
+          tax: usdEnabled ? Number(totals.tax || 0) * Number(exchangeRate || 0) : totals.tax,
+          shipping: usdEnabled ? Number(totals.shipping || 0) * Number(exchangeRate || 0) : totals.shipping,
+          finalTotal: usdEnabled ? totalsTzs : totals.total,
+          amount: usdEnabled ? totalsTzs : totals.total,
+          amountPaid: paid ? (usdEnabled ? totalsTzs : totals.total) : 0,
+          balanceDue: paid ? 0 : (usdEnabled ? totalsTzs : totals.total),
+          description: resolved.map((r) => String(r?.item || '').trim()).filter(Boolean).join(', '),
+          items: resolved.map((r) => ({
+            productId: String(r?.productId || '').trim() || undefined,
+            item: String(r?.item || '').trim(),
+            productName: String(r?.item || '').trim(),
+            productType: String(r?.itemType || '').trim() || 'general',
+            qty: Number(r?.qty) || 0,
+            unit: String(r?.unit || 'pcs').trim() || 'pcs',
+            rate: usdEnabled ? unitPriceTzs(r) : Number(r?.rate) || 0,
+            amountTzs: Number(r?.amountTzs),
+            total: usdEnabled ? Number(r?.amountTzs) || 0 : (Number(r?.qty) || 0) * (Number(r?.rate) || 0)
+          }))
+        };
+        const syncedSale = editingOrderId
+          ? (Array.isArray(existingSales) ? existingSales : []).find((entry) => String(entry?.id || '') === String(editingOrderId) && entry?.persisted)
+          : null;
+        if (syncedSale) {
+          savedOrder = await salesApi.update(editingOrderId, backendPayload);
+          savedLocally = false;
+        } else if (editingOrderId) {
+          savedOrder = await salesApi.create(backendPayload);
+          savedLocally = !savedOrder?.persisted;
         } else {
-          order._stockApplied = false;
-          if (applyStockOut()) order._stockApplied = true;
-          existing.push(order);
+          savedOrder = await salesApi.create(backendPayload);
+          savedLocally = !savedOrder?.persisted;
+        }
+
+        try {
+          if (customerName && customerName !== 'Walk-in') {
+            const existingCustomers = await customersApi.list().catch(() => []);
+            const phoneKey = String(customerPayload.phone || '').trim();
+            const nameKey = normName(customerName);
+            const existingCustomer = (Array.isArray(existingCustomers) ? existingCustomers : []).find((c) => {
+              const n = normName(c?.name || '');
+              if (!n || n !== nameKey) return false;
+              const p = String(c?.phone || c?.mainPhone || '').trim();
+              if (!phoneKey) return true;
+              return p === phoneKey;
+            });
+            if (existingCustomer?.id) {
+              await customersApi.update(existingCustomer.id, {
+                ...existingCustomer,
+                name: String(existingCustomer?.name || customerName).trim() || customerName,
+                mainEmail: String(existingCustomer?.mainEmail || existingCustomer?.email || customerPayload.email || '').trim(),
+                mainPhone: String(existingCustomer?.mainPhone || existingCustomer?.phone || customerPayload.phone || '').trim(),
+                billTo: String(existingCustomer?.billTo || existingCustomer?.billedTo || customerPayload.billTo || '').trim(),
+                shipTo: String(existingCustomer?.shipTo || existingCustomer?.shippedTo || customerPayload.shipTo || '').trim()
+              });
+            } else {
+              await customersApi.create({
+                name: customerName,
+                mainEmail: String(customerPayload.email || '').trim(),
+                mainPhone: String(customerPayload.phone || '').trim(),
+                billTo: String(customerPayload.billTo || '').trim(),
+                shipTo: String(customerPayload.shipTo || '').trim(),
+                address: String(customerPayload.billTo || '').trim()
+              });
+            }
+          }
+        } catch {}
+
+        const catalog = Array.isArray(productCatalog) ? productCatalog : [];
+        const findInventoryItemId = (name) => {
+          const key = normName(name);
+          const hit = catalog.find((p) => normName(p?.name || p?.itemName || '') === key);
+          const idRaw = hit?.id;
+          const id = idRaw != null ? Number(idRaw) : null;
+          return id && Number.isFinite(id) ? id : null;
+        };
+
+        void orderDateTime;
+        void dateOnly;
+        void customerName;
+        void customerPayload;
+        void paymentMethod;
+        void orderItemType;
+        void resolved;
+        void findInventoryItemId;
+
+        if (savedLocally) {
+          try {
+            const totalTzs = Number(savedOrder?.finalTotal ?? order.totalTzs ?? order.total) || 0;
+            appendSystemActivity(
+              'sales_sync',
+              'Sale saved locally',
+              `Invoice ${String(savedOrder?.invoiceNumber || order.invoiceNumber || '').trim() || '—'} • TSH ${totalTzs.toLocaleString()}`,
+              'Sales',
+              'warning',
+              { saleId: savedOrder?.id || orderId, invoiceNumber: savedOrder?.invoiceNumber || order.invoiceNumber, orderNumber: savedOrder?.saleNumber || order.orderNumber }
+            );
+          } catch {}
+        }
+        if (!editingOrderId) {
           try {
             const so = parseInt(localStorage.getItem('nextSoNumber') || '1150', 10);
             const inv = parseInt(localStorage.getItem('nextInvoiceNumber') || '1', 10);
@@ -1927,20 +2737,48 @@ export default function Placeholder() {
             localStorage.setItem('nextInvoiceNumber', String((Number.isFinite(inv) ? inv : 1) + 1));
           } catch {}
         }
-        localStorage.setItem('salesOrders', JSON.stringify(existing));
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      } catch (e) {
+        window.alert(String(e?.message || 'Unable to save sale. Please try again.'));
+        return false;
+      }
+      return true;
     };
     const saveAndClose = () => {
-      saveOrder();
-      navigate('/placeholder/sales-history');
+      if (saveLoading) return;
+      let shouldNavigate = false;
+      setSaveLoading('close');
+      void withMinimumDelay(async () => {
+        const ok = await saveOrder();
+        if (!ok) return;
+        shouldNavigate = true;
+      }, 5000).finally(() => {
+        setSaveLoading('');
+        if (shouldNavigate) navigate('/placeholder/sales-history');
+      });
     };
     const saveAndNew = () => {
-      saveOrder();
-      clearForm();
+      if (saveLoading) return;
+      let shouldClear = false;
+      setSaveLoading('new');
+      void withMinimumDelay(async () => {
+        const ok = await saveOrder();
+        if (!ok) return;
+        shouldClear = true;
+      }, 5000).finally(() => {
+        setSaveLoading('');
+        if (shouldClear) clearForm();
+      });
     };
     const closeForm = () => {
-      navigate('/placeholder/sales-history');
+      if (saveLoading) return;
+      setSaveLoading('close-only');
+      void withMinimumDelay(async () => {}, 5000).finally(() => {
+        setSaveLoading('');
+        navigate('/placeholder/sales-history');
+      });
     };
     const createCopy = () => {
       try {
@@ -1974,26 +2812,32 @@ export default function Placeholder() {
         return;
       }
       if (deleteLoading) return;
+      const startedAt = Date.now();
       setDeleteLoading(true);
-      try {
-        const currentId = editingOrderId;
-        if (currentId) {
-          const existing = JSON.parse(localStorage.getItem('salesOrders') || '[]');
-          const list = Array.isArray(existing) ? existing : [];
-          const next = list.filter((o) => String(o?.id || '') !== String(currentId));
-          localStorage.setItem('salesOrders', JSON.stringify(next));
+      window.setTimeout(async () => {
+        try {
+          const currentId = editingOrderId;
+          if (currentId) {
+            await salesApi.remove(currentId);
+            try {
+              localStorage.removeItem('selectedOrderForEdit');
+            } catch {}
+          }
+        } catch (error) {
           try {
-            localStorage.removeItem('selectedOrderForEdit');
+            window.alert(String(error?.message || 'Unable to delete sale.'));
           } catch {}
-          try {
-            window.dispatchEvent(new CustomEvent('dataUpdated'));
-          } catch {}
+          setDeleteLoading(false);
+          return;
         }
-      } catch {}
-      clearForm();
-      setDeleteLoading(false);
-      setDeleteModalOpen(false);
-      navigate('/placeholder/sales-history');
+        clearForm();
+        const elapsed = Date.now() - startedAt;
+        const remaining = 5000 - elapsed;
+        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+        setDeleteLoading(false);
+        setDeleteModalOpen(false);
+        navigate('/placeholder/sales-history');
+      }, 0);
     };
 
     return (
@@ -2011,6 +2855,7 @@ export default function Placeholder() {
           input.no-spin::-webkit-outer-spin-button,
           input.no-spin::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
           input.no-spin[type=number] { -moz-appearance: textfield; }
+          .so-invoice-preview { position: absolute; left: -10000px; top: 0; width: 900px; background: white; }
           @page { margin: 0; size: A4; }
           @media print {
             html, body { margin: 0 !important; padding: 0 !important; }
@@ -2025,7 +2870,7 @@ export default function Placeholder() {
             }
           }
         `}</style>
-        <div className="so-invoice-preview" style={{ display: 'none' }}>
+        <div className="so-invoice-preview">
           <SalesOrderPrint
             companyDetails={companyInfo}
             salesOrderNumber={header.orderNumber}
@@ -2047,7 +2892,7 @@ export default function Placeholder() {
             convertedCurrencyLabel="TZS"
           />
         </div>
-        <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+        <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
           <div className="text-gray-900 font-semibold">Sales Order</div>
           <div className="flex items-center gap-2">
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 flex items-center gap-2" onClick={()=>window.print()}>
@@ -2057,86 +2902,85 @@ export default function Placeholder() {
             <button
               className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 flex items-center gap-2"
               onClick={() => {
-                const subject = encodeURIComponent(`Sales Order ${header.orderNumber}`);
-                const body = encodeURIComponent(`Dear ${customer.name || 'Customer'},\n\nPlease find Sales Order ${header.orderNumber} dated ${header.orderDate}.\nTotal: ${shareTotalText}\n\nThank you.`);
+                const subject = encodeURIComponent(`Invoice ${header.invoiceNumber}`);
+                const body = encodeURIComponent(`Dear ${customer.name || 'Customer'},\n\nPlease find invoice ${header.invoiceNumber} dated ${header.orderDate}.\nTotal: ${shareTotalText}\n\nThank you.`);
                 window.location.href = `mailto:${customer.email || ''}?subject=${subject}&body=${body}`;
               }}
             >
               <Mail size={16} />
               <span className="text-sm">Email</span>
             </button>
-            <div className="relative">
-              <button
-                className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 flex items-center gap-2"
-                onClick={()=>setShowShareMenu(v=>!v)}
-              >
-                <Share2 size={16} />
-                <span className="text-sm">Share</span>
-              </button>
-              {showShareMenu && (
-                <div className="absolute right-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow w-52">
-                  <button
-                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
-                    onClick={()=>{
-                      const url = window.location.href;
-                      if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(url);
+            <button
+              type="button"
+              className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2"
+              onClick={async () => {
+                const invoiceEl = document.querySelector('.so-invoice-preview');
+                const invoiceNo = String(header.invoiceNumber || '').trim() || 'Invoice';
+                const fileName = `Invoice_${invoiceNo}.pdf`;
+                const shareText = `Invoice ${invoiceNo} • Date ${header.orderDate} • Total ${shareTotalText}`;
+                try {
+                  const file = await elementToPdfFile(invoiceEl, fileName);
+                  const url = URL.createObjectURL(file);
+                  try {
+                    if (navigator?.canShare && navigator.canShare({ files: [file] }) && navigator?.share) {
+                      await navigator.share({
+                        title: `Invoice ${invoiceNo}`,
+                        text: shareText,
+                        files: [file]
+                      });
+                    } else {
+                      const rawPhone = String(customer?.phone || '').trim();
+                      const digits = rawPhone.replace(/[^\d]/g, '');
+                      const waUrl = digits.length >= 9 ? `https://wa.me/${digits}?text=${encodeURIComponent(shareText)}` : `https://wa.me/?text=${encodeURIComponent(shareText)}`;
+                      const isMobile = /Android|iPhone|iPad|iPod/i.test(String(navigator?.userAgent || ''));
+                      if (isMobile) {
+                        try {
+                          const scheme = digits.length >= 9 ? `whatsapp://send?phone=${digits}&text=${encodeURIComponent(shareText)}` : `whatsapp://send?text=${encodeURIComponent(shareText)}`;
+                          window.location.href = scheme;
+                        } catch {}
                       }
-                      setShowShareMenu(false);
-                    }}
-                  >
-                    Copy Link
-                  </button>
-                  <button
-                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
-                    onClick={()=>{
-                      const summary = `Sales Order ${header.orderNumber} • Date ${header.orderDate}\nCustomer: ${customer.name || ''}\nTotal: ${shareTotalText}`;
-                      if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(summary);
+                      try {
+                        window.open(waUrl, '_blank');
+                      } catch {
+                        window.location.href = waUrl;
                       }
-                      setShowShareMenu(false);
-                    }}
-                  >
-                    Copy Summary
-                  </button>
-                  <button
-                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
-                    onClick={()=>{
-                      window.print();
-                      const subject = encodeURIComponent(`Sales Order ${header.orderNumber} PDF`);
-                      const body = encodeURIComponent(`Please find attached the PDF for Sales Order ${header.orderNumber} dated ${header.orderDate}.\nTotal: ${shareTotalText}\n\n(If the attachment is not added automatically, attach the saved PDF.)`);
-                      window.location.href = `mailto:${customer.email || ''}?subject=${subject}&body=${body}`;
-                      setShowShareMenu(false);
-                    }}
-                  >
-                    Share as PDF via Email
-                  </button>
-                  <button
-                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
-                    onClick={()=>{
-                      window.print();
-                      const shareText = `Sales Order ${header.orderNumber} PDF • Date ${header.orderDate} • Total ${shareTotalText}. Please attach the saved PDF.`;
-                      const url = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
+                      try {
+                        window.open(url, '_blank');
+                      } catch {}
+                    }
+                  } catch {
+                    const rawPhone = String(customer?.phone || '').trim();
+                    const digits = rawPhone.replace(/[^\d]/g, '');
+                    const waUrl = digits.length >= 9 ? `https://wa.me/${digits}?text=${encodeURIComponent(shareText)}` : `https://wa.me/?text=${encodeURIComponent(shareText)}`;
+                    try {
+                      window.open(waUrl, '_blank');
+                    } catch {
+                      window.location.href = waUrl;
+                    }
+                    try {
                       window.open(url, '_blank');
-                      setShowShareMenu(false);
-                    }}
-                  >
-                    Share as PDF via WhatsApp
-                  </button>
-                  <button
-                    className="w-full text-left px-3 py-2 hover:bg-gray-100 text-sm"
-                    onClick={()=>{
-                      const shareText = `Sales Order ${header.orderNumber} dated ${header.orderDate}. Total: ${shareTotalText}`;
-                      const url = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
-                      window.open(url, '_blank');
-                      setShowShareMenu(false);
-                    }}
-                  >
-                    Share via WhatsApp
-                  </button>
-                </div>
-              )}
-            </div>
+                    } catch {}
+                  }
+                  window.setTimeout(() => {
+                    try {
+                      URL.revokeObjectURL(url);
+                    } catch {}
+                  }, 60000);
+                } catch {
+                  const rawPhone = String(customer?.phone || '').trim();
+                  const digits = rawPhone.replace(/[^\d]/g, '');
+                  const waUrl = digits.length >= 9 ? `https://wa.me/${digits}?text=${encodeURIComponent(shareText)}` : `https://wa.me/?text=${encodeURIComponent(shareText)}`;
+                  try {
+                    window.open(waUrl, '_blank');
+                  } catch {
+                    window.location.href = waUrl;
+                  }
+                }
+              }}
+            >
+              <MessageCircle size={16} />
+              <span className="text-sm">WhatsApp</span>
+            </button>
             <button
               className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 flex items-center gap-2"
               onClick={createCopy}
@@ -2146,6 +2990,7 @@ export default function Placeholder() {
             </button>
             {canDelete ? (
               <button
+                data-delete-trigger="true"
                 className="px-3 py-2 rounded-lg border border-red-300 text-red-700 hover:bg-red-50 flex items-center gap-2"
                 onClick={deleteCurrent}
               >
@@ -2155,8 +3000,7 @@ export default function Placeholder() {
             ) : null}
           </div>
         </div>
-        {showShareMenu && <div className="fixed inset-0 z-40" onClick={()=>setShowShareMenu(false)}></div>}
-        <div className="p-6 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-6">
+        <div className="p-4 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-4">
           <div>
           <div className="mb-4 bg-gray-50 border border-gray-200 rounded-lg">
             <div className="px-4 py-2 flex items-end gap-2">
@@ -2228,19 +3072,6 @@ export default function Placeholder() {
                   <label className="block text-sm font-semibold text-gray-700 mb-0.5">Time</label>
                   <input className="w-full px-2 py-1.5 border rounded-lg text-sm bg-gray-100" type="time" step="1" value={String(header.orderTime || '').slice(0,8) || '00:00:00'} disabled />
                 </div>
-                <div className="w-32">
-                  <label className="block text-sm font-semibold text-gray-700 mb-0.5">S.O. No.</label>
-                  <input
-                    className="w-full px-2 py-1.5 border rounded-lg text-sm"
-                    value={header.orderNumber}
-                    maxLength={6}
-                    onChange={(e)=>{
-                      const digits = e.target.value.replace(/[^\d]/g, '').slice(0,6);
-                      setHeaderField('orderNumber', digits);
-                    }}
-                    placeholder="0000"
-                  />
-                </div>
                 <div className="w-36">
                   <label className="block text-sm font-semibold text-gray-700 mb-0.5">Invoice No.</label>
                   <input
@@ -2294,17 +3125,6 @@ export default function Placeholder() {
             <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
               <div className="text-gray-900 font-semibold">ITEMS</div>
               <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 flex items-center gap-2"
-                  onClick={() => {
-                    setProductPickerOpen(true);
-                    setProductQuery('');
-                  }}
-                >
-                  <PackageCheck size={16} />
-                  <span className="text-sm">Add Product</span>
-                </button>
                 <button className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2" onClick={addItem}>
                   <Plus size={16} />
                   <span className="text-sm">Add Line</span>
@@ -2327,16 +3147,35 @@ export default function Placeholder() {
               <tbody>
                   {items.map((row, i) => {
                     const amount = (Number(row.qty)||0) * (Number(row.rate)||0);
+                    const remain = row.item ? productStock.getRemain(row.item) : null;
+                    const outOfStock = row.item ? (Number.isFinite(remain) ? remain <= 0 : false) : false;
                     return (
                       <tr key={i} className="align-middle">
                       <td className="px-3 py-2 border border-gray-200 text-center select-none">{i + 1}</td>
-                      <td className="px-3 py-2 border border-gray-200" onContextMenu={(e)=>showMenu(e,i,'item')}>
-                          <input
-                          className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none"
-                            value={row.item}
-                            onChange={(e)=>updateItem(i,'item',e.target.value)}
-                            placeholder="Product or service"
-                          />
+                      <td className="px-3 py-2 border border-gray-200">
+                        <button
+                          type="button"
+                          data-no-loading="true"
+                          className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none flex items-center justify-between gap-2"
+                          onClick={(e) => {
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const spaceAbove = rect.top;
+                            const spaceBelow = window.innerHeight - rect.bottom;
+                            const direction = (spaceBelow < 320 && spaceAbove > spaceBelow) ? 'up' : 'down';
+                            const anchorY = direction === 'up' ? rect.top : rect.bottom;
+                            const panelWidth = Math.max(320, rect.width);
+                            const left = Math.max(12, Math.min(rect.left, window.innerWidth - panelWidth - 12));
+                            loadProductCatalogFromStorage();
+                            loadSalesOrderMovementsFromStorage();
+                            setProductMenu({ visible: true, row: i, direction, x: left, y: anchorY, width: panelWidth });
+                            setProductQuery('');
+                          }}
+                        >
+                          <span className={row.item ? (outOfStock ? 'text-red-700 font-semibold' : 'text-gray-900') : 'text-gray-400'}>
+                            {row.item ? row.item : 'Select item'}
+                          </span>
+                          <ChevronDown size={14} className={outOfStock ? 'text-red-700' : 'text-gray-600'} />
+                        </button>
                         </td>
                       <td className="px-3 py-2 border border-gray-200" onContextMenu={(e)=>showMenu(e,i,'description')}>
                           <input
@@ -2430,7 +3269,7 @@ export default function Placeholder() {
           </div>
         )}
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
             <div className="md:col-span-2">
               <div className="bg-white border border-gray-200 rounded-xl p-4 max-w-sm">
                 <div className="text-sm font-medium text-gray-700 mb-1">Message</div>
@@ -2483,7 +3322,10 @@ export default function Placeholder() {
                           className="no-spin w-28 px-2 py-1 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-green-500 outline-none"
                           placeholder="e.g. 2600"
                           value={usdRate}
-                          onChange={(e)=>setUsdRate(e.target.value)}
+                          onChange={(e) => {
+                            usdRateKeyRef.current = usdRateStorageKey;
+                            setUsdRate(e.target.value);
+                          }}
                           min="0"
                         />
                       </div>
@@ -2501,10 +3343,34 @@ export default function Placeholder() {
             </div>
           </div>
           
-          <div className="mt-6 px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
-            <button className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={saveAndClose}>Save & Close</button>
-            <button className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700" onClick={saveAndNew}>Save & New</button>
-            <button className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={closeForm}>Close</button>
+          <div className="mt-4 px-4 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+            <button
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-green-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 inline-flex items-center gap-2'}
+              onClick={saveAndClose}
+              disabled={!!saveLoading}
+              type="button"
+            >
+              {saveLoading === 'close' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'close' ? 'Saving...' : 'Save & Close'}</span>
+            </button>
+            <button
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-blue-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-2'}
+              onClick={saveAndNew}
+              disabled={!!saveLoading}
+              type="button"
+            >
+              {saveLoading === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'new' ? 'Saving...' : 'Save & New'}</span>
+            </button>
+            <button
+              className={saveLoading ? 'px-4 py-2 rounded-lg border border-gray-300 text-gray-500 cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100 inline-flex items-center gap-2'}
+              onClick={closeForm}
+              disabled={!!saveLoading}
+              type="button"
+            >
+              {saveLoading === 'close-only' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'close-only' ? 'Closing...' : 'Close'}</span>
+            </button>
           </div>
           </div>
           <div className="border-l border-gray-200 bg-gray-50 p-5">
@@ -2518,10 +3384,6 @@ export default function Placeholder() {
                 <div className="flex justify-between">
                   <span>Order Date</span>
                   <span className="font-medium text-gray-900">{header.orderDate || '—'}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>S.O. No</span>
-                  <span className="font-medium text-gray-900">{header.orderNumber || '—'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Status</span>
@@ -2580,23 +3442,14 @@ export default function Placeholder() {
             </div>
           </div>
         )}
-        {productPickerOpen ? (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-            <div className="bg-white border border-gray-200 rounded-xl w-full max-w-2xl overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between gap-3">
-                <div className="text-gray-900 font-semibold">Select Product</div>
-                <button
-                  type="button"
-                  className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm"
-                  onClick={() => {
-                    setProductPickerOpen(false);
-                    setProductQuery('');
-                  }}
-                >
-                  Close
-                </button>
-              </div>
-              <div className="p-4">
+        {productMenu.visible && <div className="fixed inset-0 z-40" onClick={() => setProductMenu({ visible: false, row: -1, direction: 'down', x: 0, y: 0, width: 320 })} />}
+        {productMenu.visible ? (
+          <div className="fixed z-50" style={{ top: productMenu.y, left: productMenu.x }}>
+            <div
+              className="bg-white border border-gray-200 rounded-md shadow overflow-hidden"
+              style={{ transform: productMenu.direction === 'up' ? 'translateY(-100%)' : 'none', minWidth: productMenu.width }}
+            >
+              <div className="p-2 border-b border-gray-200 bg-white">
                 <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-gray-200 bg-white">
                   <Search className="w-4 h-4 text-gray-500" />
                   <input
@@ -2606,49 +3459,59 @@ export default function Placeholder() {
                     className="w-full bg-transparent outline-none text-sm"
                   />
                 </div>
-                <div className="mt-3 max-h-[60vh] overflow-auto border border-gray-200 rounded-xl">
-                  {(() => {
-                    const q = String(productQuery || '').trim().toLowerCase();
-                    const list = (Array.isArray(productCatalog) ? productCatalog : [])
-                      .filter((p) => String(p?.status || 'active').toLowerCase() !== 'inactive')
-                      .filter((p) => {
-                        if (!q) return true;
-                        const hay = [p?.name, p?.sku, p?.barcode, p?.category].map((x) => String(x || '').toLowerCase()).join(' ');
-                        return hay.includes(q);
-                      })
-                      .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
-                    if (!list.length) {
-                      return <div className="px-4 py-6 text-sm text-gray-600 text-center">No products found.</div>;
-                    }
-                    return (
-                      <div className="divide-y divide-gray-100">
-                        {list.map((p) => {
-                          const name = String(p?.name || '').trim();
-                          const unit = String(p?.unit || '').trim();
-                          const priceRaw = p?.sellingPrice ?? p?.sellPrice ?? p?.price ?? 0;
-                          const priceNum = typeof priceRaw === 'number' ? priceRaw : parseFloat(String(priceRaw || '').replace(/,/g, ''));
-                          const priceText = Number.isFinite(priceNum) ? priceNum.toLocaleString() : '0';
-                          return (
-                            <button
-                              key={String(p?.id || name)}
-                              type="button"
-                              className="w-full text-left px-4 py-3 hover:bg-gray-50 flex items-center justify-between gap-3"
-                              onClick={() => addProductToOrder(p)}
-                            >
-                              <div>
-                                <div className="text-sm font-semibold text-gray-900">{name || '—'}</div>
-                                <div className="text-xs text-gray-600">
-                                  {unit ? `Unit: ${unit}` : 'Unit: —'} {String(p?.sku || '').trim() ? `• SKU: ${String(p.sku).trim()}` : ''}
-                                </div>
+              </div>
+              <div className="max-h-[320px] overflow-auto">
+                {(() => {
+                  const q = String(productQuery || '').trim().toLowerCase();
+                  const list = (Array.isArray(productCatalog) ? productCatalog : [])
+                    .filter((p) => String(p?.status || 'active').toLowerCase() !== 'inactive')
+                    .filter((p) => {
+                      if (!q) return true;
+                      const hay = [p?.name, p?.sku, p?.barcode, p?.category].map((x) => String(x || '').toLowerCase()).join(' ');
+                      return hay.includes(q);
+                    })
+                    .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
+                  if (!list.length) {
+                    return <div className="px-4 py-6 text-sm text-gray-600 text-center">No products found.</div>;
+                  }
+                  return (
+                    <div className="divide-y divide-gray-100">
+                      {list.map((p) => {
+                        const name = String(p?.name || '').trim();
+                        const unit = String(p?.unit || '').trim();
+                        const priceRaw = p?.sellingPrice ?? p?.sellPrice ?? p?.price ?? 0;
+                        const priceNum = typeof priceRaw === 'number' ? priceRaw : parseFloat(String(priceRaw || '').replace(/,/g, ''));
+                        const priceText = Number.isFinite(priceNum) ? priceNum.toLocaleString() : '0';
+                        const typeKey = productStock.normalizeType(p?.category || p?.itemType || 'general');
+                        const remain = productStock.getRemain(name, typeKey);
+                        const outOfStock = Number.isFinite(remain) ? remain <= 0 : false;
+                        return (
+                          <button
+                            key={String(p?.id || name)}
+                            type="button"
+                            className={
+                              'w-full text-left px-4 py-3 hover:bg-gray-50 flex items-center justify-between gap-3'
+                            }
+                            onClick={() => addProductToOrder(p, productMenu.row)}
+                          >
+                            <div>
+                              <div className={outOfStock ? 'text-sm font-semibold text-red-700' : 'text-sm font-semibold text-gray-900'}>{name || '—'}</div>
+                              <div className="text-xs text-gray-600">
+                                {unit ? `Unit: ${unit}` : 'Unit: —'} {String(p?.sku || '').trim() ? `• SKU: ${String(p.sku).trim()}` : ''}
                               </div>
-                              <div className="text-sm font-semibold text-green-700">TSH {priceText}</div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    );
-                  })()}
-                </div>
+                              {Number.isFinite(remain) ? (
+                                <div className={outOfStock ? 'text-xs text-red-600 mt-0.5' : 'text-xs text-gray-600 mt-0.5'}>
+                                  Remaining: {Number(remain || 0).toLocaleString()}
+                                </div>
+                              ) : null}
+                            </div>
+                            <div className="text-sm font-semibold text-green-700">TSH {priceText}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           </div>
@@ -2769,13 +3632,7 @@ export default function Placeholder() {
                           <button
                             className="px-3 py-1 rounded border border-gray-200 hover:bg-gray-100 text-xs"
                             onClick={()=>{
-                              setCustomer({
-                                name: c.name || c.company || '',
-                                email: c.mainEmail || c.ccEmail || '',
-                                phone: c.mainPhone || c.mobile || c.workPhone || '',
-                                billTo: c.billTo || c.address || '',
-                                shipTo: c.shipTo || c.address || ''
-                              });
+                              setCustomer(mapCustomerToContactFields(c));
                               setShowCustomerModal(false);
                             }}
                           >
@@ -2783,16 +3640,13 @@ export default function Placeholder() {
                           </button>
                           <button
                             className="px-3 py-1 rounded border border-red-300 text-red-700 hover:bg-red-50 text-xs"
-                            onClick={()=>{
+                            onClick={async ()=>{
                               try {
-                                const list = JSON.parse(localStorage.getItem('customers') || '[]');
-                                const next = (Array.isArray(list) ? list : []).filter(x => !(
-                                  (x.name || '') === (c.name || '') &&
-                                  (x.mainEmail || '') === (c.mainEmail || '')
-                                ));
-                                localStorage.setItem('customers', JSON.stringify(next));
-                                setCustomers(next);
-                              } catch {}
+                                await customersApi.remove(c.id);
+                                await loadCustomers();
+                              } catch (err) {
+                                try { window.alert(String(err?.message || 'Unable to delete customer')); } catch {}
+                              }
                             }}
                           >
                             Delete
@@ -2807,23 +3661,24 @@ export default function Placeholder() {
                 </div>
               </div>
               <div className="px-6 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
-                <button className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700" onClick={()=>{
+                <button className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700" onClick={async ()=>{
                   const displayName = newCustomer.company || [newCustomer.prefix, newCustomer.firstName, newCustomer.middle, newCustomer.lastName].filter(Boolean).join(' ');
                   if (!displayName.trim()) return;
                   try {
-                    const list = JSON.parse(localStorage.getItem('customers') || '[]');
-                    const updated = Array.isArray(list) ? list : [];
-                    updated.push({ ...newCustomer, name: displayName });
-                    localStorage.setItem('customers', JSON.stringify(updated));
-                    setCustomers(updated);
-                    setCustomer({
+                    const created = await customersApi.create({
+                      ...newCustomer,
                       name: displayName,
-                      email: newCustomer.mainEmail || newCustomer.ccEmail || '',
-                      phone: newCustomer.mainPhone || newCustomer.mobile || '',
+                      mainPhone: newCustomer.mainPhone || newCustomer.mobile || '',
+                      mainEmail: newCustomer.mainEmail || newCustomer.ccEmail || '',
                       billTo: newCustomer.billTo || newCustomer.address || '',
                       shipTo: newCustomer.defaultShipTo ? (newCustomer.shipTo || newCustomer.billTo || newCustomer.address || '') : (newCustomer.shipTo || '')
                     });
-                  } catch {}
+                    await loadCustomers();
+                    setCustomer(mapCustomerToContactFields(created));
+                  } catch (err) {
+                    try { window.alert(String(err?.message || 'Unable to save customer')); } catch {}
+                    return;
+                  }
                   setShowCustomerModal(false);
                 }}>OK</button>
                 <button className="px-4 py-2 rounded-lg border border-gray-200 hover:bg-gray-100" onClick={()=>setShowCustomerModal(false)}>Cancel</button>
@@ -2863,52 +3718,152 @@ export default function Placeholder() {
       window.addEventListener('mousemove', move);
       window.addEventListener('mouseup', up);
     };
-    React.useEffect(() => {
-      try {
-        const list = JSON.parse(localStorage.getItem('salesOrders') || '[]');
-        setOrders(Array.isArray(list) ? list : []);
-      } catch {
-        setOrders([]);
+    const normalizeHistoryItems = useCallback((record) => {
+      const items = Array.isArray(record?.items) ? record.items : [];
+      if (items.length) {
+        return items.map((it) => {
+          const quantity = Number(it?.quantity ?? it?.qty ?? record?.quantity ?? 0) || 0;
+          const unitPrice = Number(it?.unitPrice ?? it?.price ?? it?.rate ?? record?.price ?? 0) || 0;
+          const amount = Number(it?.total ?? it?.amount ?? quantity * unitPrice) || 0;
+          return {
+            productName: String(it?.productName || it?.item || record?.productName || '').trim(),
+            description: String(it?.description || record?.description || record?.notes || '').trim(),
+            unit: String(it?.unit || record?.unit || '').trim(),
+            quantity,
+            unitPrice,
+            amount
+          };
+        });
       }
+      const quantity = Number(record?.quantity ?? 0) || 0;
+      const unitPrice = Number(record?.price ?? record?.unitPrice ?? 0) || 0;
+      const amount = Number(record?.amount ?? record?.finalTotal ?? record?.total ?? quantity * unitPrice) || 0;
+      if (!quantity && !unitPrice && !amount && !String(record?.productName || '').trim()) {
+        return [];
+      }
+      return [
+        {
+          productName: String(record?.productName || record?.description || '').trim(),
+          description: String(record?.description || record?.notes || '').trim(),
+          unit: String(record?.unit || '').trim(),
+          quantity,
+          unitPrice,
+          amount
+        }
+      ];
+    }, []);
+    const normalizeHistoryRecord = useCallback((record, sourceType) => {
+      const date = String(
+        record?.date ||
+        record?.saleDate ||
+        record?.orderDateTime ||
+        record?.orderDate ||
+        record?.createdAt ||
+        ''
+      ).trim();
+      const customerName = String(record?.customerName || record?.customer || record?.name || '').trim();
+      const saleNumber = String(record?.saleNumber || record?.invoiceNumber || record?.invoiceNo || record?.orderNumber || record?.id || '').trim();
+      const paymentMethod = String(record?.paymentMethod || '').trim();
+      const rawStatus = String(record?.status || '').trim();
+      const status = rawStatus || (paymentMethod.toLowerCase() === 'credit' ? 'Open' : 'Paid');
+      return {
+        ...record,
+        _sourceType: sourceType,
+        date,
+        customerName,
+        saleNumber,
+        paymentMethod,
+        status,
+        items: normalizeHistoryItems(record)
+      };
+    }, [normalizeHistoryItems]);
+    React.useEffect(() => {
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const sales = await salesApi.list().catch(() => []);
+          const combined = [
+            ...(Array.isArray(sales) ? sales : []).map((sale) => normalizeHistoryRecord(sale, 'sale'))
+          ];
+          const list = combined;
+          if (!alive) return;
+          setOrders(Array.isArray(list) ? list : []);
+        })
+        .catch(() => {
+          if (!alive) return;
+          setOrders([]);
+        });
+      return () => {
+        alive = false;
+      };
     }, [refreshKey]);
-    const filteredLines = useMemo(() => {
+    React.useEffect(() => {
+      const onEvent = () => setRefreshKey((v) => v + 1);
+      window.addEventListener('dataUpdated', onEvent);
+      return () => window.removeEventListener('dataUpdated', onEvent);
+    }, []);
+    const filtered = useMemo(() => {
       const start = new Date(fromDate);
       const end = new Date(toDate);
+      end.setHours(23, 59, 59, 999);
       const rows = [];
+      let truncated = false;
+      const MAX_ROWS = 2000;
       orders.forEach(o => {
-        const oDate = new Date(o.orderDate || o.date || '');
+        if (rows.length >= MAX_ROWS) {
+          truncated = true;
+          return;
+        }
+        const oDate = new Date(o.date || o.orderDate || o.createdAt || '');
         if (isNaN(oDate)) return;
         if (oDate < start || oDate > end) return;
-        const isUsd = String(o.currency || '').toUpperCase() === 'USD' || Boolean(o.usdEnabled);
-        const orderRate = Number(o.usdRate);
-        const usableRate = Number.isFinite(orderRate) && orderRate > 0 ? orderRate : 0;
         (o.items || []).forEach((it, idx) => {
-          const qty = Number(it.qty) || 0;
-          const price = Number(it.rate) || 0;
-          const amount = qty * price;
-          const amountTzsRaw = it.amountTzs;
-          const amountTzs = isUsd
-            ? (Number.isFinite(Number(amountTzsRaw)) ? Number(amountTzsRaw) : (usableRate ? amount * usableRate : null))
-            : amount;
+          if (rows.length >= MAX_ROWS) {
+            truncated = true;
+            return;
+          }
+          const qty = Number(it.quantity) || 0;
+          const currency = String(o.currency || (o.usdEnabled ? 'USD' : 'TZS')).trim().toUpperCase() === 'USD' ? 'USD' : 'TZS';
+          const usdRate = Number(o.usdRate ?? o.exchangeRate) || 0;
+          const rawUnitPrice = Number(it.unitPrice) || 0;
+          const rawAmount = Number(it.amount ?? qty * rawUnitPrice) || 0;
+          const isPersistedUsdSale = currency === 'USD' && Boolean(o.persisted);
+          const usdUnitPrice = currency === 'USD'
+            ? (isPersistedUsdSale
+                ? (usdRate > 0 ? rawUnitPrice / usdRate : rawUnitPrice)
+                : rawUnitPrice)
+            : rawUnitPrice;
+          const usdAmount = currency === 'USD'
+            ? (isPersistedUsdSale
+                ? (usdRate > 0 ? rawAmount / usdRate : rawAmount)
+                : rawAmount)
+            : null;
+          const tzsAmount = currency === 'USD'
+            ? (isPersistedUsdSale
+                ? rawAmount
+                : (Number.isFinite(Number(it.amountTzs)) ? Number(it.amountTzs) : (usdRate > 0 && usdAmount != null ? usdAmount * usdRate : null)))
+            : rawAmount;
+          const amount = currency === 'USD' ? (usdAmount ?? 0) : rawAmount;
           rows.push({
             id: `${o.id}-${idx}`,
             orderId: o.id,
-            date: (o.orderDate || '').slice(0,10),
-            invoiceNo: o.invoiceNumber || '',
-            soNo: o.orderNumber || '',
-            name: o.name || '',
-            item: it.item || '',
+            date: String(o.date || '').slice(0, 10),
+            invoiceNo: o.invoiceNumber || o.saleNumber || '',
+            soNo: '',
+            name: o.customerName || '',
+            item: it.productName || '',
             description: it.description || '',
             qty,
             unit: it.unit || '',
-            price,
+            price: usdUnitPrice,
             amount,
-            amountTzs,
+            amountTzs: tzsAmount,
             paymentMethod: String(o.paymentMethod || '').trim(),
-            currency: isUsd ? 'USD' : 'TZS',
-            usdRate: usableRate,
-            usdAmount: isUsd ? amount : null,
-            tzsAmount: isUsd ? amountTzs : amount,
+            currency,
+            usdRate: currency === 'USD' ? usdRate : 0,
+            usdAmount,
+            tzsAmount,
+            status: String(o.status || '').trim(),
             raw: o
           });
         });
@@ -2922,108 +3877,97 @@ export default function Placeholder() {
           default: return 0;
         }
       });
-      return sorted;
+      return { lines: sorted, truncated };
     }, [orders, fromDate, toDate, sortKey]);
+    const filteredLines = filtered.lines;
     const totals = useMemo(() => {
-      const totalUsd = filteredLines.reduce((s, r) => s + (r.currency === 'USD' ? (Number(r.usdAmount) || 0) : 0), 0);
-      const totalTzs = filteredLines.reduce((s, r) => {
-        const v = r.currency === 'USD' ? r.tzsAmount : r.amount;
-        return s + (Number.isFinite(Number(v)) ? Number(v) : 0);
+      const totalUsd = filteredLines.reduce((sum, row) => {
+        if (row.currency !== 'USD') return sum;
+        const value = row.usdAmount;
+        return sum + (Number.isFinite(Number(value)) ? Number(value) : 0);
       }, 0);
-      const missingRates = filteredLines.some((r) => r.currency === 'USD' && !Number(r.usdRate));
+      const totalTzs = filteredLines.reduce((sum, row) => {
+        const value = row.currency === 'USD' ? row.tzsAmount : row.amount;
+        return sum + (Number.isFinite(Number(value)) ? Number(value) : 0);
+      }, 0);
+      const missingRates = filteredLines.some((row) => row.currency === 'USD' && !(Number(row.usdRate) > 0));
       return { totalUsd, totalTzs, missingRates };
     }, [filteredLines]);
-    const hasUsd = useMemo(() => filteredLines.some((r) => r.currency === 'USD'), [filteredLines]);
-    const exportCSV = () => {
-      const header = ['Date','S.O. No.','Invoice No.','Customer Name','Item','Qty','Unit','Sales Price Currency','Sales Price','Amount USD','Rate','Amount TZS','Sell With','Status'];
-      const rows = filteredLines.map(r => [
+    const hasUsd = useMemo(() => filteredLines.some((row) => row.currency === 'USD'), [filteredLines]);
+    const reportDateRange = `${formatDisplayDate(fromDate)} - ${formatDisplayDate(toDate)}`;
+    const printSalesHistory = useCallback(() => {
+      printWithTitle(`Sales History - ${fromDate} to ${toDate}`);
+    }, [fromDate, toDate]);
+    const exportExcel = () => {
+      const header = ['Date','Invoice No.','Customer Name','Item','Qty','Unit','Currency','Sales Price','Amount USD','Rate','Amount TZS','Sell With','Status'];
+      const rows = filteredLines.map((r) => [
         r.date,
-        r.soNo,
         r.invoiceNo,
         r.name,
         r.item,
-        r.qty,
+        String(r.qty ?? ''),
         r.unit,
         r.currency === 'USD' ? 'USD' : 'TZS',
-        r.price,
-        r.currency === 'USD' ? (Number(r.usdAmount) || 0) : '',
-        r.currency === 'USD' ? (Number(r.usdRate) || '') : '',
-        r.currency === 'USD' ? (r.tzsAmount == null ? '' : Number(r.tzsAmount)) : (Number(r.amount) || 0),
+        String(Number(r.price || 0)),
+        r.currency === 'USD' ? String(Number(r.usdAmount || 0)) : '',
+        r.currency === 'USD' ? String(Number(r.usdRate || 0) || '') : '',
+        r.currency === 'USD' ? String(r.tzsAmount == null ? '' : Number(r.tzsAmount)) : String(Number(r.amount || 0)),
         r.paymentMethod || '',
         (r.raw.status || '') || 'Open'
       ]);
-      const csv = [header, ...rows].map(x => x.join(',')).join('\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'sales_by_customer_detail.csv';
-      a.click();
-      URL.revokeObjectURL(url);
-    };
-    const toggleOrderStatus = (orderId) => {
-      setOrders(prev => {
-        const updated = (Array.isArray(prev) ? prev : []).map(o => {
-          if (o.id !== orderId) return o;
-          const current = (o.status || 'Open') === 'Paid' ? 'Paid' : 'Open';
-          const nextStatus = current === 'Paid' ? 'Open' : 'Paid';
-          const next = { ...o, status: nextStatus };
-          if (nextStatus === 'Paid' && !next._stockApplied) {
-            try {
-              const type = String(next.itemType || 'eggs').trim() || 'eggs';
-              const key = `stockOut_${type}`;
-              const outRaw = JSON.parse(localStorage.getItem(key) || '[]');
-              const outList = Array.isArray(outRaw) ? outRaw : [];
-              (next.items || []).forEach((it) => {
-                const qty = Number(it?.qty) || 0;
-                const itemName = String(it?.item || '').trim();
-                if (!itemName || qty <= 0) return;
-                outList.push({
-                  id: Date.now() + Math.random(),
-                  date: String(next.orderDate || next.date || '').slice(0, 10),
-                  quantity: String(qty),
-                  unit: String(it?.unit || ''),
-                  reason: 'Sales Order',
-                  description: `Sales Order ${String(next.orderNumber || '')}`,
-                  saleOrderId: next.id,
-                  itemType: type,
-                  itemName
-                });
-              });
-              localStorage.setItem(key, JSON.stringify(outList));
-              next._stockApplied = true;
-            } catch {}
-          }
-          return next;
-        });
-        try {
-          localStorage.setItem('salesOrders', JSON.stringify(updated));
-          window.dispatchEvent(new CustomEvent('dataUpdated'));
-        } catch {}
-        return updated;
+      downloadExcelFile(`sales_history_${new Date().toISOString().slice(0, 10)}.xls`, {
+        title: 'Sales History',
+        subtitle: `${String(fromDate || '').slice(0, 10)} - ${String(toDate || '').slice(0, 10)}`,
+        rows: [header, ...rows]
       });
+    };
+    const toggleOrderStatus = () => {
+      window.alert('Status changes are not available in this view.');
     };
     return (
       <div className="bg-white border border-gray-200 rounded-xl">
+        <style>{`
+          .sales-history-print-only { display: none; }
+          @media print {
+            @page { size: landscape; margin: 12mm; }
+            body * { visibility: hidden !important; }
+            .sales-history-print-scope, .sales-history-print-scope * { visibility: visible !important; }
+            .sales-history-print-scope {
+              position: absolute !important;
+              inset: 0 !important;
+              padding: 16px !important;
+              background: white !important;
+            }
+            .sales-history-no-print { display: none !important; }
+            .sales-history-print-only { display: block !important; }
+          }
+        `}</style>
         <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm">Customize Report</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm">Comment on Report</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm">Share Template</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm">Memorize</button>
-            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>window.print()}>Print</button>
+            <button type="button" className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={printSalesHistory}>Print</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>{
               const subject = encodeURIComponent('Sales by Customer Detail');
               const body = encodeURIComponent('Please find the Sales by Customer Detail report.');
               window.location.href = `mailto:?subject=${subject}&body=${body}`;
             }}>E-mail</button>
-            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportCSV}>Excel</button>
+            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportExcel}>Excel</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>setHideHeader(v=>!v)}>{hideHeader ? 'Show Header' : 'Hide Header'}</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>setRefreshKey(k=>k+1)}>Refresh</button>
           </div>
         </div>
-        <div className="p-4">
-          <div className="flex items-center gap-3 flex-wrap">
+        <div className="p-4 sales-history-print-scope">
+          <div className="sales-history-print-only mb-4">
+            <div className="text-lg font-semibold text-gray-900">Sales History</div>
+            <div className="text-sm text-gray-700">{reportDateRange}</div>
+            <div className="mt-1 text-xs text-gray-600">
+              {filteredLines.length} line{filteredLines.length === 1 ? '' : 's'} printed
+            </div>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap sales-history-no-print">
             <div className="px-3 py-2 rounded-lg border border-green-300 bg-green-50 text-green-700 text-sm">{periodLabel}</div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-gray-700">From</span>
@@ -3047,21 +3991,17 @@ export default function Placeholder() {
             <div className="text-center mt-4">
               <div className="text-xs text-gray-600">Accrual Basis</div>
               <div className="text-lg font-semibold text-gray-900">Sales by Customer Detail</div>
-              <div className="text-sm text-gray-700">{formatDisplayDate(fromDate)} - {formatDisplayDate(toDate)}</div>
+              <div className="text-sm text-gray-700">{reportDateRange}</div>
             </div>
           )}
           <div className="mt-4 border rounded-lg">
             <div className="max-w-full overflow-x-auto">
-              <table className="min-w-[1400px] w-full table-fixed border-collapse">
+              <table className="min-w-[1280px] w-full table-fixed border-collapse">
                 <thead>
                   <tr className="bg-gray-100">
                     <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[0] }}>
                       Date
                       <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(0,e)}></div>
-                    </th>
-                    <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[1] }}>
-                      S.O. No.
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(1,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[2] }}>
                       Invoice No.
@@ -3073,39 +4013,39 @@ export default function Placeholder() {
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[4] }}>
                       Item
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(4,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(4,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-right border-b relative" style={{ width: shWidths[5] }}>
                       Qty
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(5,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(5,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[6] }}>
                       U/M
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(6,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(6,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-right border-b relative" style={{ width: shWidths[7] }}>
                       Sales Price
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(7,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(7,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-right border-b relative" style={{ width: shWidths[8] }}>
                       Amount (USD)
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(8,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(8,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-right border-b relative" style={{ width: shWidths[9] }}>
                       Rate
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(9,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(9,e)}></div>
                     </th>
                     <th className="px-3 py-2 pr-6 text-xs text-gray-700 text-right border-b relative" style={{ width: shWidths[10] }}>
                       Amount (TZS)
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(10,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(10,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-left border-b relative" style={{ width: shWidths[11] }}>
                       Sell with
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(11,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(11,e)}></div>
                     </th>
                     <th className="px-3 py-2 text-xs text-gray-700 text-center border-b relative" style={{ width: shWidths[12] }}>
                       Status
-                      <div className="absolute right-0 top-0 h-full cursor-col-resize" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(12,e)}></div>
+                      <div className="absolute right-0 top-0 h-full cursor-col-resize sales-history-no-print" style={{ width: 2, backgroundColor: '#d1d5db' }} onMouseDown={(e)=>onShMouseDown(12,e)}></div>
                     </th>
                   </tr>
                 </thead>
@@ -3113,13 +4053,17 @@ export default function Placeholder() {
                   {filteredLines.map((r) => (
                     <tr key={r.id} className="border-b">
                       <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[0] }}>{r.date}</td>
-                      <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[1] }}>
-                        <button className="underline text-blue-700" onClick={()=>{
-                          try { localStorage.setItem('selectedOrderForEdit', JSON.stringify(r.raw)); } catch {}
-                          navigate('/placeholder/sales-order');
-                        }}>{r.soNo}</button>
+                      <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[2] }}>
+                        <span className="sales-history-print-only">{r.invoiceNo || '—'}</span>
+                        {r.raw ? (
+                          <button className="underline text-blue-700 sales-history-no-print" onClick={()=>{
+                            try { localStorage.setItem('selectedOrderForEdit', JSON.stringify(r.raw)); } catch {}
+                            navigate('/placeholder/sales-order');
+                          }}>{r.invoiceNo || '—'}</button>
+                        ) : (
+                          <span className="sales-history-no-print">{r.invoiceNo || '—'}</span>
+                        )}
                       </td>
-                      <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[2] }}>{r.invoiceNo}</td>
                       <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[3] }}>{r.name}</td>
                       <td className="px-3 py-2 text-sm text-gray-800" style={{ width: shWidths[4] }}>{r.item}</td>
                       <td className="px-3 py-2 text-sm text-right text-gray-800" style={{ width: shWidths[5] }}>{r.qty}</td>
@@ -3142,15 +4086,19 @@ export default function Placeholder() {
                         {r.paymentMethod || '—'}
                       </td>
                       <td className="px-3 py-2 text-sm text-center" style={{ width: shWidths[12] }}>
+                        <span className="sales-history-print-only">{String(r.status || 'Open')}</span>
                         <button
                           type="button"
-                          className={((r.raw.status || '') === 'Paid')
-                            ? 'px-2 py-1 rounded bg-green-100 text-green-700 text-xs hover:bg-green-200'
-                            : 'px-2 py-1 rounded bg-gray-100 text-gray-700 text-xs hover:bg-gray-200'}
+                          className={`${(() => {
+                            const status = String(r.status || '').toLowerCase();
+                            return status === 'paid' || status === 'completed'
+                              ? 'px-2 py-1 rounded bg-green-100 text-green-700 text-xs hover:bg-green-200'
+                              : 'px-2 py-1 rounded bg-gray-100 text-gray-700 text-xs hover:bg-gray-200';
+                          })()} sales-history-no-print`}
                           onClick={() => toggleOrderStatus(r.orderId)}
                           title="Click to toggle Paid/Open"
                         >
-                          {((r.raw.status || '') === 'Paid') ? 'Paid' : 'Open'}
+                          {String(r.status || 'Open')}
                         </button>
                       </td>
                     </tr>
@@ -3234,21 +4182,22 @@ export default function Placeholder() {
     });
     const [deleteCustomerModal, setDeleteCustomerModal] = useState({ open: false, customer: null });
     const [deleteCustomerLoading, setDeleteCustomerLoading] = useState(false);
-    React.useEffect(() => {
+    const loadCustomers = useCallback(async () => {
       try {
-        const list = JSON.parse(localStorage.getItem('customers') || '[]');
+        const list = await customersApi.list();
         setCustomers(Array.isArray(list) ? list : []);
       } catch {
         setCustomers([]);
       }
     }, []);
-    const addCustomer = () => {
+    React.useEffect(() => {
+      void loadCustomers();
+    }, [loadCustomers]);
+    const addCustomer = async () => {
       const displayName = newCustomer.name || newCustomer.company;
       if (!displayName || !displayName.trim()) return;
       try {
-        const list = JSON.parse(localStorage.getItem('customers') || '[]');
-        const updated = Array.isArray(list) ? list : [];
-        updated.push({
+        await customersApi.create({
           name: displayName,
           company: newCustomer.company || '',
           mainEmail: newCustomer.mainEmail || '',
@@ -3257,12 +4206,14 @@ export default function Placeholder() {
           shipTo: newCustomer.shipTo || '',
           address: newCustomer.billTo || ''
         });
-        localStorage.setItem('customers', JSON.stringify(updated));
-        setCustomers(updated);
+        await loadCustomers();
         setShowAdd(false);
         setNewCustomer({ name: '', company: '', mainEmail: '', mainPhone: '', billTo: '', shipTo: '' });
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
+      } catch (err) {
+        try { window.alert(String(err?.message || 'Unable to save customer')); } catch {}
+        return false;
+      }
+      return true;
     };
     const deleteCustomer = (c) => {
       if (!canDelete) return;
@@ -3277,21 +4228,22 @@ export default function Placeholder() {
       if (deleteCustomerLoading) return;
       const c = deleteCustomerModal.customer;
       if (!c) return;
+      const startedAt = Date.now();
       setDeleteCustomerLoading(true);
-      window.setTimeout(() => {
+      (async () => {
         try {
-          const list = JSON.parse(localStorage.getItem('customers') || '[]');
-          const next = (Array.isArray(list) ? list : []).filter(x => !(
-            (x.name || '') === (c.name || '') &&
-            (x.mainEmail || '') === (c.mainEmail || '')
-          ));
-          localStorage.setItem('customers', JSON.stringify(next));
-          setCustomers(next);
-          window.dispatchEvent(new CustomEvent('dataUpdated'));
-        } catch {}
-        setDeleteCustomerLoading(false);
-        setDeleteCustomerModal({ open: false, customer: null });
-      }, 5000);
+          await customersApi.remove(c.id);
+          await loadCustomers();
+        } catch (err) {
+          try { window.alert(String(err?.message || 'Unable to delete customer')); } catch {}
+        } finally {
+          const elapsed = Date.now() - startedAt;
+          const remaining = 5000 - elapsed;
+          if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+          setDeleteCustomerLoading(false);
+          setDeleteCustomerModal({ open: false, customer: null });
+        }
+      })();
     };
 
     const cancelDeleteCustomer = () => {
@@ -3482,6 +4434,7 @@ export default function Placeholder() {
                         >Use</button>
                         {canDelete ? (
                           <button
+                            data-delete-trigger="true"
                             className="px-3 py-1 rounded border border-red-300 text-red-700 hover:bg-red-50 text-xs"
                             onClick={()=>deleteCustomer(c)}
                           >Delete</button>
@@ -3548,6 +4501,7 @@ export default function Placeholder() {
 
   const SalesCredit = () => {
     const navigate = useNavigate();
+    const [saveLoading, setSaveLoading] = useState('');
     const [creditForm, setCreditForm] = useState({
       name: '',
       phone: '',
@@ -3581,6 +4535,14 @@ export default function Placeholder() {
     const [vatEnabled, setVatEnabled] = useState(false);
     const VAT_RATE = 0.18;
     const [creditItems, setCreditItems] = useState([{ item: '', description: '', unit: 'kg', qty: 1, rate: 0 }]);
+    const loadCustomers = useCallback(async () => {
+      try {
+        const list = await customersApi.list();
+        setCustomers(Array.isArray(list) ? list : []);
+      } catch {
+        setCustomers([]);
+      }
+    }, []);
     const creditTotals = useMemo(() => {
       const subtotal = creditItems.reduce((s, r) => s + (Number(r.qty) || 0) * (Number(r.rate) || 0), 0);
       const tax = vatEnabled ? subtotal * VAT_RATE : 0;
@@ -3589,48 +4551,59 @@ export default function Placeholder() {
       return { subtotal, tax, shipping, total };
     }, [creditItems, vatEnabled]);
     React.useEffect(() => {
-      try {
-        const list = JSON.parse(localStorage.getItem('customers') || '[]');
-        setCustomers(Array.isArray(list) ? list : []);
-      } catch {
-        setCustomers([]);
-      }
-    }, []);
+      void loadCustomers();
+    }, [loadCustomers]);
     React.useEffect(() => {
       const handler = () => {
-        try {
-          const list = JSON.parse(localStorage.getItem('customers') || '[]');
-          setCustomers(Array.isArray(list) ? list : []);
-        } catch {
-          setCustomers([]);
-        }
+        void loadCustomers();
       };
       window.addEventListener('dataUpdated', handler);
       return () => window.removeEventListener('dataUpdated', handler);
+    }, [loadCustomers]);
+    React.useEffect(() => {
+      let alive = true;
+      const loadNextCreditNumber = async () => {
+        const sales = await salesApi.list().catch(() => []);
+        if (!alive) return;
+        const maxCreditNumber = (Array.isArray(sales) ? sales : []).reduce((max, sale) => {
+          if (String(sale?.paymentMethod || '').toLowerCase() !== 'credit') return max;
+          const rawNumber = String(sale?.creditNumber || sale?.saleNumber || sale?.orderNumber || '').trim();
+          const parsed = parseInt(rawNumber, 10);
+          return Number.isFinite(parsed) ? Math.max(max, parsed) : max;
+        }, nextCreditInit - 1);
+        const nextNum = Math.max(maxCreditNumber + 1, nextCreditInit);
+        setHeader((prev) => ({ ...prev, creditNumber: String(nextNum).padStart(CREDIT_PAD, '0') }));
+        try {
+          localStorage.setItem('nextCreditNumber', String(nextNum));
+        } catch {}
+      };
+      void loadNextCreditNumber();
+      return () => {
+        alive = false;
+      };
     }, []);
-    const addCustomer = () => {
+    const addCustomer = async () => {
       const displayName = (newCustomer.name || '').trim() || (newCustomer.company || '').trim();
       if (!displayName) return;
       try {
-        const list = JSON.parse(localStorage.getItem('customers') || '[]');
-        const updated = Array.isArray(list) ? list : [];
-        updated.push({ ...newCustomer, name: displayName });
-        localStorage.setItem('customers', JSON.stringify(updated));
-        setCustomers(updated);
+        await customersApi.create({ ...newCustomer, name: displayName });
+        await loadCustomers();
         setCreditForm(prev => ({
           ...prev,
           name: displayName,
           phone: newCustomer.mainPhone || ''
         }));
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
+      } catch (err) {
+        try { window.alert(String(err?.message || 'Unable to save customer')); } catch {}
+        return;
+      }
       setShowCustomerModal(false);
     };
-    const saveCreditSale = () => {
+    const saveCreditSale = async () => {
       const name = (creditForm.name || '').trim();
       const phone = (creditForm.phone || '').trim();
       const dueDate = (creditForm.dueDate || '').slice(0,10);
-      if (!name || !dueDate) return;
+      if (!name || !dueDate) return false;
       const first = creditItems[0] || { qty: 0, unit: '', rate: 0 };
       const qtyNum = Number(first.qty) || 0;
       const rateNum = Number(first.rate) || 0;
@@ -3662,16 +4635,38 @@ export default function Placeholder() {
         createdAt: new Date().toISOString()
       };
       try {
-        const list = JSON.parse(localStorage.getItem('creditSales') || '[]');
-        const next = Array.isArray(list) ? list : [];
-        next.push(entry);
-        localStorage.setItem('creditSales', JSON.stringify(next));
+        await salesApi.create({
+          saleNumber: header.creditNumber,
+          date: header.creditDate,
+          customerName: name,
+          phone,
+          paymentMethod: 'credit',
+          status: 'Open',
+          paymentTerms: header.terms,
+          dueDate,
+          amount: amountFinal,
+          subtotal: creditTotals.subtotal,
+          tax: creditTotals.tax,
+          shipping: creditTotals.shipping,
+          finalTotal: amountFinal,
+          amountPaid: 0,
+          balanceDue: amountFinal,
+          notes: (creditForm.notes || '').trim(),
+          items: creditItems.map((r) => ({
+            item: r.item || '',
+            description: r.description || '',
+            unit: r.unit || '',
+            qty: Number(r.qty) || 0,
+            rate: Number(r.rate) || 0,
+            total: (Number(r.qty) || 0) * (Number(r.rate) || 0)
+          }))
+        });
+        const currentNumber = parseInt(String(header.creditNumber || ''), 10);
+        const nextNum = (Number.isFinite(currentNumber) ? currentNumber : nextCreditInit) + 1;
         try {
-          const cur = parseInt(localStorage.getItem('nextCreditNumber') || String(nextCreditInit), 10);
-          const nextNum = (Number.isFinite(cur) ? cur : nextCreditInit) + 1;
           localStorage.setItem('nextCreditNumber', String(nextNum));
-          setHeader(prev => ({ ...prev, creditNumber: String(nextNum).padStart(CREDIT_PAD, '0') }));
         } catch {}
+        setHeader(prev => ({ ...prev, creditNumber: String(nextNum).padStart(CREDIT_PAD, '0') }));
         setCreditForm({
           name: '',
           phone: '',
@@ -3679,7 +4674,13 @@ export default function Placeholder() {
           notes: ''
         });
         setCreditItems([{ item: '', description: '', unit: 'kg', qty: 1, rate: 0 }]);
-      } catch {}
+        return true;
+      } catch (error) {
+        try {
+          window.alert(error?.message || 'Failed to save credit sale.');
+        } catch {}
+        return false;
+      }
     };
     return (
       <div className="bg-white border border-gray-200 rounded-xl">
@@ -3905,8 +4906,44 @@ export default function Placeholder() {
             </div>
           </div>
           <div className="mt-6 px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
-            <button className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={()=>{saveCreditSale(); navigate('/placeholder/credit-history');}}>Save & Close</button>
-            <button className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700" onClick={()=>{saveCreditSale(); setCreditItems([{ item:'', description:'', unit:'kg', qty:1, rate:0 }]);}}>Save & New</button>
+            <button
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-green-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 inline-flex items-center gap-2'}
+              onClick={() => {
+                if (saveLoading) return;
+                setSaveLoading('close');
+                void withMinimumDelay(async () => {
+                  const ok = await saveCreditSale();
+                  if (!ok) return;
+                  navigate('/placeholder/credit-history');
+                }, 5000).finally(() => {
+                  setSaveLoading('');
+                });
+              }}
+              disabled={!!saveLoading}
+              type="button"
+            >
+              {saveLoading === 'close' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'close' ? 'Saving...' : 'Save & Close'}</span>
+            </button>
+            <button
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-blue-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-2'}
+              onClick={() => {
+                if (saveLoading) return;
+                setSaveLoading('new');
+                void withMinimumDelay(async () => {
+                  const ok = await saveCreditSale();
+                  if (!ok) return;
+                  setCreditItems([{ item:'', description:'', unit:'kg', qty:1, rate:0 }]);
+                }, 5000).finally(() => {
+                  setSaveLoading('');
+                });
+              }}
+              disabled={!!saveLoading}
+              type="button"
+            >
+              {saveLoading === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'new' ? 'Saving...' : 'Save & New'}</span>
+            </button>
             <button className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={()=>{ setCreditItems([{ item:'', description:'', unit:'kg', qty:1, rate:0 }]); setCreditForm({ name:'', phone:'', dueDate:new Date().toISOString().slice(0,10), notes:'' }); }}>Clear</button>
           </div>
           </div>
@@ -4009,16 +5046,29 @@ export default function Placeholder() {
     const [hideHeader, setHideHeader] = useState(false);
     const [periodLabel] = useState('This Month-to-date');
     React.useEffect(() => {
-      try {
-        const list = JSON.parse(localStorage.getItem('creditSales') || '[]');
-        setCredits(Array.isArray(list) ? list : []);
-      } catch {
-        setCredits([]);
-      }
+      let alive = true;
+      const loadCredits = async () => {
+        const sales = await salesApi.list().catch(() => []);
+        if (!alive) return;
+        const creditRows = (Array.isArray(sales) ? sales : []).filter(
+          (sale) => String(sale?.paymentMethod || '').toLowerCase() === 'credit'
+        );
+        setCredits(creditRows);
+      };
+      const handler = () => {
+        void loadCredits();
+      };
+      void loadCredits();
+      window.addEventListener('dataUpdated', handler);
+      return () => {
+        alive = false;
+        window.removeEventListener('dataUpdated', handler);
+      };
     }, []);
     const filteredRows = useMemo(() => {
       const start = new Date(fromDate);
       const end = new Date(toDate);
+      end.setHours(23, 59, 59, 999);
       const rows = (credits || []).filter(c => {
         const d = new Date(c.creditDate || c.createdAt || '');
         if (isNaN(d) || d < start || d > end) return false;
@@ -4034,12 +5084,33 @@ export default function Placeholder() {
       });
       return rows;
     }, [credits, fromDate, toDate, sortKey]);
+    const exportExcel = () => {
+      const header = ['Date', 'Credit No', 'Customer', 'Phone', 'Qty', 'Unit', 'Rate', 'Amount', 'Due', 'Status'];
+      const rows = filteredRows.map((cs) => [
+        String(cs.creditDate || cs.createdAt || '').slice(0, 10),
+        String(cs.creditNumber || ''),
+        String(cs.name || ''),
+        String(cs.phone || ''),
+        String(Number(cs.qty || 0)),
+        String(cs.unit || ''),
+        String(Number(cs.rate || 0)),
+        String(Number(cs.amount || 0)),
+        String(cs.dueDate || ''),
+        String(cs.status || '')
+      ]);
+      downloadExcelFile(`credit_history_${new Date().toISOString().slice(0, 10)}.xls`, {
+        title: 'Credit History',
+        subtitle: `${String(fromDate || '').slice(0, 10)} - ${String(toDate || '').slice(0, 10)}`,
+        rows: [header, ...rows]
+      });
+    };
     return (
       <div className="bg-white border border-gray-200 rounded-xl">
         <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
           <div className="text-gray-900 font-semibold">Credit History</div>
           <div className="flex items-center gap-2">
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>navigate('/placeholder/sales-credit')}>New Credit</button>
+            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportExcel}>Excel</button>
           </div>
         </div>
         <div className="p-4">
@@ -4122,111 +5193,345 @@ export default function Placeholder() {
 
   const SalesReturns = () => {
     const navigate = useNavigate();
+    const location = useLocation();
+    const [saveLoading, setSaveLoading] = useState('');
     const RMA_PAD = 6;
-    const nextRmaInit = (() => {
-      try {
-        const v = parseInt(localStorage.getItem('nextRmaNumber') || '7000', 10);
-        return Number.isFinite(v) ? v : 7000;
-      } catch { return 7000; }
-    })();
+    const nextRmaInit = 7000;
+    const viewRmaNo = useMemo(() => {
+      const params = new URLSearchParams(String(location.search || ''));
+      return String(params.get('rmaNo') || '').trim();
+    }, [location.search]);
+    const defaultReportedBy = useMemo(
+      () => String(currentUser?.fullName || currentUser?.name || currentUser?.username || currentUser?.email || '').trim(),
+      [currentUser?.email, currentUser?.fullName, currentUser?.name, currentUser?.username]
+    );
+    const [editMode, setEditMode] = useState(false);
+    const [editId, setEditId] = useState(null);
+    const [deleteDamageModalOpen, setDeleteDamageModalOpen] = useState(false);
+    const [deleteDamageLoading, setDeleteDamageLoading] = useState(false);
     const [header, setHeader] = useState({
       rmaNumber: String(nextRmaInit).padStart(RMA_PAD, '0'),
       rmaDate: new Date().toISOString().slice(0,10),
       windowDays: '30'
     });
-    const [form, setForm] = useState({ name: '', phone: '', notes: '' });
-    const categoryOptions = ['eggs','chickens'];
-    const getUnitsForCategory = (cat) => (cat === 'eggs' ? ['tray','piece'] : ['piece','kg']);
-    const [items, setItems] = useState([{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }]);
+    const [form, setForm] = useState(() => ({ name: defaultReportedBy, phone: '', notes: '' }));
+    const defaultUnit = 'item';
+    const [items, setItems] = useState([{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }]);
+    const [availableProducts, setAvailableProducts] = useState([]);
     const [vatEnabled, setVatEnabled] = useState(false);
     const VAT_RATE = 0.18;
     const [restockPercent, setRestockPercent] = useState('0');
+    const resetDamageForm = useCallback(async () => {
+      const list = await damageStocksApi.list().catch(() => []);
+      const nextInfo = damageStocksApi.getNextDamageNumber(list);
+      setEditMode(false);
+      setEditId(null);
+      setHeader({
+        rmaNumber: String(nextInfo?.rmaNumber || nextRmaInit).padStart(RMA_PAD, '0'),
+        rmaDate: new Date().toISOString().slice(0, 10),
+        windowDays: '30'
+      });
+      setForm({ name: defaultReportedBy, phone: '', notes: '' });
+      setItems([{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }]);
+      setVatEnabled(false);
+      setRestockPercent('0');
+    }, [defaultReportedBy, defaultUnit, nextRmaInit]);
     const totals = useMemo(() => {
       const subtotal = items.reduce((s, r) => s + (Number(r.qty)||0) * (Number(r.price)||0), 0);
       const tax = vatEnabled ? subtotal * VAT_RATE : 0;
       const restockFee = subtotal * (Number(restockPercent||0)/100);
       const shippingReverse = 0;
-      const refundTotal = subtotal + tax - restockFee - shippingReverse;
-      return { subtotal, tax, restockFee, shippingReverse, refundTotal };
+      const lossTotal = subtotal + tax - restockFee - shippingReverse;
+      return { subtotal, tax, restockFee, shippingReverse, lossTotal };
     }, [items, vatEnabled, restockPercent]);
-    const saveReturn = () => {
-      const name = (form.name||'').trim();
-      const phone = (form.phone||'').trim();
-      if (!name) return;
-      const entry = {
-        id: Date.now(),
-        rmaNumber: header.rmaNumber,
-        rmaDate: header.rmaDate,
-        windowDays: header.windowDays,
-        name,
-        phone,
-        items: items.map(r=>({
-          item:r.item||'',
-          description:r.description||'',
-          unit:r.unit||'',
-          qty:Number(r.qty)||0,
-          price:Number(r.price)||0,
-          amount:(Number(r.qty)||0)*(Number(r.price)||0),
-          reason:r.reason||'',
-          condition:r.condition||'New',
-          restock: !!r.restock
-        })),
-        totals,
-        restockPercent: Number(restockPercent||0),
-        vatEnabled,
-        refundMethod: 'Original',
-        notes: (form.notes||'').trim(),
-        status: 'Closed',
-        createdAt: new Date().toISOString()
+    useEffect(() => {
+      if (viewRmaNo) return;
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const list = await damageStocksApi.list().catch(() => []);
+          const nextInfo = damageStocksApi.getNextDamageNumber(list);
+          if (!alive) return;
+          setHeader((prev) => ({ ...prev, rmaNumber: String(nextInfo?.rmaNumber || nextRmaInit).padStart(RMA_PAD, '0') }));
+        })
+        .catch(() => {});
+      return () => {
+        alive = false;
       };
+    }, [nextRmaInit, viewRmaNo]);
+
+    useEffect(() => {
+      if (!viewRmaNo) {
+        setEditMode(false);
+        setEditId(null);
+        return;
+      }
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const list = await damageStocksApi.list().catch(() => []);
+          const target = String(viewRmaNo || '').trim();
+          const found = (Array.isArray(list) ? list : []).find((r) => String(r?.rmaNumber || r?.rmaNo || '').trim() === target) || null;
+          if (!alive || !found) return;
+          setEditMode(true);
+          setEditId(found?.id ?? null);
+          setHeader((prev) => ({
+            ...prev,
+            rmaNumber: String(found?.rmaNumber || viewRmaNo).trim(),
+            rmaDate: String(found?.rmaDate || prev.rmaDate || '').slice(0, 10) || prev.rmaDate,
+            windowDays: String(found?.windowDays || prev.windowDays || '30')
+          }));
+          setForm({ name: String(found?.reportedBy || found?.name || ''), phone: String(found?.phone || ''), notes: String(found?.notes || '') });
+          setVatEnabled(Boolean(found?.vatEnabled));
+          setRestockPercent(String(found?.restockPercent ?? '0'));
+          const lines = Array.isArray(found?.items) ? found.items : [];
+          setItems(
+            lines.length
+              ? lines.map((r) => ({
+                  item: String(r?.item || r?.itemName || ''),
+                  description: String(r?.description || ''),
+                  unit: String(r?.unit || defaultUnit),
+                  qty: Number(r?.qty || 0) || 0,
+                  price: Number(r?.price || 0) || 0,
+                  reason: String(r?.reason || ''),
+                  restock: true
+                }))
+              : [{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }]
+          );
+        })
+        .catch(() => {});
+      return () => {
+        alive = false;
+      };
+    }, [defaultUnit, viewRmaNo]);
+    useEffect(() => {
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const snapshot = await productsApi.loadInventorySnapshot();
+          const inventory = Array.isArray(snapshot?.items) ? snapshot.items : [];
+          const moves = Array.isArray(snapshot?.movements) ? snapshot.movements : [];
+
+          const norm = (v) => String(v || '').trim().toLowerCase();
+          const qtyMap = new Map();
+          const nameMap = new Map();
+          const addQty = (name, delta) => {
+            const display = String(name || '').trim();
+            const key = norm(name);
+            if (!key) return;
+            if (display && !nameMap.has(key)) nameMap.set(key, display);
+            const cur = qtyMap.get(key) || 0;
+            qtyMap.set(key, cur + (Number(delta) || 0));
+          };
+          (Array.isArray(moves) ? moves : []).forEach((m) => {
+            const type = String(m?.movementType || '').trim().toLowerCase();
+            const qty = Number(m?.quantity || 0) || 0;
+            if (!qty) return;
+            if (type === 'stock_in') addQty(m?.itemName, qty);
+            else if (type === 'stock_out') addQty(m?.itemName, -qty);
+            else addQty(m?.itemName, qty);
+          });
+
+          const productMap = new Map();
+          (Array.isArray(inventory) ? inventory : []).forEach((it) => {
+            const name = String(it?.name || it?.itemName || '').trim();
+            const key = norm(name);
+            if (!key) return;
+            const unit = String(it?.unit || defaultUnit || '').trim() || defaultUnit;
+            const price = Number(it?.sellingPrice ?? it?.sellPrice ?? it?.price ?? 0) || 0;
+            const category = String(it?.category || it?.itemType || 'general').trim() || 'general';
+            if (!productMap.has(key)) productMap.set(key, { productId: String(it?.id || ''), name, unit, price, category });
+          });
+
+          const out = Array.from(productMap.entries())
+            .map(([key, v]) => ({
+              key,
+              name: v.name,
+              unit: v.unit,
+              price: v.price,
+              category: v.category,
+              availableQty: Number(qtyMap.get(key) || 0)
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+          if (!alive) return;
+          setAvailableProducts(out);
+        })
+        .catch(() => {});
+      return () => {
+        alive = false;
+      };
+    }, [defaultUnit]);
+
+    const applySelectedProduct = (index, productName) => {
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const key = norm(productName);
+      const found = (availableProducts || []).find((p) => p.key === key);
+      if (!found) return;
+      setItems((prev) =>
+        prev.map((r, idx) => {
+          if (idx !== index) return r;
+          const next = { ...r, item: found.name };
+          next.productId = found.productId || '';
+          next.itemType = found.category || 'general';
+          next.unit = found.unit || defaultUnit;
+          const priceNum = Number(r.price || 0) || 0;
+          if (!priceNum && Number(found.price || 0)) next.price = Number(found.price || 0);
+          return next;
+        })
+      );
+    };
+    const saveReturn = async () => {
+      const name = (form.name || defaultReportedBy || '').trim();
+      const phone = (form.phone||'').trim();
+      if (!name) {
+        try { window.alert('Reported By is required'); } catch {}
+        return false;
+      }
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const availMap = new Map((availableProducts || []).map((p) => [p.key, Number(p.availableQty || 0)]));
+      let anyLine = false;
+      for (const r of items) {
+        const itemName = String(r?.item || '').trim();
+        const qty = Number(r?.qty || 0) || 0;
+        if (!(qty > 0) && !itemName) continue;
+        anyLine = true;
+        if (!itemName) {
+          try { window.alert('Select product for damaged item'); } catch {}
+          return false;
+        }
+        if (!(qty > 0)) {
+          try { window.alert(`Enter qty for ${itemName}`); } catch {}
+          return false;
+        }
+        const key = norm(itemName);
+        const availableQty = Number(availMap.get(key) ?? 0) || 0;
+        if (qty > availableQty) {
+          try { window.alert(`Not enough stock for ${itemName}. Available: ${availableQty}`); } catch {}
+          return false;
+        }
+      }
+      if (!anyLine) {
+        try { window.alert('Add at least one damaged item'); } catch {}
+        return false;
+      }
       try {
-        const list = JSON.parse(localStorage.getItem('returns') || '[]');
-        const next = Array.isArray(list) ? list : [];
-        next.push(entry);
-        localStorage.setItem('returns', JSON.stringify(next));
-        items.forEach(r => {
-          if (r.restock) {
-            const cat = (r.category || 'eggs');
-            const stockKey = `stockIn_${cat}`;
-            const stockIn = JSON.parse(localStorage.getItem(stockKey) || '[]');
-            const record = {
-              id: Date.now() + Math.random(),
-              quantity: String(r.qty || 0),
-              unit: r.unit || '',
-              supplier: 'Return',
-              pricePerItem: String(r.price || 0),
-              date: new Date().toISOString().slice(0,10),
-              itemType: cat,
-              note: `Restock from RMA ${header.rmaNumber}`,
-              itemName: r.item || ''
-            };
-            stockIn.push(record);
-            localStorage.setItem(stockKey, JSON.stringify(stockIn));
-          }
+        const record = await damageStocksApi.create({
+          rmaNumber: header.rmaNumber,
+          rmaDate: header.rmaDate,
+          windowDays: header.windowDays,
+          reportedBy: name,
+          phone,
+          notes: form.notes,
+          vatEnabled,
+          restockPercent,
+          lossTotal: totals.lossTotal,
+          items
         });
-        try {
-          const cur = parseInt(localStorage.getItem('nextRmaNumber') || String(nextRmaInit), 10);
-          const nextNum = (Number.isFinite(cur) ? cur : nextRmaInit) + 1;
-          localStorage.setItem('nextRmaNumber', String(nextNum));
-          setHeader(prev => ({ ...prev, rmaNumber: String(nextNum).padStart(RMA_PAD, '0') }));
-        } catch {}
-        setForm({ name:'', phone:'', notes:'' });
-        setItems([{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }]);
-      } catch {}
+        setEditMode(true);
+        setEditId(record?.id || null);
+        setHeader((prev) => ({
+          ...prev,
+          rmaNumber: String(record?.rmaNumber || prev.rmaNumber || ''),
+          rmaDate: String(record?.rmaDate || prev.rmaDate || '').slice(0, 10) || prev.rmaDate,
+          windowDays: String(record?.windowDays || prev.windowDays || '30')
+        }));
+        appendSystemActivity(
+          'damage_stock_create',
+          'Damaged stock recorded',
+          `${String(record?.rmaNumber || header.rmaNumber)} • TSH ${totals.lossTotal.toLocaleString()}`,
+          'Damage Stock',
+          'warning',
+          { entityId: record?.id || '' }
+        );
+      } catch (err) {
+        try { window.alert(String(err?.message || 'Unable to save damaged stock')); } catch {}
+        return false;
+      }
+      return true;
+    };
+
+    const updateReturn = async () => {
+      if (!editId) return false;
+      const name = (form.name || defaultReportedBy || '').trim();
+      const phone = (form.phone || '').trim();
+      if (!name) return false;
+      try {
+        const record = await damageStocksApi.update(editId, {
+          rmaNumber: header.rmaNumber,
+          rmaDate: header.rmaDate,
+          windowDays: header.windowDays,
+          reportedBy: name,
+          phone,
+          notes: form.notes,
+          vatEnabled,
+          restockPercent,
+          lossTotal: totals.lossTotal,
+          items
+        });
+        appendSystemActivity(
+          'damage_stock_update',
+          'Damaged stock updated',
+          `${String(record?.rmaNumber || header.rmaNumber)} updated`,
+          'Damage Stock',
+          'warning',
+          { entityId: record?.id || editId }
+        );
+        return true;
+      } catch (err) {
+        try { window.alert(String(err?.message || 'Unable to update damaged stock')); } catch {}
+        return false;
+      }
+    };
+
+    const deleteReturn = async () => {
+      const no = String(header.rmaNumber || '').trim();
+      if (!no || !editId || deleteDamageLoading) return;
+      setDeleteDamageLoading(true);
+      try {
+        await damageStocksApi.remove(editId);
+        appendSystemActivity(
+          'damage_stock_delete',
+          'Damaged stock deleted',
+          `${no} deleted`,
+          'Damage Stock',
+          'warning',
+          { entityId: editId }
+        );
+        setDeleteDamageModalOpen(false);
+        navigate('/placeholder/damage-history');
+      } catch (err) {
+        try { window.alert(String(err?.message || 'Unable to delete damaged stock')); } catch {}
+      } finally {
+        setDeleteDamageLoading(false);
+      }
+    };
+    const cancelDeleteReturn = () => {
+      if (deleteDamageLoading) return;
+      setDeleteDamageModalOpen(false);
     };
     return (
       <div className="bg-white border border-gray-200 rounded-xl">
+        <ConfirmDeleteModal
+          open={deleteDamageModalOpen}
+          title="Delete Damage Record?"
+          description={`This will permanently delete damage record ${header.rmaNumber || ''}.`}
+          confirmText="Delete"
+          loading={deleteDamageLoading}
+          onCancel={cancelDeleteReturn}
+          onConfirm={deleteReturn}
+        />
         <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between">
-          <div className="text-gray-900 font-semibold">Returns & Refunds</div>
+          <div className="text-gray-900 font-semibold">Damaged Stocks</div>
           <div className="flex items-center gap-2">
-            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>navigate('/placeholder/returns-history')}>Show History</button>
+            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>navigate('/placeholder/damage-history')}>Show History</button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm flex items-center gap-2" onClick={()=>window.print()}>
               <Printer size={16} />
               <span>Print</span>
             </button>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm flex items-center gap-2" onClick={()=>{
-              const subject = `Return ${header.rmaNumber}`;
-              const body = `RMA Date: ${header.rmaDate}\nWindow: ${header.windowDays} days\nCustomer: ${(form.name||'')}\nRefund: ${totals.refundTotal.toLocaleString()}`;
+              const subject = `Damaged Stock ${header.rmaNumber}`;
+              const body = `Date: ${header.rmaDate}\nReported by: ${(form.name||'')}\nLoss: ${totals.lossTotal.toLocaleString()}`;
               window.location.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
             }}>
               <Mail size={16} />
@@ -4234,11 +5539,14 @@ export default function Placeholder() {
             </button>
             {canDelete ? (
               <button className="px-3 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 text-sm flex items-center gap-2" onClick={()=>{
-                setForm({ name:'', phone:'', notes:'' });
-                setItems([{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }]);
+                if (editMode) setDeleteDamageModalOpen(true);
+                else {
+                  setForm({ name:'', phone:'', notes:'' });
+                  setItems([{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }]);
+                }
               }}>
                 <Trash2 size={16} />
-                <span>Delete</span>
+                <span>{editMode ? 'Delete Record' : 'Delete'}</span>
               </button>
             ) : null}
           </div>
@@ -4246,30 +5554,30 @@ export default function Placeholder() {
         <div className="p-4">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
             <div>
-              <div className="text-xs text-gray-700">RMA Number</div>
-              <input className="mt-1 w-full px-3 py-2 border rounded-lg text-sm" value={header.rmaNumber} readOnly />
+              <div className="text-xs text-gray-700">Damage No</div>
+              <input className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm" value={header.rmaNumber} readOnly />
             </div>
             <div>
-              <div className="text-xs text-gray-700">RMA Date</div>
-              <DateInput className="mt-1 w-full px-3 py-2 border rounded-lg text-sm" value={header.rmaDate} onChange={(e)=>setHeader(prev=>({ ...prev, rmaDate: e.target.value }))} />
+              <div className="text-xs text-gray-700">Date</div>
+              <DateInput className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm" value={header.rmaDate} onChange={(e)=>setHeader(prev=>({ ...prev, rmaDate: e.target.value }))} />
             </div>
             <div>
-              <div className="text-xs text-gray-700">Return Window (days)</div>
-              <input className="mt-1 w-full px-3 py-2 border rounded-lg text-sm" value={header.windowDays} onChange={(e)=>setHeader(prev=>({ ...prev, windowDays: e.target.value.replace(/[^0-9]/g,'') }))} />
+              <div className="text-xs text-gray-700">Window (days)</div>
+              <input className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm" value={header.windowDays} onChange={(e)=>setHeader(prev=>({ ...prev, windowDays: e.target.value.replace(/[^0-9]/g,'') }))} />
             </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
             <div>
-              <div className="text-xs text-gray-700">Customer Name</div>
-              <input className="mt-1 w-full px-3 py-2 border rounded-lg text-sm" value={form.name} onChange={(e)=>setForm(prev=>({ ...prev, name: e.target.value }))} />
+              <div className="text-xs text-gray-700">Reported By</div>
+              <input className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm" value={form.name} onChange={(e)=>setForm(prev=>({ ...prev, name: e.target.value }))} />
             </div>
             <div>
-              <div className="text-xs text-gray-700">Phone</div>
-              <input className="mt-1 w-full px-3 py-2 border rounded-lg text-sm" value={form.phone} onChange={(e)=>setForm(prev=>({ ...prev, phone: e.target.value }))} />
+              <div className="text-xs text-gray-700">Contact</div>
+              <input className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm" value={form.phone} onChange={(e)=>setForm(prev=>({ ...prev, phone: e.target.value }))} />
             </div>
             <div>
-              <div className="text-xs text-gray-700">Refund Method</div>
-              <select className="mt-1 w-full px-3 py-2 border rounded-lg text-sm">
+              <div className="text-xs text-gray-700">Method</div>
+              <select className="mt-1 w-full px-3 py-1.5 border rounded-lg text-sm">
                 <option>Original</option>
                 <option>Cash</option>
                 <option>Bank</option>
@@ -4280,8 +5588,8 @@ export default function Placeholder() {
           </div>
           <div className="bg-white border border-gray-200 rounded-xl">
             <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-              <div className="text-gray-900 font-semibold">Return Items</div>
-              <button className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2" onClick={()=>setItems(prev=>[...prev,{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }])}>
+              <div className="text-gray-900 font-semibold">Damaged Items</div>
+              <button className="px-3 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 flex items-center gap-2" onClick={()=>setItems(prev=>[...prev,{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }])}>
                 <Plus size={16} />
                 <span className="text-sm">Add Line</span>
               </button>
@@ -4291,16 +5599,14 @@ export default function Placeholder() {
                 <thead>
                   <tr className="bg-gray-50">
                     <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-center w-1/12 border border-gray-200">No.</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-2/12 border border-gray-200">Item</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-2/12 border border-gray-200">Description</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-1/12 border border-gray-200">Category</th>
+                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-3/12 border border-gray-200">Item</th>
+                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-3/12 border border-gray-200">Description</th>
                     <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-1/12 border border-gray-200">Unit</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-right w-1/12 border border-gray-200">Qty Return</th>
+                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-right w-1/12 border border-gray-200">Qty Damaged</th>
                     <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-right w-1/12 border border-gray-200">Price</th>
                     <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-right w-1/12 border border-gray-200">Amount</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-1/12 border border-gray-200">Reason</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-1/12 border border-gray-200">Condition</th>
-                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-center w-1/12 border border-gray-200">Restock</th>
+                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-left w-2/12 border border-gray-200">Reason</th>
+                    <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-center w-1/12 border border-gray-200">Deduct Stock</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -4310,19 +5616,29 @@ export default function Placeholder() {
                       <tr key={i} className="align-middle">
                         <td className="px-3 py-2 border border-gray-200 text-center select-none">{i + 1}</td>
                         <td className="px-3 py-2 border border-gray-200">
-                          <input className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.item} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,item:e.target.value}:r))} placeholder="Product or service" />
+                          <select
+                            className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none"
+                            value={row.item}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setItems((prev) => prev.map((r, idx) => (idx === i ? { ...r, item: v } : r)));
+                              applySelectedProduct(i, v);
+                            }}
+                          >
+                            <option value="">Select product</option>
+                            {(availableProducts || []).map((p) => (
+                              <option key={p.key} value={p.name}>
+                                {p.name} ({Number(p.availableQty || 0).toLocaleString()})
+                              </option>
+                            ))}
+                          </select>
                         </td>
                         <td className="px-3 py-2 border border-gray-200">
                           <input className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.description} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,description:e.target.value}:r))} placeholder="Description" />
                         </td>
                         <td className="px-3 py-2 border border-gray-200">
-                          <select className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.category||'eggs'} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,category:e.target.value, unit:getUnitsForCategory(e.target.value)[0]}:r))}>
-                            {categoryOptions.map(u => <option key={u} value={u}>{u}</option>)}
-                          </select>
-                        </td>
-                        <td className="px-3 py-2 border border-gray-200">
                           <select className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.unit} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,unit:e.target.value}:r))}>
-                            {getUnitsForCategory(row.category||'eggs').map(u => <option key={u} value={u}>{u}</option>)}
+                            {UNIT_OPTIONS.map((u) => <option key={u} value={u}>{u}</option>)}
                           </select>
                         </td>
                         <td className="px-3 py-2 border border-gray-200">
@@ -4337,15 +5653,8 @@ export default function Placeholder() {
                         <td className="px-3 py-2 border border-gray-200">
                           <input className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.reason} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,reason:e.target.value}:r))} placeholder="Reason" />
                         </td>
-                        <td className="px-3 py-2 border border-gray-200">
-                          <select className="w-full px-2 py-1 text-sm bg-transparent focus:outline-none" value={row.condition} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,condition:e.target.value}:r))}>
-                            <option>New</option>
-                            <option>Opened</option>
-                            <option>Damaged</option>
-                          </select>
-                        </td>
                         <td className="px-3 py-2 border border-gray-200 text-center">
-                          <input type="checkbox" checked={!!row.restock} onChange={(e)=>setItems(prev=>prev.map((r,idx)=>idx===i?{...r,restock:e.target.checked}:r))} />
+                          <input type="checkbox" checked disabled />
                         </td>
                       </tr>
                     );
@@ -4388,16 +5697,58 @@ export default function Placeholder() {
                   <span className="text-sm font-semibold text-gray-900">{totals.restockFee.toLocaleString()}</span>
                 </div>
                 <div className="border-t border-gray-200 pt-2 flex items-center justify-between">
-                  <span className="text-sm font-semibold text-gray-900">Refund Total</span>
-                  <span className="text-lg font-bold text-gray-900">{totals.refundTotal.toLocaleString()}</span>
+                  <span className="text-sm font-semibold text-gray-900">Loss Total</span>
+                  <span className="text-lg font-bold text-gray-900">{totals.lossTotal.toLocaleString()}</span>
                 </div>
               </div>
             </div>
           </div>
           <div className="mt-6 px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-2">
-            <button className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={()=>{ saveReturn(); navigate('/placeholder/sales-returns'); }}>Save & Close</button>
-            <button className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700" onClick={()=>{ saveReturn(); setItems([{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }]); }}>Save & New</button>
-            <button className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={()=>{ setItems([{ item:'', description:'', unit:getUnitsForCategory('eggs')[0], qty:1, price:0, reason:'', condition:'New', restock:true, category:'eggs' }]); setForm({ name:'', phone:'', notes:'' }); }}>Clear</button>
+            <button
+              type="button"
+              disabled={!!saveLoading}
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-green-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 inline-flex items-center gap-2'}
+              onClick={() => {
+                if (saveLoading) return;
+                let goTo = '';
+                setSaveLoading('close');
+                void withMinimumDelay(async () => {
+                  const ok = editMode ? await updateReturn() : await saveReturn();
+                  if (!ok) return;
+                  goTo = editMode ? '/placeholder/damage-history' : '/placeholder/damage-stocks';
+                }, 5000)
+                  .finally(() => {
+                    setSaveLoading('');
+                    if (goTo) navigate(goTo);
+                  });
+              }}
+            >
+              {saveLoading === 'close' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'close' ? 'Saving...' : editMode ? 'Save Changes' : 'Save & Close'}</span>
+            </button>
+            <button
+              type="button"
+              disabled={!!saveLoading}
+              className={saveLoading ? 'px-4 py-2 rounded-lg bg-blue-600/70 text-white cursor-not-allowed inline-flex items-center gap-2' : 'px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 inline-flex items-center gap-2'}
+              onClick={() => {
+                if (saveLoading) return;
+                let shouldReset = false;
+                setSaveLoading('new');
+                void withMinimumDelay(async () => {
+                  const ok = editMode ? await updateReturn() : await saveReturn();
+                  if (!ok) return;
+                  shouldReset = !editMode;
+                }, 5000)
+                  .finally(() => {
+                    setSaveLoading('');
+                    if (shouldReset) void resetDamageForm();
+                  });
+              }}
+            >
+              {saveLoading === 'new' ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{saveLoading === 'new' ? 'Saving...' : editMode ? 'Save Changes' : 'Save & New'}</span>
+            </button>
+            <button className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100" onClick={()=>{ setItems([{ item: '', description: '', unit: defaultUnit, qty: 1, price: 0, reason: '', restock: true }]); setForm({ name:'', phone:'', notes:'' }); }}>Clear</button>
           </div>
         </div>
       </div>
@@ -4415,32 +5766,45 @@ export default function Placeholder() {
     const [sortKey, setSortKey] = useState('date_desc');
     const [hideHeader, setHideHeader] = useState(false);
     const [periodLabel] = useState('This Month-to-date');
-    React.useEffect(() => {
-      try {
-        const list = JSON.parse(localStorage.getItem('returns') || '[]');
-        const lines = [];
-        (Array.isArray(list) ? list : []).forEach(ret => {
-          (ret.items || []).forEach((it, idx) => {
-            lines.push({
-              id: `${ret.id}-${idx}`,
-              date: (ret.rmaDate || '').slice(0,10),
-              rmaNo: ret.rmaNumber || '',
-              name: ret.name || '',
-              item: it.item || '',
-              qty: Number(it.qty) || 0,
-              unit: it.unit || '',
-              price: Number(it.price) || 0,
-              amount: (Number(it.qty)||0) * (Number(it.price)||0),
-              category: it.category || 'eggs',
-              restock: !!it.restock
-            });
+    const loadRows = React.useCallback(async () => {
+      const list = await damageStocksApi.list().catch(() => []);
+      const lines = [];
+      (Array.isArray(list) ? list : []).forEach((ret) => {
+        (ret.items || []).forEach((it, idx) => {
+          lines.push({
+            id: `${ret.id}-${idx}`,
+            date: String(ret.rmaDate || '').slice(0, 10),
+            rmaNo: ret.rmaNumber || '',
+            name: ret.reportedBy || ret.name || '',
+            item: it.item || '',
+            qty: Number(it.qty) || 0,
+            unit: it.unit || '',
+            price: Number(it.price) || 0,
+            amount: (Number(it.qty) || 0) * (Number(it.price) || 0),
+            restock: true
           });
         });
-        setRows(lines);
-      } catch {
-        setRows([]);
-      }
+      });
+      setRows(lines);
     }, []);
+    React.useEffect(() => {
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          await loadRows();
+        })
+        .catch(() => {});
+      const onEvent = () => {
+        if (!alive) return;
+        void loadRows();
+      };
+      window.addEventListener('dataUpdated', onEvent);
+      return () => {
+        alive = false;
+        window.removeEventListener('dataUpdated', onEvent);
+        void alive;
+      };
+    }, [loadRows]);
     const filtered = useMemo(() => {
       const start = new Date(fromDate);
       const end = new Date(toDate);
@@ -4459,12 +5823,32 @@ export default function Placeholder() {
       });
       return f;
     }, [rows, fromDate, toDate, sortKey]);
+    const exportExcel = () => {
+      const header = ['Date', 'Damage No', 'Reported By', 'Item', 'Qty', 'Unit', 'Price', 'Amount', 'Deducted'];
+      const excelRows = filtered.map((r) => [
+        String(r.date || ''),
+        String(r.rmaNo || ''),
+        String(r.name || ''),
+        String(r.item || ''),
+        String(Number(r.qty || 0)),
+        String(r.unit || ''),
+        String(Number(r.price || 0)),
+        String(Number(r.amount || 0)),
+        r.restock ? 'Yes' : 'No'
+      ]);
+      downloadExcelFile(`damaged_stock_history_${new Date().toISOString().slice(0, 10)}.xls`, {
+        title: 'Damaged Stock History',
+        subtitle: `${String(fromDate || '').slice(0, 10)} - ${String(toDate || '').slice(0, 10)}`,
+        rows: [header, ...excelRows]
+      });
+    };
     return (
       <div className="bg-white border border-gray-200 rounded-xl">
         <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between">
-          <div className="text-gray-900 font-semibold">Returns History</div>
+          <div className="text-gray-900 font-semibold">Damaged Stock History</div>
           <div className="flex items-center gap-2">
-            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>navigate('/placeholder/sales-returns')}>New Return</button>
+            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>navigate('/placeholder/damage-stocks')}>New Record</button>
+            <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={exportExcel}>Excel</button>
           </div>
         </div>
         <div className="p-4">
@@ -4483,8 +5867,8 @@ export default function Placeholder() {
               <select className="px-3 py-2 border rounded-lg text-sm" value={sortKey} onChange={(e)=>setSortKey(e.target.value)}>
                 <option value="date_desc">Default</option>
                 <option value="date_asc">Date Asc</option>
-                <option value="name_asc">Customer A→Z</option>
-                <option value="name_desc">Customer Z→A</option>
+                <option value="name_asc">Name A→Z</option>
+                <option value="name_desc">Name Z→A</option>
               </select>
             </div>
             <button className="px-3 py-2 rounded-lg border border-gray-200 hover:bg-gray-100 text-sm" onClick={()=>setHideHeader(v=>!v)}>{hideHeader ? 'Show Header' : 'Hide Header'}</button>
@@ -4492,7 +5876,7 @@ export default function Placeholder() {
           {!hideHeader && (
             <div className="text-center mt-4">
               <div className="text-xs text-gray-600">Accrual Basis</div>
-              <div className="text-lg font-semibold text-gray-900">Returns Detail</div>
+              <div className="text-lg font-semibold text-gray-900">Damaged Stock Detail</div>
               <div className="text-sm text-gray-700">{formatDisplayDate(fromDate)} - {formatDisplayDate(toDate)}</div>
             </div>
           )}
@@ -4501,29 +5885,31 @@ export default function Placeholder() {
               <thead>
                 <tr className="bg-gray-50">
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Date</th>
-                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">RMA No</th>
-                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Customer</th>
+                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Damage No</th>
+                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Reported By</th>
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Item</th>
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-right border border-gray-200">Qty</th>
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Unit</th>
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-right border border-gray-200">Price</th>
                   <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-right border border-gray-200">Amount</th>
-                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-left border border-gray-200">Category</th>
-                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-center border border-gray-200">Restocked</th>
+                  <th className="px-3 py-2 text-xs font-semibold text-gray-700 text-center border border-gray-200">Deducted</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map(r => (
                   <tr key={r.id}>
                     <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900">{r.date}</td>
-                    <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900">{r.rmaNo}</td>
+                    <td className="px-3 py-2 border border-gray-200 text-sm">
+                      <button type="button" className="text-gray-900 hover:underline" onClick={() => navigate(`/placeholder/damage-stocks?rmaNo=${encodeURIComponent(String(r.rmaNo || '').trim())}`)}>
+                        {r.rmaNo}
+                      </button>
+                    </td>
                     <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900">{r.name}</td>
                     <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900">{r.item}</td>
                     <td className="px-3 py-2 border border-gray-200 text-right text-sm text-gray-900">{Number(r.qty || 0).toLocaleString()}</td>
                     <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900">{r.unit}</td>
                     <td className="px-3 py-2 border border-gray-200 text-right text-sm text-gray-900">{Number(r.price || 0).toLocaleString()}</td>
                     <td className="px-3 py-2 border border-gray-200 text-right text-sm font-semibold text-gray-900">{Number(r.amount || 0).toLocaleString()}</td>
-                    <td className="px-3 py-2 border border-gray-200 text-sm text-gray-900 capitalize">{r.category}</td>
                     <td className="px-3 py-2 border border-gray-200 text-center">
                       <span className={`inline-block px-2 py-1 rounded-full text-xs ${r.restock ? 'bg-green-100 text-green-700 border border-green-200' : 'bg-orange-100 text-orange-700 border border-orange-200'}`}>
                         {r.restock ? 'Yes' : 'No'}
@@ -4533,7 +5919,7 @@ export default function Placeholder() {
                 ))}
                 {filtered.length === 0 && (
                   <tr>
-                    <td className="px-3 py-4 text-center text-sm text-gray-600" colSpan={10}>No returns found</td>
+                    <td className="px-3 py-4 text-center text-sm text-gray-600" colSpan={9}>No records found</td>
                   </tr>
                 )}
               </tbody>
@@ -4594,6 +5980,7 @@ export default function Placeholder() {
         bullets: ['Track delivery status in real-time', 'Inspect goods on arrival', 'Compare actual vs budgeted cost', 'Log supplier performance rating']
       }
     ];
+    void steps;
 
     const barData = {
       labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug'],
@@ -4917,22 +6304,12 @@ export default function Placeholder() {
       <Shell>
         <Card className="relative overflow-hidden p-6 md:p-8">
           <div className="absolute inset-0 bg-gradient-to-br from-green-50 via-white to-white" />
-          <div className="absolute -top-24 -right-28 w-[420px] h-[420px] rounded-full bg-green-200/30 blur-3xl animate-pulse" />
-          <div className="absolute -bottom-24 -left-28 w-[420px] h-[420px] rounded-full bg-emerald-200/30 blur-3xl animate-pulse" />
+          <div className="absolute -top-24 -right-28 w-[420px] h-[420px] rounded-full bg-green-200/30 blur-3xl" />
+          <div className="absolute -bottom-24 -left-28 w-[420px] h-[420px] rounded-full bg-emerald-200/30 blur-3xl" />
 
           <div className="relative">
             <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-[44px] leading-[1.05] font-extrabold tracking-tight text-gray-900">
-                  Purchase <span className="text-green-600">Planning</span>
-                </div>
-              </div>
-              <button
-                type="button"
-                className="shrink-0 px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-semibold hover:bg-green-700 transition-colors"
-              >
-                Planning Guide
-              </button>
+              <div />
             </div>
 
             <div className="mt-2" />
@@ -4940,7 +6317,7 @@ export default function Placeholder() {
         </Card>
 
         <div className="space-y-5">
-          <SectionTitle title="Purchase Planning Process Flowchart" />
+          <div />
           <Card className="p-6">
             <div className="hidden xl:block space-y-5">
               <div className="flex items-center gap-3">
@@ -5141,6 +6518,7 @@ export default function Placeholder() {
       </Shell>
     );
   };
+  void PurchasePlanningGuide;
 
   const ExpensesAnalytics = () => {
     const [fromDate, setFromDate] = useState(() => {
@@ -5184,24 +6562,16 @@ export default function Placeholder() {
     const expenses = useMemo(() => {
       void nonce;
       void refreshKey;
-      try {
-        const list = JSON.parse(localStorage.getItem('expenses') || '[]');
-        return Array.isArray(list) ? list : [];
-      } catch {
-        return [];
-      }
+      const list = localStore.get('expenses', []);
+      return Array.isArray(list) ? list : [];
     }, [nonce, refreshKey]);
 
     const income = useMemo(() => {
       void nonce;
       void refreshKey;
       const readArray = (key) => {
-        try {
-          const list = JSON.parse(localStorage.getItem(key) || '[]');
-          return Array.isArray(list) ? list : [];
-        } catch {
-          return [];
-        }
+        const list = localStore.get(key, []);
+        return Array.isArray(list) ? list : [];
       };
       const toNum = (v) => {
         const n = parseFloat(v);
@@ -5485,18 +6855,26 @@ export default function Placeholder() {
       if (deleteExpenseLoading) return;
       const expenseId = String(deleteExpenseModal.expenseId || '');
       if (!expenseId) return;
+      const startedAt = Date.now();
       setDeleteExpenseLoading(true);
-      window.setTimeout(() => {
+      (async () => {
         try {
-          const list = JSON.parse(localStorage.getItem('expenses') || '[]');
-          const next = (Array.isArray(list) ? list : []).filter((e) => String(e?.id || '') !== expenseId);
-          localStorage.setItem('expenses', JSON.stringify(next));
+          await expensesApi.remove(expenseId);
+          try {
+            appendSystemActivity('expense_delete', 'Expense deleted', `Expense #${expenseId}`, 'Expenses', 'warning', { expenseId });
+          } catch {}
           window.dispatchEvent(new CustomEvent('dataUpdated'));
-        } catch {}
-        setDeleteExpenseLoading(false);
-        setDeleteExpenseModal({ open: false, expenseId: '' });
-        setRefreshKey((k) => k + 1);
-      }, 5000);
+        } catch (error) {
+          alert(String(error?.message || 'Unable to delete expense.'));
+        } finally {
+          const elapsed = Date.now() - startedAt;
+          const remaining = 5000 - elapsed;
+          if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+          setDeleteExpenseLoading(false);
+          setDeleteExpenseModal({ open: false, expenseId: '' });
+          setRefreshKey((k) => k + 1);
+        }
+      })();
     };
 
     return (
@@ -5807,12 +7185,16 @@ export default function Placeholder() {
     const [refreshKey, setRefreshKey] = useState(0);
     const [search, setSearch] = useState('');
     const [categoryFilter, setCategoryFilter] = useState('all');
-    const [stockFilter] = useState('all');
+    const [lowOnly, setLowOnly] = useState(false);
     const [sortKey] = useState('name_asc');
     const [products, setProducts] = useState([]);
+    const [stockMovements, setStockMovements] = useState([]);
     const [locationFilter, setLocationFilter] = useState('all');
     const [modal, setModal] = useState({ open: false, mode: 'create', id: '' });
     const [deleteModal, setDeleteModal] = useState({ open: false, id: '', name: '' });
+    const [stockInModal, setStockInModal] = useState({ open: false, id: '', name: '', category: 'general', unit: 'kg', buying: 0, selling: 0 });
+    const [stockInQty, setStockInQty] = useState('');
+    const [stockInLoading, setStockInLoading] = useState(false);
     const [deleteLoading, setDeleteLoading] = useState(false);
     const [draft, setDraft] = useState({
       name: '',
@@ -5834,21 +7216,61 @@ export default function Placeholder() {
     React.useEffect(() => {
       const handler = () => setRefreshKey((v) => v + 1);
       window.addEventListener('dataUpdated', handler);
-      window.addEventListener('storage', handler);
       return () => {
         window.removeEventListener('dataUpdated', handler);
-        window.removeEventListener('storage', handler);
       };
     }, []);
 
     React.useEffect(() => {
-      void refreshKey;
-      try {
-        const list = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        setProducts(Array.isArray(list) ? list : []);
-      } catch {
-        setProducts([]);
-      }
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const snapshot = await productsApi.loadInventorySnapshot();
+          const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+          const seenNames = new Set();
+          const sanitizedItems = (Array.isArray(items) ? items : []).filter((item) => {
+            const name = String(item?.name || item?.itemName || '').trim();
+            const key = name.toLowerCase();
+            if (!name) return false;
+            if (seenNames.has(key)) return false;
+            seenNames.add(key);
+            return true;
+          });
+          const itemsChanged = sanitizedItems.length !== (Array.isArray(items) ? items.length : 0);
+          if (itemsChanged) {
+            await setStoredJson('inventoryItems', sanitizedItems);
+          }
+          const validNames = new Set(sanitizedItems.map((item) => String(item?.name || item?.itemName || '').trim().toLowerCase()).filter(Boolean));
+          const movements = (Array.isArray(snapshot?.movements) ? snapshot.movements : []).filter((m) => {
+            const name = String(m?.itemName || m?.name || '').trim().toLowerCase();
+            if (!name) return false;
+            return validNames.has(name);
+          }).map((m) => ({
+            id: m?.id ?? `${String(m?.productId || '')}:${String(m?.itemName || m?.name || '')}:${String(m?.date || m?.createdAt || '')}:${Math.random().toString(16).slice(2)}`,
+            movementType: m?.movementType,
+            itemType: m?.itemType,
+            itemName: m?.itemName || m?.name,
+            quantity: m?.quantity,
+            unit: m?.unit,
+            pricePerItem: m?.pricePerItem,
+            supplierName: m?.supplierName || m?.supplier,
+            reason: m?.reason,
+            note: m?.note,
+            date: m?.date,
+            createdAt: m?.createdAt
+          }));
+          if (!alive) return;
+          setProducts(sanitizedItems);
+          setStockMovements(isAdmin ? movements : []);
+        })
+        .catch(() => {
+          if (!alive) return;
+          setProducts([]);
+          setStockMovements([]);
+        });
+      return () => {
+        alive = false;
+      };
     }, [refreshKey]);
 
     const toMoney = (v) => {
@@ -5859,34 +7281,25 @@ export default function Placeholder() {
 
     const stockState = useMemo(() => {
       void refreshKey;
+      const norm = (v) => String(v || '').trim().toLowerCase();
       const qtyByName = new Map();
+      const seenByName = new Set();
       const add = (name, delta) => {
-        const key = String(name || '').trim();
+        const key = norm(name);
         if (!key) return;
         qtyByName.set(key, (qtyByName.get(key) || 0) + delta);
+        seenByName.add(key);
       };
-      const safeParse = (raw) => {
-        try {
-          const list = JSON.parse(raw || '[]');
-          return Array.isArray(list) ? list : [];
-        } catch {
-          return [];
-        }
-      };
-      const keys = Object.keys(localStorage || {});
-      keys.forEach((k) => {
-        if (!/^stock(In|Out)_/.test(k)) return;
-        const isIn = k.startsWith('stockIn_');
-        const list = safeParse(localStorage.getItem(k));
-        list.forEach((r) => {
-          const name = String(r?.itemName || r?.name || '').trim();
-          const qty = parseFloat(String(r?.quantity || 0)) || 0;
-          if (!name || !qty) return;
-          add(name, isIn ? qty : -qty);
-        });
+      (Array.isArray(stockMovements) ? stockMovements : []).forEach((m) => {
+        const name = String(m?.itemName || '').trim();
+        const qty = parseFloat(String(m?.quantity || 0)) || 0;
+        if (!name || !qty) return;
+        if (isInventoryMovementIn(m)) add(name, qty);
+        else if (isInventoryMovementOut(m)) add(name, -qty);
+        else add(name, qty);
       });
-      return { qtyByName };
-    }, [refreshKey]);
+      return { qtyByName, seenByName };
+    }, [refreshKey, stockMovements]);
 
     const categories = useMemo(() => {
       const set = new Set();
@@ -5897,16 +7310,43 @@ export default function Placeholder() {
       return ['all', ...Array.from(set.values()).sort((a, b) => a.localeCompare(b))];
     }, [products]);
 
+    const categoryOptionLabels = useMemo(() => {
+      const byCat = new Map();
+      (products || []).forEach((p) => {
+        const c = String(p?.category || p?.itemType || 'general').trim() || 'general';
+        const name = String(p?.name || '').trim();
+        const cur = byCat.get(c) || { count: 0, names: [] };
+        cur.count += 1;
+        if (name && cur.names.length < 2 && !cur.names.includes(name)) cur.names.push(name);
+        byCat.set(c, cur);
+      });
+      const labelOf = (c) => {
+        if (c === 'all') return 'Category';
+        const meta = byCat.get(c);
+        if (!meta) return c;
+        const suffix = meta.names.length ? ` - ${meta.names.join(', ')}` : '';
+        return `${c} (${meta.count})${suffix}`;
+      };
+      const map = new Map();
+      categories.forEach((c) => map.set(c, labelOf(c)));
+      return map;
+    }, [categories, products]);
+
     const rows = useMemo(() => {
       const q = (search || '').trim().toLowerCase();
       const cat = String(categoryFilter || 'all');
-      const stockF = String(stockFilter || 'all');
       const list = (products || []).map((p) => {
         const name = String(p?.name || '').trim();
-        const qty = stockState.qtyByName.get(name) || 0;
+        const nameKey = String(name || '').trim().toLowerCase();
+        const baseQty = (() => {
+          const n = parseFloat(String(p?.stockQuantity ?? p?.qty ?? p?.quantity ?? 0).replace(/,/g, ''));
+          return Number.isFinite(n) ? n : 0;
+        })();
+        const movementQty = stockState.qtyByName.get(nameKey) || 0;
+        const qty = stockState.seenByName.has(nameKey) ? movementQty : baseQty;
         const buying = toMoney(p?.buyingPrice ?? p?.buyPrice ?? p?.costPrice ?? 0);
         const selling = toMoney(p?.sellingPrice ?? p?.sellPrice ?? p?.price ?? 0);
-        const value = qty > 0 ? qty * (buying || 0) : 0;
+        const value = qty > 0 ? qty * (selling || 0) : 0;
         return {
           ...p,
           _name: name,
@@ -5923,8 +7363,6 @@ export default function Placeholder() {
           if (!hay.includes(q)) return false;
         }
         if (cat !== 'all' && String(p._category) !== cat) return false;
-        if (stockF === 'in' && !(p._qty > 0)) return false;
-        if (stockF === 'out' && !(p._qty <= 0)) return false;
         return true;
       });
       const sorted = list.slice().sort((a, b) => {
@@ -5938,53 +7376,87 @@ export default function Placeholder() {
         }
       });
       return sorted;
-    }, [categoryFilter, products, search, sortKey, stockFilter, stockState.qtyByName]);
+    }, [categoryFilter, products, search, sortKey, stockState.qtyByName, stockState.seenByName]);
+
+    const reorderLevel = useMemo(() => {
+      void refreshKey;
+      const getUser = () => {
+        try {
+          const local = JSON.parse(localStorage.getItem('currentUser') || 'null');
+          if (local) return local;
+        } catch {}
+        return null;
+      };
+      const user = getUser();
+      const role = String(user?.role || '').toLowerCase();
+      const businessId = role && role !== 'admin' ? String(user?.businessId || '') : String(user?.id || '');
+      const key = `systemPreferences:${businessId || 'default'}`;
+      try {
+        const prefs = localStore.get(key, null);
+        const n = parseFloat(String(prefs?.inventory?.defaultReorderLevel ?? '0').replace(/,/g, ''));
+        return Number.isFinite(n) && n > 0 ? n : 10;
+      } catch {
+        return 10;
+      }
+    }, [refreshKey]);
+
+    // eslint-disable-next-line no-unused-vars
+    const displayRows = useMemo(() => {
+      if (!lowOnly) return rows;
+      return rows.filter((r) => Number(r?._qty || 0) <= Number(reorderLevel || 0));
+    }, [lowOnly, reorderLevel, rows]);
 
     const kpis = useMemo(() => {
+      void refreshKey;
       const total = rows.length;
       const inStock = rows.filter((r) => r._qty > 0).length;
-      const outStock = rows.filter((r) => r._qty <= 0).length;
+      const outStock = rows.filter((r) => Number(r._qty || 0) <= Number(reorderLevel || 0)).length;
       const stockValue = rows.reduce((s, r) => s + (r._value || 0), 0);
-      let salesMade = 0;
+      let soldQty = 0;
       try {
-        const list = JSON.parse(localStorage.getItem('sales') || '[]');
-        const salesCount = (Array.isArray(list) ? list : []).length;
-        const orders = JSON.parse(localStorage.getItem('salesOrders') || '[]');
-        const paidOrdersCount = (Array.isArray(orders) ? orders : []).filter((o) => String(o?.status || '').toLowerCase() === 'paid').length;
-        salesMade = salesCount + paidOrdersCount;
+        const norm = (v) => String(v || '').trim().toLowerCase();
+        const known = new Set(rows.map((r) => norm(r?._name || r?.name || '')));
+        let salesOnly = 0;
+        let allOut = 0;
+        (Array.isArray(stockMovements) ? stockMovements : []).forEach((r) => {
+          if (!isInventoryMovementOut(r)) return;
+          const nameKey = norm(r?.itemName || r?.name || '');
+          if (!nameKey || !known.has(nameKey)) return;
+          const qty = parseFloat(String(r?.quantity || 0)) || 0;
+          if (!(qty > 0)) return;
+          allOut += qty;
+          const hay = `${r?.reason || ''} ${r?.description || ''} ${r?.note || ''}`.toLowerCase();
+          if (r?.saleOrderId != null || /sales/.test(hay) || /invoice/.test(hay) || String(r?.rawMovementType || '').includes('SALE_OUT')) salesOnly += qty;
+        });
+        soldQty = salesOnly > 0 ? salesOnly : allOut;
       } catch {
-        salesMade = 0;
+        soldQty = 0;
       }
-      return { total, inStock, outStock, stockValue, salesMade };
-    }, [rows]);
+      return { total, inStock, outStock, stockValue, soldQty };
+    }, [refreshKey, reorderLevel, rows]);
 
     const exportProductsCsv = () => {
-      const header = ['Name', 'Category', 'Unit', 'BuyingPrice', 'SellingPrice', 'Qty'];
+      const header = ['Name', 'Category', 'Unit', 'Buying Price', 'Selling Price', 'Qty Remain', 'Value', 'SKU', 'Barcode', 'Status', 'Updated', 'Created', 'Description'];
       const dataRows = rows.map((p) => [
         String(p?._name || ''),
         String(p?._category || ''),
         String(p?.unit || ''),
         String(p?._buying ?? ''),
         String(p?._selling ?? ''),
-        String(p?._qty ?? '')
+        String(p?._qty ?? ''),
+        String(p?._value ?? ''),
+        String(p?.sku || ''),
+        String(p?.barcode || ''),
+        String(p?.status || ''),
+        String(p?._updatedAt || ''),
+        String(p?.createdAt || ''),
+        String(p?.description || '')
       ]);
-      const csv = [header, ...dataRows]
-        .map((r) =>
-          r
-            .map((v) => {
-              const s = String(v ?? '');
-              return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
-            })
-            .join(',')
-        )
-        .join('\n');
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'products.csv';
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadExcelFile(`products_${new Date().toISOString().slice(0, 10)}.xls`, {
+        title: 'Products Report',
+        subtitle: 'All products',
+        rows: [header, ...dataRows]
+      });
     };
 
     const importProductsFile = async (file) => {
@@ -6069,37 +7541,47 @@ export default function Placeholder() {
           setImporting(false);
           return;
         }
-        const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        const list = Array.isArray(existing) ? existing : [];
-        const byName = new Map(list.map((p) => [String(p?.name || '').trim().toLowerCase(), p]));
-        const now = new Date().toISOString();
-        normalized.forEach((p) => {
-          const key = p.name.toLowerCase();
+        const existingList = await productsApi.list().catch(() => []);
+        const byName = new Map(
+          (Array.isArray(existingList) ? existingList : [])
+            .map((p) => [String(p?.name || p?.itemName || '').trim().toLowerCase(), p])
+            .filter(([key]) => Boolean(key))
+        );
+        let createdCount = 0;
+        let updatedCount = 0;
+        for (const p of normalized) {
+          const key = String(p.name || '').trim().toLowerCase();
+          if (!key) continue;
           const prev = byName.get(key);
-          const next = {
-            ...(prev || {}),
-            id: String(prev?.id || `PROD-${Date.now()}-${Math.random().toString(16).slice(2)}`),
+          const payload = {
             name: p.name,
             category: p.category,
+            productType: p.category,
             unit: p.unit,
             buyingPrice: p.buyingPrice,
+            costPrice: p.buyingPrice,
             sellingPrice: p.sellingPrice,
-            price: p.sellingPrice,
-            sku: p.sku,
-            barcode: p.barcode,
-            imageDataUrl: p.imageDataUrl,
-            status: String(prev?.status || 'active'),
-            updatedAt: now,
-            createdAt: String(prev?.createdAt || now)
+            sku: p.sku || String(prev?.sku || '').trim(),
+            barcode: p.barcode || String(prev?.barcode || '').trim(),
+            imageDataUrl: p.imageDataUrl || String(prev?.imageDataUrl || '').trim(),
+            status: String(prev?.status || 'active')
           };
-          byName.set(key, next);
-        });
-        const nextList = Array.from(byName.values()).sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
-        localStorage.setItem('inventoryItems', JSON.stringify(nextList));
-        try {
-          window.dispatchEvent(new CustomEvent('dataUpdated'));
-        } catch {}
-        setToast(`Imported ${normalized.length.toLocaleString()} products`);
+          if (prev?.id) {
+            const next = await productsApi.patch(String(prev.id), payload);
+            byName.set(key, next || prev);
+            updatedCount += 1;
+            continue;
+          }
+          const created = await productsApi.create({
+            ...payload,
+            stockQuantity: 0
+          });
+          byName.set(key, created);
+          createdCount += 1;
+        }
+        const latestList = await productsApi.list().catch(() => []);
+        setProducts(Array.isArray(latestList) ? latestList : []);
+        setToast(`Imported ${createdCount.toLocaleString()} new • Updated ${updatedCount.toLocaleString()}`);
         window.setTimeout(() => setToast(''), 1800);
       } catch {
         setToast('Import failed');
@@ -6134,7 +7616,7 @@ export default function Placeholder() {
         barcode: String(p?.barcode || ''),
         category: String(p?._category || p?.category || 'general') || 'general',
         unit: String(p?.unit || 'kg') || 'kg',
-        qty: '',
+        qty: String(p?._qty ?? ''),
         buyingPrice: String(p?.buyingPrice ?? p?.buyPrice ?? p?.costPrice ?? ''),
         sellingPrice: String(p?.sellingPrice ?? p?.sellPrice ?? p?.price ?? ''),
         description: String(p?.description || ''),
@@ -6161,98 +7643,60 @@ export default function Placeholder() {
       });
     };
 
-    const saveProduct = () => {
+    const saveProduct = async () => {
       if (saving) return;
-      const name = String(draft.name || '').trim();
-      if (!name) {
+      const nameFromDraft = String(draft.name || '').trim();
+      if (!nameFromDraft) {
         setToast('Product name is required');
         return;
       }
-      const unit = String(draft.unit || '').trim() || 'kg';
-      const qty = (() => {
-        const raw = String(draft.qty || '').trim();
-        if (!raw) return null;
-        const n = parseFloat(raw);
-        return Number.isFinite(n) ? Math.max(0, n) : null;
-      })();
+      const unitFromDraft = String(draft.unit || '').trim() || 'kg';
+      const qty =
+        modal.mode === 'edit'
+          ? null
+          : (() => {
+              const raw = String(draft.qty || '').trim();
+              if (!raw) return null;
+              const n = parseFloat(raw);
+              return Number.isFinite(n) ? Math.max(0, n) : null;
+            })();
       const buying = toMoney(draft.buyingPrice);
       const selling = toMoney(draft.sellingPrice);
       setSaving(true);
-      window.setTimeout(() => {
-        try {
-          const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-          const list = Array.isArray(existing) ? existing : [];
-          const id = modal.mode === 'edit' && modal.id ? modal.id : `PROD-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-          const normalizedName = name.toLowerCase();
-          const idx = list.findIndex((p) => String(p?.id || '') === String(id));
-          const dupeIdx = list.findIndex((p, i) => i !== idx && String(p?.name || '').trim().toLowerCase() === normalizedName);
-          if (dupeIdx >= 0) {
-            setToast('Product already exists');
-            setSaving(false);
-            return;
-          }
-          const originalName = idx >= 0 ? String(list[idx]?.name || '').trim() : '';
-          const originalCategory = idx >= 0 ? String(list[idx]?.category || list[idx]?.itemType || '').trim() : '';
-          const now = new Date().toISOString();
-          const nextRecord = {
-            ...(idx >= 0 ? list[idx] : {}),
-            id,
-            name,
-            sku: String(draft.sku || '').trim(),
-            barcode: String(draft.barcode || '').trim(),
-            category: String(draft.category || 'general').trim() || 'general',
-            unit,
-            buyingPrice: buying,
-            sellingPrice: selling,
-            price: selling,
-            description: String(draft.description || '').trim(),
-            imageDataUrl: String(draft.imageDataUrl || ''),
-            status: String(draft.status || 'active'),
-            updatedAt: now,
-            createdAt: idx >= 0 ? String(list[idx]?.createdAt || now) : now
-          };
-          const next = idx >= 0 ? list.map((p, i) => (i === idx ? nextRecord : p)) : [nextRecord, ...list];
-          localStorage.setItem('inventoryItems', JSON.stringify(next));
-          if (qty !== null) {
-            const targetCategory = String(nextRecord.category || 'general').trim() || 'general';
-            const currentQty = idx >= 0 ? (stockState.qtyByName.get(originalName || name) || 0) : 0;
-            const delta = idx >= 0 ? (qty - currentQty) : qty;
-            const isIn = delta >= 0;
-            const absQty = Math.abs(delta);
-            if (absQty > 0) {
-              const key = `${isIn ? 'stockIn' : 'stockOut'}_${targetCategory || 'general'}`;
-              const existingMoves = JSON.parse(localStorage.getItem(key) || '[]');
-              const movesList = Array.isArray(existingMoves) ? existingMoves : [];
-              movesList.push({
-                id: Date.now() + Math.random(),
-                date: new Date().toISOString().slice(0, 10),
-                quantity: String(absQty),
-                unit,
-                supplier: isIn ? 'Opening Stock' : 'Stock Adjustment',
-                pricePerItem: String(buying || 0),
-                itemType: targetCategory,
-                note: isIn ? 'Opening stock' : 'Stock adjustment',
-                itemName: originalName && originalName !== name ? originalName : name
-              });
-              localStorage.setItem(key, JSON.stringify(movesList));
-            }
-            if (originalCategory && originalCategory !== targetCategory) {
-              void 0;
-            }
-          }
-          try {
-            window.dispatchEvent(new CustomEvent('dataUpdated'));
-          } catch {}
-          setModal({ open: false, mode: 'create', id: '' });
-          setSaving(false);
-          setToast('Saved');
-          window.setTimeout(() => setToast(''), 1500);
-          return;
-        } catch {
-          setSaving(false);
-          setToast('Failed to save');
+      try {
+        const payload = {
+          name: nameFromDraft,
+          sku: String(draft.sku || '').trim(),
+          barcode: String(draft.barcode || '').trim(),
+          category: String(draft.category || 'general').trim() || 'general',
+          productType: String(draft.category || 'general').trim() || 'general',
+          unit: unitFromDraft,
+          buyingPrice: buying,
+          costPrice: buying,
+          sellingPrice: selling,
+          description: String(draft.description || '').trim(),
+          imageDataUrl: String(draft.imageDataUrl || '').trim(),
+          status: String(draft.status || 'active').trim() || 'active'
+        };
+        if (modal.mode === 'edit') {
+          const id = String(modal.id || '').trim();
+          if (!id) throw new Error('Invalid product id');
+          await productsApi.patch(id, payload);
+        } else {
+          await productsApi.create({
+            ...payload,
+            stockQuantity: qty != null && qty > 0 ? qty : 0
+          });
         }
-      }, 300);
+        setModal({ open: false, mode: 'create', id: '' });
+        setToast('Saved');
+        window.setTimeout(() => setToast(''), 1500);
+      } catch (err) {
+        const msg = String(err?.message || '').trim();
+        setToast(msg ? `Failed to save: ${msg}` : 'Failed to save');
+      } finally {
+        setSaving(false);
+      }
     };
 
     const requestDelete = (p) => {
@@ -6260,27 +7704,98 @@ export default function Placeholder() {
       setDeleteModal({ open: true, id: String(p?.id || ''), name: String(p?._name || p?.name || '') });
     };
 
-    const confirmDelete = () => {
+    const openStockIn = (p) => {
+      if (!isAdmin) return;
+      setToast('');
+      setStockInQty('');
+      setStockInModal({
+        open: true,
+        id: String(p?.id || ''),
+        name: String(p?._name || p?.name || ''),
+        category: String(p?._category || p?.category || p?.itemType || 'general') || 'general',
+        unit: String(p?.unit || 'kg') || 'kg',
+        buying: toMoney(p?.buyingPrice ?? p?.buyPrice ?? p?.costPrice ?? 0),
+        selling: toMoney(p?.sellingPrice ?? p?.sellPrice ?? p?.price ?? 0)
+      });
+    };
+
+    const openStockInPicker = () => {
+      if (!isAdmin) return;
+      setToast('');
+      setStockInQty('');
+      setStockInModal({ open: true, id: '', name: '', category: 'general', unit: 'kg', buying: 0, selling: 0 });
+    };
+
+    const confirmStockIn = async () => {
+      if (!isAdmin) return;
+      if (stockInLoading) return;
+      if (!String(stockInModal.id || '').trim() || !String(stockInModal.name || '').trim()) {
+        setToast('Select a product');
+        return;
+      }
+      const qty = (() => {
+        const n = parseFloat(String(stockInQty || '').trim());
+        return Number.isFinite(n) ? Math.max(0, n) : 0;
+      })();
+      if (!qty) {
+        setToast('Enter stock quantity');
+        return;
+      }
+      setStockInLoading(true);
+      try {
+        const invId = String(stockInModal.id || '').trim();
+        if (!invId) throw new Error('Invalid product');
+        await productsApi.stockIn(invId, {
+          quantity: qty,
+          unitCost: Number(stockInModal.buying || 0),
+          notes: 'Stock in'
+        });
+        setStockInModal({ open: false, id: '', name: '', category: 'general', unit: 'kg', buying: 0, selling: 0 });
+        setStockInQty('');
+        setToast('Stock added');
+        window.setTimeout(() => setToast(''), 1400);
+      } catch (err) {
+        const msg = String(err?.message || '').trim();
+        setToast(msg || 'Failed to add stock');
+      } finally {
+        setStockInLoading(false);
+      }
+    };
+
+    const confirmDelete = async () => {
       if (deleteLoading) return;
+      const startedAt = Date.now();
       setDeleteLoading(true);
-      setTimeout(() => {
-        try {
-          const existing = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-          const list = Array.isArray(existing) ? existing : [];
-          const byId = list.filter((x) => String(x?.id || '') !== String(deleteModal.id));
-          const byName = byId.filter((x) => String(x?.name || '').trim().toLowerCase() !== String(deleteModal.name || '').trim().toLowerCase());
-          const next = byName;
-          localStorage.setItem('inventoryItems', JSON.stringify(next));
-          setProducts(next);
-          try {
-            window.dispatchEvent(new CustomEvent('dataUpdated'));
-          } catch {}
-        } catch {}
-        setDeleteLoading(false);
-        setDeleteModal({ open: false, id: '', name: '' });
+      try {
+        const id = String(deleteModal.id || '').trim();
+        const targetName = String(deleteModal.name || '').trim().toLowerCase();
+        if (!id && !targetName) throw new Error('Invalid product');
+        const existing = await getStoredJson('inventoryItems', []);
+        const list = Array.isArray(existing) ? existing.slice() : [];
+        const idx = list.findIndex((p) => {
+          const rowId = String(p?.id || '').trim();
+          const rowName = String(p?.name || p?.itemName || '').trim().toLowerCase();
+          if (id && rowId === id) return true;
+          if (targetName && rowName === targetName) return true;
+          return false;
+        });
+        if (idx < 0) throw new Error('Invalid product');
+        const removed = list[idx];
+        const removedId = String(removed?.id || '').trim();
+        const removedName = String(removed?.name || removed?.itemName || '').trim().toLowerCase();
+        await productsApi.remove(removedId || id);
         setToast('Deleted');
         window.setTimeout(() => setToast(''), 1200);
-      }, 500);
+      } catch (err) {
+        const msg = String(err?.message || '').trim();
+        setToast(msg || 'Failed to delete');
+      } finally {
+        const elapsed = Date.now() - startedAt;
+        const remaining = 5000 - elapsed;
+        if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+        setDeleteLoading(false);
+        setDeleteModal({ open: false, id: '', name: '' });
+      }
     };
 
     return (
@@ -6294,6 +7809,110 @@ export default function Placeholder() {
           onCancel={() => (deleteLoading ? null : setDeleteModal({ open: false, id: '', name: '' }))}
           onConfirm={confirmDelete}
         />
+        {stockInModal.open ? (
+          <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+            <div className="w-full max-w-lg bg-white rounded-2xl border border-gray-200 shadow-xl overflow-hidden">
+              <div className="p-5 border-b border-gray-200 flex items-center justify-between">
+                <div className="text-base font-semibold text-gray-900">Stock In</div>
+                <button
+                  type="button"
+                  className="w-9 h-9 rounded-lg border border-gray-200 hover:bg-gray-50"
+                  onClick={() => (stockInLoading ? null : setStockInModal({ open: false, id: '', name: '', category: 'general', unit: 'kg', buying: 0, selling: 0 }))}
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div className="text-sm text-gray-700">
+                  <span className="font-semibold text-gray-900">{stockInModal.name || 'Product'}</span>
+                  <span className="text-gray-500"> • {stockInModal.category || 'general'}</span>
+                </div>
+                {!String(stockInModal.id || '').trim() ? (
+                  <div>
+                    <div className="text-xs font-semibold text-gray-700">Select product</div>
+                    <select
+                      value={stockInModal.id}
+                      onChange={(e) => {
+                        const id = String(e.target.value || '').trim();
+                        if (!id) {
+                          setStockInModal((p) => ({ ...p, id: '', name: '', category: 'general', unit: 'kg', buying: 0 }));
+                          return;
+                        }
+                        const found = (rows || []).find((x) => String(x?.id || '') === id) || null;
+                        if (!found) return;
+                        setStockInModal({
+                          open: true,
+                          id: String(found?.id || ''),
+                          name: String(found?._name || found?.name || ''),
+                          category: String(found?._category || found?.category || found?.itemType || 'general') || 'general',
+                          unit: String(found?.unit || 'kg') || 'kg',
+                          buying: toMoney(found?.buyingPrice ?? found?.buyPrice ?? found?.costPrice ?? 0),
+                          selling: toMoney(found?.sellingPrice ?? found?.sellPrice ?? found?.price ?? 0)
+                        });
+                      }}
+                      className="mt-2 w-full px-4 py-3 rounded-xl border border-gray-200 bg-white outline-none focus:ring-2 focus:ring-green-500"
+                    >
+                      <option value="">Choose product…</option>
+                      {(rows || []).map((p) => (
+                        <option key={String(p?.id || '')} value={String(p?.id || '')}>
+                          {String(p?._name || p?.name || '')}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+                <div>
+                  <div className="text-xs font-semibold text-gray-700">Quantity to add</div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      value={stockInQty}
+                      onChange={(e) => setStockInQty(e.target.value)}
+                      className="flex-1 px-4 py-3 rounded-xl border border-gray-200 bg-white outline-none focus:ring-2 focus:ring-green-500"
+                      placeholder="e.g. 10"
+                      inputMode="decimal"
+                    />
+                    <div className="px-3 py-3 rounded-xl bg-gray-50 border border-gray-200 text-sm text-gray-700">{stockInModal.unit || 'kg'}</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+                    <div className="text-[11px] font-semibold text-gray-600">SELLING PRICE</div>
+                    <div className="mt-1 text-sm font-semibold text-gray-900">{Number(stockInModal.selling || 0) ? `TSH ${money(stockInModal.selling)}` : '—'}</div>
+                  </div>
+                  <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+                    <div className="text-[11px] font-semibold text-gray-600">STOCK IN VALUE</div>
+                    <div className="mt-1 text-sm font-semibold text-gray-900">
+                      {(() => {
+                        const q = parseFloat(String(stockInQty || '').trim()) || 0;
+                        const sp = Number(stockInModal.selling || 0) || 0;
+                        const total = q > 0 && sp > 0 ? q * sp : 0;
+                        return total ? `TSH ${money(total)}` : '—';
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="p-5 border-t border-gray-200 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  className="px-5 py-2.5 rounded-2xl bg-white border border-gray-200 text-gray-800 hover:bg-gray-50 font-semibold"
+                  onClick={() => (stockInLoading ? null : setStockInModal({ open: false, id: '', name: '', category: 'general', unit: 'kg', buying: 0, selling: 0 }))}
+                  disabled={stockInLoading}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className={stockInLoading ? 'px-5 py-2.5 rounded-2xl bg-green-600/70 text-white font-semibold cursor-not-allowed' : 'px-5 py-2.5 rounded-2xl bg-green-600 text-white hover:bg-green-700 font-semibold'}
+                  onClick={confirmStockIn}
+                  disabled={stockInLoading}
+                >
+                  {stockInLoading ? 'Adding...' : 'Add Stock'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className="bg-gray-50 border border-gray-200 rounded-2xl p-6">
           <div className="flex items-start justify-between gap-4">
             <div>
@@ -6324,10 +7943,18 @@ export default function Placeholder() {
               <div className="inline-flex items-center gap-2 px-3 py-2 rounded-full border border-gray-200 bg-white text-sm">
                 <select value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)} className="bg-transparent outline-none">
                   {categories.map((c) => (
-                    <option key={c} value={c}>{c === 'all' ? 'Category' : c}</option>
+                    <option key={c} value={c}>{categoryOptionLabels.get(c) || (c === 'all' ? 'Category' : c)}</option>
                   ))}
                 </select>
               </div>
+              <button
+                type="button"
+                className={lowOnly ? 'inline-flex items-center gap-2 px-3 py-2 rounded-full border border-green-200 bg-green-50 text-sm font-semibold text-green-800' : 'inline-flex items-center gap-2 px-3 py-2 rounded-full border border-gray-200 bg-white text-sm hover:bg-gray-50'}
+                onClick={() => setLowOnly((v) => !v)}
+                title="Toggle low stock filter"
+              >
+                Low stock <span className={lowOnly ? 'text-green-800' : 'text-gray-600'}>({kpis.outStock.toLocaleString()})</span>
+              </button>
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -6339,21 +7966,33 @@ export default function Placeholder() {
                 <Download className="w-4 h-4 text-gray-700" />
                 Export
               </button>
-              <label className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm hover:bg-gray-50 inline-flex items-center gap-2 cursor-pointer">
-                <Upload className="w-4 h-4 text-gray-700" />
-                {importing ? 'Importing...' : 'Bulk import'}
-                <input
-                  type="file"
-                  accept=".csv,.json"
-                  className="hidden"
-                  disabled={importing}
-                  onChange={(e) => {
-                    const file = e.target.files && e.target.files[0];
-                    e.target.value = '';
-                    void importProductsFile(file);
-                  }}
-                />
-              </label>
+              {isAdmin ? (
+                <label className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm hover:bg-gray-50 inline-flex items-center gap-2 cursor-pointer">
+                  <Upload className="w-4 h-4 text-gray-700" />
+                  {importing ? 'Importing...' : 'Bulk import'}
+                  <input
+                    type="file"
+                    accept=".csv,.json"
+                    className="hidden"
+                    disabled={importing}
+                    onChange={(e) => {
+                      const file = e.target.files && e.target.files[0];
+                      e.target.value = '';
+                      void importProductsFile(file);
+                    }}
+                  />
+                </label>
+              ) : null}
+              {isAdmin ? (
+                <button
+                  type="button"
+                  onClick={openStockInPicker}
+                  className="px-4 py-2 rounded-xl border border-green-200 bg-green-50 text-green-800 text-sm font-semibold hover:bg-green-100 inline-flex items-center gap-2"
+                >
+                  <Plus className="w-4 h-4" />
+                  Stock In
+                </button>
+              ) : null}
               {isAdmin ? (
                 <button
                   type="button"
@@ -6377,16 +8016,16 @@ export default function Placeholder() {
                   <PackageCheck className="w-4 h-4 text-blue-600" />
                 </div>
               </div>
-              <div className="mt-2 text-3xl font-extrabold text-gray-900">{kpis.total.toLocaleString()}</div>
+              <div className="mt-2 text-3xl font-semibold text-gray-900">{kpis.total.toLocaleString()}</div>
             </div>
             <div className="bg-white border border-gray-200 rounded-2xl p-5">
               <div className="flex items-center justify-between">
-                <div className="text-sm text-gray-600">Selling goods</div>
+                <div className="text-sm text-gray-600">Goods sold</div>
                 <div className="w-9 h-9 rounded-full bg-green-50 border border-green-100 flex items-center justify-center">
                   <BadgeCheck className="w-4 h-4 text-green-600" />
                 </div>
               </div>
-              <div className="mt-2 text-3xl font-extrabold text-gray-900">{kpis.salesMade.toLocaleString()}</div>
+              <div className="mt-2 text-3xl font-semibold text-gray-900">{Number(kpis.soldQty || 0).toLocaleString()}</div>
             </div>
             <div className="bg-white border border-gray-200 rounded-2xl p-5">
               <div className="flex items-center justify-between">
@@ -6395,7 +8034,7 @@ export default function Placeholder() {
                   <HelpCircle className="w-4 h-4 text-amber-600" />
                 </div>
               </div>
-              <div className="mt-2 text-3xl font-extrabold text-gray-900">{kpis.outStock.toLocaleString()}</div>
+              <div className="mt-2 text-3xl font-semibold text-gray-900">{kpis.outStock.toLocaleString()}</div>
             </div>
             <div className="bg-white border border-gray-200 rounded-2xl p-5">
               <div className="flex items-center justify-between">
@@ -6404,7 +8043,7 @@ export default function Placeholder() {
                   <HandCoins className="w-4 h-4 text-emerald-700" />
                 </div>
               </div>
-              <div className="mt-2 text-3xl font-extrabold text-gray-900">TZS {money(kpis.stockValue)}</div>
+              <div className="mt-2 text-3xl font-semibold text-gray-900">TZS {money(kpis.stockValue)}</div>
             </div>
           </div>
 
@@ -6416,7 +8055,7 @@ export default function Placeholder() {
                     <th className="px-5 py-3">Product</th>
                     <th className="px-5 py-3 text-right">Buying</th>
                     <th className="px-5 py-3 text-right">Selling</th>
-                    <th className="px-5 py-3 text-right">Qty</th>
+                    <th className="px-5 py-3 text-right">Qty remain</th>
                     <th className="px-5 py-3">Unit</th>
                     <th className="px-5 py-3 text-right">Value</th>
                     <th className="px-5 py-3">Updated</th>
@@ -6424,14 +8063,14 @@ export default function Placeholder() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((p) => (
+                  {displayRows.map((p) => (
                     <tr key={String(p.id)} className="border-b border-gray-100">
                       <td className="px-5 py-4">
                         <div className="flex items-center gap-3">
                           {p.imageDataUrl ? (
                             <img alt="" src={p.imageDataUrl} className="w-10 h-10 rounded-full object-cover border border-gray-200" />
                           ) : (
-                            <div className="w-10 h-10 rounded-full bg-blue-50 border border-blue-100 flex items-center justify-center text-sm font-extrabold text-blue-700">
+                            <div className="w-10 h-10 rounded-full bg-blue-50 border border-blue-100 flex items-center justify-center text-sm font-semibold text-blue-700">
                               {(p._name || 'P').slice(0, 1).toUpperCase()}
                             </div>
                           )}
@@ -6449,10 +8088,21 @@ export default function Placeholder() {
                       <td className="px-5 py-4 text-sm text-gray-700">{p._updatedAt ? formatDisplayDate(p._updatedAt) : '—'}</td>
                       <td className="px-5 py-4 text-right">
                         <div className="inline-flex items-center gap-2">
+                          {isAdmin && Number(p._qty || 0) <= Number(reorderLevel || 0) ? (
+                            <button
+                              type="button"
+                              className="w-9 h-9 inline-flex items-center justify-center rounded-lg border border-green-200 bg-green-50 hover:bg-green-100"
+                              onClick={() => openStockIn(p)}
+                              title="Stock In"
+                            >
+                              <Plus className="w-4 h-4 text-green-700" />
+                            </button>
+                          ) : null}
                           <button
                             type="button"
-                            className="w-9 h-9 inline-flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50"
+                            className={p?.isStoreOnly ? 'w-9 h-9 inline-flex items-center justify-center rounded-lg border border-gray-200 bg-gray-50 cursor-not-allowed' : 'w-9 h-9 inline-flex items-center justify-center rounded-lg border border-gray-200 hover:bg-gray-50'}
                             onClick={() => {
+                              if (p?.isStoreOnly) return;
                               try {
                                 localStorage.setItem(
                                   'selectedProductForSale',
@@ -6466,9 +8116,10 @@ export default function Placeholder() {
                               } catch {}
                               navigate('/placeholder/sales-order');
                             }}
-                            title="Sell"
+                            title={p?.isStoreOnly ? 'Not for sale' : 'Sell'}
+                            disabled={Boolean(p?.isStoreOnly)}
                           >
-                            <ArrowRight className="w-4 h-4 text-gray-700" />
+                            <ArrowRight className={p?.isStoreOnly ? 'w-4 h-4 text-gray-400' : 'w-4 h-4 text-gray-700'} />
                           </button>
                           <button
                             type="button"
@@ -6479,26 +8130,22 @@ export default function Placeholder() {
                           >
                             <Pencil className="w-4 h-4 text-gray-700" />
                           </button>
-                          {canDelete ? (
+                          {isAdmin && canDelete ? (
                             <button
                               type="button"
-                              className={deleteLoading && String(deleteModal.id) === String(p.id) ? 'w-9 h-9 inline-flex items-center justify-center rounded-lg border border-red-200 bg-red-50 cursor-not-allowed' : 'w-9 h-9 inline-flex items-center justify-center rounded-lg border border-gray-200 hover:bg-red-50'}
+                              data-delete-trigger="true"
+                              className="w-9 h-9 inline-flex items-center justify-center rounded-lg border border-gray-200 hover:bg-red-50"
                               onClick={() => requestDelete(p)}
                               title="Delete"
-                              disabled={deleteLoading && String(deleteModal.id) === String(p.id)}
                             >
-                              {deleteLoading && String(deleteModal.id) === String(p.id) ? (
-                                <span className="w-4 h-4 rounded-full border-2 border-red-600/60 border-t-red-600 animate-spin" />
-                              ) : (
-                                <Trash2 className="w-4 h-4 text-red-700" />
-                              )}
+                              <Trash2 className="w-4 h-4 text-red-700" />
                             </button>
                           ) : null}
                         </div>
                       </td>
                     </tr>
                   ))}
-                  {rows.length === 0 ? (
+                  {displayRows.length === 0 ? (
                     <tr>
                       <td className="px-5 py-12 text-center text-sm text-gray-600" colSpan={8}>
                         No products found.
@@ -6512,25 +8159,38 @@ export default function Placeholder() {
         </div>
 
         {modal.open ? (
-          <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
             <button type="button" className="absolute inset-0 bg-transparent" onClick={closeModal} />
-            <div className="relative w-[94vw] max-w-[980px] rounded-2xl border border-gray-200 overflow-hidden max-h-[92vh] overflow-y-auto bg-gray-50">
+            <div className="relative w-[94vw] max-w-[980px] rounded-2xl border border-gray-200 overflow-hidden max-h-[92vh] overflow-y-auto bg-white">
               <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-green-500 via-emerald-400 to-green-500" />
-              <div className="absolute -inset-1 rounded-[18px] bg-gradient-to-br from-green-200/60 via-white to-emerald-200/60 -z-10" />
               <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between bg-white">
                 <div className="text-sm text-gray-900">{modal.mode === 'edit' ? 'Edit Product' : 'New Product'}</div>
                 <button type="button" className="px-3 py-2 rounded-lg border border-gray-200 text-sm hover:bg-gray-50" onClick={closeModal}>Close</button>
               </div>
-              <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div className="space-y-4 bg-white border border-gray-200 rounded-2xl p-5 focus-within:ring-2 focus-within:ring-green-200">
+                <div className="p-6 bg-gray-50 grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="space-y-4 bg-white border border-gray-200 rounded-2xl p-5">
                   <div>
-                    <div className="text-xs text-gray-600">Product name</div>
-                    <input value={draft.name} onChange={(e) => setDraft((p) => ({ ...p, name: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="Product name" />
+                    <div className="text-xs text-gray-600">Product name *</div>
+                    <input value={draft.name} onChange={(e) => setDraft((p) => ({ ...p, name: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" placeholder="Product name" disabled={modal.mode === 'edit'} />
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <div>
                       <div className="text-xs text-gray-600">Category</div>
-                      <input value={draft.category} onChange={(e) => setDraft((p) => ({ ...p, category: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="eggs / feeds / general" />
+                      <select
+                        value={draft.category}
+                        onChange={(e) => setDraft((p) => ({ ...p, category: e.target.value }))}
+                        className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500"
+                      >
+                        {(() => {
+                          const opts = (categories || []).filter((c) => c !== 'all');
+                          const list = opts.length ? opts : ['general'];
+                          return list.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ));
+                        })()}
+                      </select>
                     </div>
                     <div>
                       <div className="text-xs text-gray-600">Unit</div>
@@ -6544,30 +8204,29 @@ export default function Placeholder() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <div>
                       <div className="text-xs text-gray-600">Buying price</div>
-                      <input value={draft.buyingPrice} onChange={(e) => setDraft((p) => ({ ...p, buyingPrice: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="0" />
+                      <input type="number" inputMode="decimal" value={draft.buyingPrice} onChange={(e) => setDraft((p) => ({ ...p, buyingPrice: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm text-right outline-none focus:ring-2 focus:ring-green-500" placeholder="0" />
                     </div>
                     <div>
                       <div className="text-xs text-gray-600">Selling price</div>
-                      <input value={draft.sellingPrice} onChange={(e) => setDraft((p) => ({ ...p, sellingPrice: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="0" />
+                      <input type="number" inputMode="decimal" value={draft.sellingPrice} onChange={(e) => setDraft((p) => ({ ...p, sellingPrice: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm text-right outline-none focus:ring-2 focus:ring-green-500" placeholder="0" />
+                      <div className="mt-1 text-xs text-gray-500">
+                        Profit/unit: TZS {money(toMoney(draft.sellingPrice) - toMoney(draft.buyingPrice))}
+                      </div>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div>
-                      <div className="text-xs text-gray-600">Qty</div>
-                      <input value={draft.qty} onChange={(e) => setDraft((p) => ({ ...p, qty: e.target.value.replace(/[^0-9.]/g, '') }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="0" />
-                    </div>
-                    <div className="flex items-end">
-                      <div className="text-xs text-gray-500">Creates an opening stock adjustment</div>
-                    </div>
+                  <div>
+                    <div className="text-xs text-gray-600">Qty</div>
+                    <input type="number" inputMode="decimal" value={draft.qty} onChange={(e) => setDraft((p) => ({ ...p, qty: e.target.value.replace(/[^0-9.]/g, '') }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm text-right outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" placeholder="0" disabled={modal.mode === 'edit'} />
+                    <div className="mt-1 text-xs text-gray-500">{modal.mode === 'edit' ? 'Use Stock In to change quantity' : 'Sets opening stock'}</div>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <div>
                       <div className="text-xs text-gray-600">SKU</div>
-                      <input value={draft.sku} onChange={(e) => setDraft((p) => ({ ...p, sku: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="SKU" />
+                      <input value={draft.sku} onChange={(e) => setDraft((p) => ({ ...p, sku: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" placeholder="SKU" disabled={modal.mode === 'edit'} />
                     </div>
                     <div>
                       <div className="text-xs text-gray-600">Barcode</div>
-                      <input value={draft.barcode} onChange={(e) => setDraft((p) => ({ ...p, barcode: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" placeholder="Barcode" />
+                      <input value={draft.barcode} onChange={(e) => setDraft((p) => ({ ...p, barcode: e.target.value }))} className="mt-1 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" placeholder="Barcode" disabled={modal.mode === 'edit'} />
                     </div>
                   </div>
                   <div>
@@ -6577,11 +8236,17 @@ export default function Placeholder() {
                   <div className="flex items-center justify-end gap-2">
                     <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 text-sm hover:bg-gray-50" onClick={closeModal} disabled={saving}>Cancel</button>
                     <button type="button" className={saving ? 'px-4 py-2 rounded-xl bg-green-600/70 text-white text-sm cursor-not-allowed' : 'px-4 py-2 rounded-xl bg-green-600 text-white hover:bg-green-700 text-sm'} onClick={saveProduct} disabled={saving}>
-                      {saving ? 'Saving...' : 'Save'}
+                      {saving ? (
+                        <span className="inline-flex items-center gap-2">
+                          <span>Saving...</span>
+                        </span>
+                      ) : (
+                        'Save'
+                      )}
                     </button>
                   </div>
                 </div>
-                <div className="space-y-4 bg-white border border-gray-200 rounded-2xl p-5 focus-within:ring-2 focus-within:ring-green-200">
+                <div className="space-y-4 bg-white border border-gray-200 rounded-2xl p-5">
                   <div className="rounded-2xl border border-gray-200 bg-gray-50 p-5">
                     <div className="text-xs text-gray-600">Product image</div>
                     <div className="mt-3 flex items-center gap-4">
@@ -6597,6 +8262,7 @@ export default function Placeholder() {
                           type="file"
                           accept="image/*"
                           className="block w-full text-sm text-gray-700"
+                          disabled={modal.mode === 'edit'}
                           onChange={(e) => {
                             const file = e.target.files && e.target.files[0];
                             if (!file) return;
@@ -6609,7 +8275,7 @@ export default function Placeholder() {
                           }}
                         />
                         {draft.imageDataUrl ? (
-                          <button type="button" className="mt-2 px-3 py-2 rounded-xl border border-gray-200 text-sm hover:bg-gray-100" onClick={() => setDraft((p) => ({ ...p, imageDataUrl: '' }))}>
+                          <button type="button" className="mt-2 px-3 py-2 rounded-xl border border-gray-200 text-sm hover:bg-gray-100 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" onClick={() => setDraft((p) => ({ ...p, imageDataUrl: '' }))} disabled={modal.mode === 'edit'}>
                             Remove image
                           </button>
                         ) : null}
@@ -6618,7 +8284,7 @@ export default function Placeholder() {
                   </div>
                   <div className="rounded-2xl border border-gray-200 bg-white p-5">
                     <div className="text-xs text-gray-600">Status</div>
-                    <select value={draft.status} onChange={(e) => setDraft((p) => ({ ...p, status: e.target.value }))} className="mt-2 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    <select value={draft.status} onChange={(e) => setDraft((p) => ({ ...p, status: e.target.value }))} className="mt-2 w-full px-4 py-3 rounded-xl border border-gray-300 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-50 disabled:text-gray-500 disabled:cursor-not-allowed" disabled={modal.mode === 'edit'}>
                       <option value="active">Active</option>
                       <option value="inactive">Inactive</option>
                     </select>
@@ -6634,37 +8300,82 @@ export default function Placeholder() {
 
   const Store = () => {
     const [refreshKey, setRefreshKey] = useState(0);
-    const [storeTab, setStoreTab] = useState('value');
+    const [storeTab, setStoreTab] = useState('movement');
     const [fromDate, setFromDate] = useState(() => {
       const d = new Date();
       return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0, 10);
     });
     const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
-    const [moveType, setMoveType] = useState('IN');
+    const [moveType] = useState('all');
+    const [movementProductKey, setMovementProductKey] = useState('all');
     const [q, setQ] = useState('');
     const [valueQ, setValueQ] = useState('');
     const [deleteOpen, setDeleteOpen] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState(null);
     const [deleteLoading, setDeleteLoading] = useState(false);
     const [assetDraft, setAssetDraft] = useState({ name: '', value: '', years: '' });
-    const [assets, setAssets] = useState(() => {
-      try {
-        const raw = JSON.parse(localStorage.getItem('fixedAssets') || '[]');
-        return Array.isArray(raw) ? raw : [];
-      } catch {
-        return [];
-      }
-    });
+    const [assets, setAssets] = useState([]);
+    const [inventoryItems, setInventoryItems] = useState([]);
+    const [stockMovements, setStockMovements] = useState([]);
 
     React.useEffect(() => {
       const handler = () => setRefreshKey((v) => v + 1);
       window.addEventListener('dataUpdated', handler);
-      window.addEventListener('storage', handler);
       return () => {
         window.removeEventListener('dataUpdated', handler);
-        window.removeEventListener('storage', handler);
       };
     }, []);
+
+    React.useEffect(() => {
+      let alive = true;
+      Promise.resolve()
+        .then(async () => {
+          const [fixedAssets, snapshot] = await Promise.all([getStoredJson('fixedAssets', []), productsApi.loadInventorySnapshot()]);
+          const items = snapshot?.items;
+          const seenNames = new Set();
+          const sanitizedItems = (Array.isArray(items) ? items : []).filter((item) => {
+            const name = String(item?.name || item?.itemName || '').trim();
+            const key = name.toLowerCase();
+            if (!name) return false;
+            if (seenNames.has(key)) return false;
+            seenNames.add(key);
+            return true;
+          });
+          if (sanitizedItems.length !== (Array.isArray(items) ? items.length : 0)) {
+            await setStoredJson('inventoryItems', sanitizedItems);
+          }
+          const validNames = new Set(sanitizedItems.map((item) => String(item?.name || item?.itemName || '').trim().toLowerCase()).filter(Boolean));
+          const movements = (Array.isArray(snapshot?.movements) ? snapshot.movements : []).filter((m) => {
+            const name = String(m?.itemName || m?.name || '').trim().toLowerCase();
+            if (!name) return false;
+            return validNames.has(name);
+          }).map((m) => ({
+            id: m?.id ?? `${String(m?.productId || '')}:${String(m?.itemName || m?.name || '')}:${String(m?.date || m?.createdAt || '')}:${Math.random().toString(16).slice(2)}`,
+            movementType: m?.movementType,
+            itemType: m?.itemType,
+            itemName: m?.itemName || m?.name,
+            quantity: m?.quantity,
+            unit: m?.unit,
+            pricePerItem: m?.pricePerItem,
+            supplierName: m?.supplierName || m?.supplier,
+            reason: m?.reason,
+            note: m?.note,
+            date: m?.date,
+            createdAt: m?.createdAt,
+            referenceId: m?.referenceId,
+            sourceKey: String(m?.referenceType || ''),
+            sourceIndex: -1
+          }));
+          if (!alive) return;
+          setAssets(Array.isArray(fixedAssets) ? fixedAssets : []);
+          setInventoryItems(sanitizedItems);
+          setStockMovements(movements);
+        })
+        .catch(() => {});
+      return () => {
+        alive = false;
+      };
+    }, [refreshKey]);
 
     const toMoney = (v) => {
       const n = typeof v === 'number' ? v : parseFloat(String(v || '').replace(/,/g, ''));
@@ -6675,9 +8386,7 @@ export default function Placeholder() {
     const saveAssets = (next) => {
       const list = Array.isArray(next) ? next : [];
       setAssets(list);
-      try {
-        localStorage.setItem('fixedAssets', JSON.stringify(list));
-      } catch {}
+      void setStoredJson('fixedAssets', list).catch(() => {});
     };
 
     const addAsset = () => {
@@ -6703,69 +8412,100 @@ export default function Placeholder() {
       saveAssets((Array.isArray(assets) ? assets : []).filter((a) => String(a?.id || '') !== String(id || '')));
     };
 
+    const calcAssetDep = React.useCallback((a) => {
+      const toMoneyLocal = (v) => {
+        const n = typeof v === 'number' ? v : parseFloat(String(v || '').replace(/,/g, ''));
+        return Number.isFinite(n) ? n : 0;
+      };
+      const value = toMoneyLocal(a?.value);
+      const years = parseFloat(String(a?.years || '').replace(/,/g, ''));
+      const createdAtTs = Date.parse(String(a?.createdAt || ''));
+      const ageYears = Number.isFinite(createdAtTs) ? Math.max(0, (Date.now() - createdAtTs) / (365.25 * 24 * 60 * 60 * 1000)) : 0;
+      const annual = value > 0 && Number.isFinite(years) && years > 0 ? value / years : 0;
+      const depToDate = annual > 0 ? Math.min(value, annual * ageYears) : 0;
+      const current = Math.max(0, value - depToDate);
+      const remainingYears = Number.isFinite(years) && years > 0 ? Math.max(0, years - ageYears) : 0;
+      return { value, years, ageYears, annual, depToDate, current, remainingYears };
+    }, []);
+
     const assetsSummary = useMemo(() => {
       const list = Array.isArray(assets) ? assets : [];
-      const totalValue = list.reduce((s, a) => s + toMoney(a?.value), 0);
-      const totalAnnualDep = list.reduce((s, a) => {
-        const v = toMoney(a?.value);
-        const y = parseFloat(String(a?.years || '').replace(/,/g, ''));
-        if (!(v > 0) || !(Number.isFinite(y) && y > 0)) return s;
-        return s + v / y;
-      }, 0);
-      return { totalValue, totalAnnualDep, count: list.length };
-    }, [assets]);
+      const totals = list.reduce(
+        (acc, a) => {
+          const d = calcAssetDep(a);
+          acc.totalOriginal += d.value;
+          acc.totalCurrent += d.current;
+          acc.totalDepToDate += d.depToDate;
+          acc.totalAnnualDep += d.annual;
+          return acc;
+        },
+        { totalOriginal: 0, totalCurrent: 0, totalDepToDate: 0, totalAnnualDep: 0 }
+      );
+      return { ...totals, count: list.length };
+    }, [assets, calcAssetDep]);
 
     const moveRows = useMemo(() => {
       void refreshKey;
       const out = [];
-      const safeParse = (raw) => {
-        try {
-          const list = JSON.parse(raw || '[]');
-          return Array.isArray(list) ? list : [];
-        } catch {
-          return [];
-        }
-      };
-      const keys = Object.keys(localStorage || {});
-      keys.forEach((k) => {
-        if (!/^stock(In|Out)_/.test(k)) return;
-        const isIn = k.startsWith('stockIn_');
-        const list = safeParse(localStorage.getItem(k));
-        list.forEach((r, sourceIndex) => {
-          const name = String(r?.itemName || r?.name || '').trim();
-          const qty = parseFloat(String(r?.quantity || 0)) || 0;
-          out.push({
-            id: String(r?.id || `${k}_${Math.random()}`),
-            date: String(r?.date || r?.createdAt || '').slice(0, 10),
-            dateTime: String(r?.createdAt || r?.timestamp || r?.dateTime || r?.date || ''),
-            type: isIn ? 'IN' : 'OUT',
-            itemType: String(r?.itemType || k.replace(/^stock(In|Out)_/, '') || ''),
-            name,
-            quantity: qty,
-            unit: String(r?.unit || ''),
-            unitCost: toMoney(r?.unitCost ?? r?.cost ?? r?.purchasePrice ?? (isIn ? (r?.pricePerItem ?? r?.price) : 0) ?? 0),
-            sellingPrice: toMoney(r?.sellingPrice ?? r?.sellPrice ?? (!isIn ? (r?.pricePerItem ?? r?.price) : 0) ?? 0),
-            reference: String(r?.reference || r?.ref || r?.saleId || r?.purchaseId || r?.invoiceNumber || r?.lpoNumber || ''),
-            note: String(r?.note || r?.supplier || r?.description || r?.reason || ''),
-            sourceKey: k,
-            sourceIndex,
-            raw: r
-          });
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const displayNameByKey = new Map();
+      const unitByKey = new Map();
+      (Array.isArray(inventoryItems) ? inventoryItems : []).forEach((it) => {
+        const displayName = String(it?.name || it?.itemName || '').trim();
+        const key = norm(displayName);
+        if (!key) return;
+        if (!displayNameByKey.has(key)) displayNameByKey.set(key, displayName);
+        if (!unitByKey.has(key)) unitByKey.set(key, String(it?.unit || '').trim());
+      });
+
+      (Array.isArray(stockMovements) ? stockMovements : []).forEach((m) => {
+        const rawName = String(m?.itemName || '').trim();
+        const nameKey = norm(rawName);
+        if (!nameKey) return;
+        const name = displayNameByKey.get(nameKey) || rawName;
+        const qty = parseFloat(String(m?.quantity || 0)) || 0;
+        const isIn = isInventoryMovementIn(m);
+        const isOut = isInventoryMovementOut(m);
+        const type = isIn ? 'IN' : isOut ? 'OUT' : 'ADJ';
+        const rawDateTime = String(m?.date || m?.createdAt || '').trim();
+        const rawDateOnly = rawDateTime ? rawDateTime.slice(0, 10) : '';
+        out.push({
+          id: String(m?.id || `local_${Math.random()}`),
+          date: rawDateOnly,
+          dateTime: rawDateTime,
+          type,
+          itemType: String(m?.itemType || ''),
+          name,
+          nameKey,
+          quantity: qty,
+          unit: String(m?.unit || unitByKey.get(nameKey) || ''),
+          unitCost: toMoney(isIn ? (m?.pricePerItem ?? 0) : 0),
+          sellingPrice: toMoney(isOut ? (m?.pricePerItem ?? 0) : 0),
+          reference: String(m?.referenceId || ''),
+          note: String(m?.note || m?.reason || ''),
+          sourceKey: String(m?.sourceKey || ''),
+          sourceIndex: Number.isInteger(m?.sourceIndex) ? m.sourceIndex : -1,
+          raw: m
         });
       });
-      out.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
       return out;
-    }, [refreshKey]);
+    }, [refreshKey, inventoryItems, stockMovements]);
 
-    const inventoryItems = useMemo(() => {
-      void refreshKey;
-      try {
-        const raw = JSON.parse(localStorage.getItem('inventoryItems') || '[]');
-        return Array.isArray(raw) ? raw : [];
-      } catch {
-        return [];
-      }
-    }, [refreshKey]);
+    const movementProducts = useMemo(() => {
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const map = new Map();
+      inventoryItems.forEach((it) => {
+        const name = String(it?.name || it?.itemName || '').trim();
+        if (!name) return;
+        const key = norm(name);
+        if (!key) return;
+        if (!map.has(key)) map.set(key, name);
+      });
+      const list = Array.from(map.entries())
+        .map(([key, label]) => ({ key, label }))
+        .sort((a, b) => String(a.label || '').localeCompare(String(b.label || '')));
+      return [{ key: 'all', label: 'All Products' }, ...list];
+    }, [inventoryItems]);
 
     const priceByName = useMemo(() => {
       const map = new Map();
@@ -6782,12 +8522,17 @@ export default function Placeholder() {
       const start = new Date(fromDate);
       const end = new Date(toDate);
       const type = String(moveType || 'all');
+      const productKeyFilter = String(movementProductKey || 'all');
       const term = (q || '').trim().toLowerCase();
       const base = (moveRows || []).filter((r) => {
-        const d = new Date(String(r?.date || ''));
-        if (isNaN(d)) return false;
-        if (d < start || d > end) return false;
+        const s = String(r?.dateTime || r?.date || '');
+        const t = Date.parse(s);
+        if (!Number.isFinite(t)) return false;
+        const day = new Date(String(r?.date || ''));
+        if (isNaN(day)) return false;
+        if (day < start || day > end) return false;
         if (type !== 'all' && String(r.type || '').toUpperCase() !== type.toUpperCase()) return false;
+        if (productKeyFilter !== 'all' && String(r.nameKey || '').trim().toLowerCase() !== productKeyFilter) return false;
         return true;
       });
       return term
@@ -6796,11 +8541,46 @@ export default function Placeholder() {
             return hay.includes(term);
           })
         : base;
-    }, [fromDate, moveRows, moveType, q, toDate]);
+    }, [fromDate, moveRows, moveType, movementProductKey, q, toDate]);
 
     const stockValueRows = useMemo(() => {
       const byKey = new Map();
       const meta = new Map();
+      const categoryByNameKey = new Map();
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const movementKnownKeys = new Set(
+        (Array.isArray(moveRows) ? moveRows : [])
+          .map((row) => String(row?.nameKey || row?.name || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
+      (Array.isArray(inventoryItems) ? inventoryItems : []).forEach((it) => {
+        const name = String(it?.name || it?.itemName || '').trim();
+        const key = norm(name);
+        if (!key) return;
+        const category = String(it?.category || it?.itemType || 'general').trim() || 'general';
+        if (!categoryByNameKey.has(key)) categoryByNameKey.set(key, category);
+      });
+      (Array.isArray(inventoryItems) ? inventoryItems : []).forEach((it) => {
+        const name = String(it?.name || it?.itemName || '').trim();
+        const key = norm(name);
+        if (!key) return;
+        const qtyRaw = String(it?.stockQuantity ?? it?.qty ?? it?.quantity ?? 0).replace(/,/g, '');
+        const qty = parseFloat(qtyRaw);
+        if (!Number.isFinite(qty)) return;
+        if (!byKey.has(key)) byKey.set(key, movementKnownKeys.has(key) ? 0 : qty);
+        const unit = String(it?.unit || '').trim();
+        const buying = Number(it?.buyingPrice ?? it?.buyPrice ?? it?.costPrice ?? 0) || 0;
+        const t = Date.parse(String(it?.updatedAt || it?.createdAt || ''));
+        meta.set(key, {
+          name: name || '—',
+          nameKey: key,
+          itemType: categoryByNameKey.get(key) || String(it?.category || it?.itemType || '—'),
+          unit: unit || '—',
+          lastCost: buying > 0 ? buying : 0,
+          lastCostTs: Number.isFinite(t) ? t : 0,
+          lastSeenTs: Number.isFinite(t) ? t : 0
+        });
+      });
       const tsOf = (r) => {
         const s = String(r?.dateTime || r?.raw?.createdAt || r?.raw?.timestamp || r?.date || '');
         const t = Date.parse(s);
@@ -6808,13 +8588,15 @@ export default function Placeholder() {
       };
       const asc = [...(moveRows || [])].sort((a, b) => tsOf(a) - tsOf(b));
       asc.forEach((r) => {
-        const key = `${String(r.itemType || '').trim()}__${String(r.name || '').trim()}`;
+        const nameKey = String(r.nameKey || String(r.name || '').toLowerCase()).trim();
+        const key = nameKey;
         const cur = byKey.get(key) || 0;
         const next = cur + (String(r.type || '').toUpperCase() === 'IN' ? Number(r.quantity || 0) : -Number(r.quantity || 0));
         byKey.set(key, next);
         const m = meta.get(key) || {
           name: r.name,
-          itemType: r.itemType,
+          nameKey,
+          itemType: categoryByNameKey.get(nameKey) || r.itemType,
           unit: r.unit,
           lastCost: 0,
           lastCostTs: 0,
@@ -6822,7 +8604,8 @@ export default function Placeholder() {
         };
         const t = tsOf(r);
         m.name = r.name || m.name;
-        m.itemType = r.itemType || m.itemType;
+        m.nameKey = String(r.nameKey || m.nameKey || String(r.name || '').toLowerCase()).trim();
+        m.itemType = categoryByNameKey.get(m.nameKey) || r.itemType || m.itemType;
         m.unit = r.unit || m.unit;
         m.lastSeenTs = Math.max(m.lastSeenTs || 0, t || 0);
         if (String(r.type || '').toUpperCase() === 'IN' && Number(r.unitCost || 0) > 0 && t >= (m.lastCostTs || 0)) {
@@ -6836,12 +8619,12 @@ export default function Placeholder() {
         const m = meta.get(key);
         const qn = Number(qty || 0);
         if (!m) return;
-        const fallback = priceByName.get(String(m.name || '').toLowerCase()) || 0;
+        const fallback = priceByName.get(String(m.nameKey || '').trim()) || priceByName.get(String(m.name || '').toLowerCase()) || 0;
         const unitCost = Number(m.lastCost || 0) || fallback;
         rows.push({
           key,
           name: m.name || '—',
-          itemType: m.itemType || '—',
+          itemType: categoryByNameKey.get(String(m.nameKey || '').trim()) || m.itemType || '—',
           unit: m.unit || '—',
           qty: qn,
           unitCost,
@@ -6851,7 +8634,7 @@ export default function Placeholder() {
       });
       rows.sort((a, b) => b.totalValue - a.totalValue);
       return rows;
-    }, [moveRows, priceByName]);
+    }, [inventoryItems, moveRows, priceByName]);
 
     const stockValueFiltered = useMemo(() => {
       const term = (valueQ || '').trim().toLowerCase();
@@ -6868,23 +8651,91 @@ export default function Placeholder() {
     }, [stockValueRows]);
 
     const rowsWithBalance = useMemo(() => {
-      const asc = [...movementRows].sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
-      const balanceByName = new Map();
-      const withBal = asc.map((r) => {
-        const key = `${String(r.itemType || '').trim()}__${String(r.name || '').trim()}`;
-        const cur = balanceByName.get(key) || 0;
-        const next = cur + (String(r.type || '').toUpperCase() === 'IN' ? Number(r.quantity || 0) : -Number(r.quantity || 0));
-        balanceByName.set(key, next);
-        return { ...r, balanceQty: next };
+      const tsOf = (r) => {
+        const s = String(r?.dateTime || r?.raw?.createdAt || r?.raw?.timestamp || r?.date || '');
+        const t = Date.parse(s);
+        return Number.isFinite(t) ? t : Date.parse(`${String(r?.date || '')}T00:00:00`);
+      };
+      const startTs = Date.parse(`${String(fromDate || '').slice(0, 10)}T00:00:00`);
+      const norm = (v) => String(v || '').trim().toLowerCase();
+      const openingByKey = new Map();
+      const metaByKey = new Map();
+      const movementKnownKeys = new Set(
+        (Array.isArray(moveRows) ? moveRows : [])
+          .map((row) => String(row?.nameKey || row?.name || '').trim().toLowerCase())
+          .filter(Boolean)
+      );
+      inventoryItems.forEach((it) => {
+        const name = String(it?.name || it?.itemName || '').trim();
+        if (!name) return;
+        const nameKeyOnly = norm(name);
+        if (String(movementProductKey || 'all') !== 'all' && nameKeyOnly !== String(movementProductKey || '').trim().toLowerCase()) return;
+        const baseQtyRaw = String(it?.stockQuantity ?? it?.qty ?? it?.quantity ?? 0).replace(/,/g, '');
+        const baseQty = parseFloat(baseQtyRaw);
+        if (!Number.isFinite(baseQty)) return;
+        const key = nameKeyOnly;
+        if (!openingByKey.has(key)) openingByKey.set(key, movementKnownKeys.has(key) ? 0 : baseQty);
+        if (!metaByKey.has(key)) {
+          metaByKey.set(key, {
+            name,
+            nameKey: nameKeyOnly,
+            itemType: String(it?.category || it?.itemType || '').trim(),
+            unit: String(it?.unit || '').trim()
+          });
+        }
       });
-      withBal.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
-      return withBal;
-    }, [movementRows]);
+      (moveRows || []).forEach((r) => {
+        const t = tsOf(r);
+        if (!Number.isFinite(t) || !Number.isFinite(startTs) || !(t < startTs)) return;
+        if (String(movementProductKey || 'all') !== 'all' && String(r.nameKey || '').trim().toLowerCase() !== String(movementProductKey || '').trim().toLowerCase()) return;
+        const key = String(r.nameKey || String(r.name || '')).trim().toLowerCase();
+        const cur = openingByKey.get(key) || 0;
+        const next = cur + (String(r.type || '').toUpperCase() === 'IN' ? Number(r.quantity || 0) : -Number(r.quantity || 0));
+        openingByKey.set(key, next);
+        if (!metaByKey.has(key)) {
+          metaByKey.set(key, {
+            name: r.name,
+            nameKey: String(r.nameKey || '').trim(),
+            itemType: String(r.itemType || '').trim(),
+            unit: String(r.unit || '').trim()
+          });
+        }
+      });
+
+      const asc = [...movementRows].sort((a, b) => tsOf(a) - tsOf(b));
+      const seen = new Set();
+      const balanceByKey = new Map();
+      const out = [];
+      asc.forEach((r) => {
+        const key = String(r.nameKey || String(r.name || '')).trim().toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          const opening = openingByKey.get(key) || 0;
+          balanceByKey.set(key, opening);
+        }
+        const cur = balanceByKey.get(key) || 0;
+        const next = cur + (String(r.type || '').toUpperCase() === 'IN' ? Number(r.quantity || 0) : -Number(r.quantity || 0));
+        balanceByKey.set(key, next);
+        const resolvedSellingPrice = Number(r.sellingPrice || 0) > 0
+          ? Number(r.sellingPrice || 0)
+          : Number(priceByName.get(String(r.nameKey || '').trim()) || priceByName.get(String(r.name || '').toLowerCase()) || 0);
+        out.push({ ...r, sellingPrice: resolvedSellingPrice, balanceQty: next });
+      });
+      return out;
+    }, [fromDate, inventoryItems, movementProductKey, movementRows, moveRows, priceByName]);
 
     const kpis = useMemo(() => {
       const totalIn = rowsWithBalance.filter((r) => String(r.type || '').toUpperCase() === 'IN').reduce((s, r) => s + Number(r.quantity || 0), 0);
       const totalOut = rowsWithBalance.filter((r) => String(r.type || '').toUpperCase() === 'OUT').reduce((s, r) => s + Number(r.quantity || 0), 0);
-      const balance = totalIn - totalOut;
+      const balance = (() => {
+        const lastByKey = new Map();
+        rowsWithBalance.forEach((r) => {
+          const key = String(r?.nameKey || r?.name || '').trim().toLowerCase();
+          if (!key) return;
+          lastByKey.set(key, Number(r.balanceQty || 0));
+        });
+        return Array.from(lastByKey.values()).reduce((s, n) => s + Number(n || 0), 0);
+      })();
       const revenue = rowsWithBalance
         .filter((r) => String(r.type || '').toUpperCase() === 'OUT')
         .reduce((s, r) => s + Number(r.quantity || 0) * Number(r.sellingPrice || 0), 0);
@@ -6896,15 +8747,13 @@ export default function Placeholder() {
     }, [rowsWithBalance]);
 
     const exportCSV = () => {
-      const rows = [
-        ['#', 'Product', 'Type', 'Qty In', 'Qty Out', 'Unit Cost', 'Selling Price', 'Total Amount', 'Balance Qty', 'Reference', 'Date & Time', 'Note', 'Category']
-      ];
+      const rows = [['No', 'Product', 'Movement', 'Qty In', 'Qty Out', 'Unit Cost (TSH)', 'Selling Price (TSH)', 'Total Amount (TSH)', 'Balance Qty', 'Reference', 'Date & Time', 'Note', 'Category']];
       rowsWithBalance.forEach((r, idx) => {
-        const qtyIn = String(r.type === 'IN' ? Number(r.quantity || 0) : 0);
-        const qtyOut = String(r.type === 'OUT' ? Number(r.quantity || 0) : 0);
+        const qtyIn = r.type === 'IN' ? String(Number(r.quantity || 0)) : '';
+        const qtyOut = r.type === 'OUT' ? String(Number(r.quantity || 0)) : '';
         const unitCost = r.unitCost ? String(r.unitCost) : '';
         const selling = r.sellingPrice ? String(r.sellingPrice) : '';
-        const total = r.type === 'IN' ? Number(r.quantity || 0) * Number(r.unitCost || 0) : Number(r.quantity || 0) * Number(r.sellingPrice || 0);
+        const total = (r.type === 'IN' || r.type === 'OUT') ? Number(r.quantity || 0) * Number(r.sellingPrice || 0) : 0;
         rows.push([
           String(idx + 1),
           String(r.name || ''),
@@ -6921,7 +8770,11 @@ export default function Placeholder() {
           String(r.itemType || '')
         ]);
       });
-      downloadCsvFile(`stock_movement_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+      downloadExcelFile(`Stock_Movement_${fromDate}_to_${toDate}.xls`, {
+        title: 'Stock Movement Report',
+        subtitle: `${fromDate} to ${toDate}`,
+        rows
+      });
     };
 
     const exportStockValueCSV = () => {
@@ -6939,7 +8792,11 @@ export default function Placeholder() {
           String(r.updatedAt || '')
         ]);
       });
-      downloadCsvFile(`stock_value_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+      downloadExcelFile(`stock_value_${new Date().toISOString().slice(0, 10)}.xls`, {
+        title: 'Stock Value Report',
+        subtitle: `As of ${new Date().toISOString().slice(0, 10)}`,
+        rows
+      });
     };
 
     const printReport = () => {
@@ -6956,70 +8813,73 @@ export default function Placeholder() {
     };
 
     const doDelete = () => {
+      if (deleteLoading) return;
+      const startedAt = Date.now();
       setDeleteLoading(true);
-      try {
-        if (deleteTarget) {
-          const key = String(deleteTarget.sourceKey || '');
-          const idx = Number(deleteTarget.sourceIndex);
-          const rawId = deleteTarget?.raw?.id;
-          if (key) {
-            const raw = localStorage.getItem(key);
-            const list = (() => {
-              try {
-                const v = JSON.parse(raw || '[]');
-                return Array.isArray(v) ? v : [];
-              } catch {
-                return [];
+      (async () => {
+        try {
+          if (deleteTarget) {
+            const key = String(deleteTarget.sourceKey || '');
+            const idx = Number(deleteTarget.sourceIndex);
+            const rawId = deleteTarget?.raw?.id;
+            if (key) {
+              const raw = localStorage.getItem(key);
+              const list = (() => {
+                try {
+                  const v = JSON.parse(raw || '[]');
+                  return Array.isArray(v) ? v : [];
+                } catch {
+                  return [];
+                }
+              })();
+              let next = list;
+              if (Number.isInteger(idx) && idx >= 0 && idx < list.length) {
+                const at = list[idx];
+                const matchById = rawId != null && String(at?.id) === String(rawId);
+                if (rawId == null || matchById) {
+                  next = list.slice();
+                  next.splice(idx, 1);
+                }
               }
-            })();
-            let next = list;
-            if (Number.isInteger(idx) && idx >= 0 && idx < list.length) {
-              const at = list[idx];
-              const matchById = rawId != null && String(at?.id) === String(rawId);
-              if (rawId == null || matchById) {
-                next = list.slice();
-                next.splice(idx, 1);
+              if (next === list && rawId != null) {
+                next = list.filter((r) => String(r?.id) !== String(rawId));
               }
+              if (next === list) {
+                next = list.filter((r) => {
+                  const a = String(r?.itemName || r?.name || '').trim();
+                  const b = String(deleteTarget?.raw?.itemName || deleteTarget?.raw?.name || '').trim();
+                  const qa = parseFloat(String(r?.quantity || 0)) || 0;
+                  const qb = parseFloat(String(deleteTarget?.raw?.quantity || 0)) || 0;
+                  const da = String(r?.date || r?.createdAt || '').slice(0, 10);
+                  const db = String(deleteTarget?.raw?.date || deleteTarget?.raw?.createdAt || '').slice(0, 10);
+                  return !(a === b && qa === qb && da === db);
+                });
+              }
+              localStorage.setItem(key, JSON.stringify(next));
             }
-            if (next === list && rawId != null) {
-              next = list.filter((r) => String(r?.id) !== String(rawId));
-            }
-            if (next === list) {
-              next = list.filter((r) => {
-                const a = String(r?.itemName || r?.name || '').trim();
-                const b = String(deleteTarget?.raw?.itemName || deleteTarget?.raw?.name || '').trim();
-                const qa = parseFloat(String(r?.quantity || 0)) || 0;
-                const qb = parseFloat(String(deleteTarget?.raw?.quantity || 0)) || 0;
-                const da = String(r?.date || r?.createdAt || '').slice(0, 10);
-                const db = String(deleteTarget?.raw?.date || deleteTarget?.raw?.createdAt || '').slice(0, 10);
-                return !(a === b && qa === qb && da === db);
-              });
-            }
-            localStorage.setItem(key, JSON.stringify(next));
           }
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+          setRefreshKey((v) => v + 1);
+          setDeleteOpen(false);
+          setDeleteTarget(null);
+        } finally {
+          const elapsed = Date.now() - startedAt;
+          const remaining = 5000 - elapsed;
+          if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+          setDeleteLoading(false);
         }
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-        setRefreshKey((v) => v + 1);
-        setDeleteOpen(false);
-        setDeleteTarget(null);
-      } finally {
-        setDeleteLoading(false);
-      }
+      })();
     };
 
     return (
       <div className="space-y-5">
         <style>{`
+          .movement-report-print-screen { position: absolute; left: -10000px; top: 0; opacity: 0; pointer-events: none; }
           @media print {
             @page { size: A4 landscape; margin: 10mm; }
-            body * { visibility: hidden !important; }
-            .report-print-scope, .report-print-scope * { visibility: visible !important; }
-            .report-print-scope { position: absolute !important; inset: 0 !important; padding: 10px !important; background: white !important; zoom: 0.86; }
-            .report-no-print { display: none !important; }
-            .report-print-scope .overflow-auto { overflow: visible !important; }
-            .report-print-scope table { width: 100% !important; min-width: 0 !important; }
-            .report-print-scope th, .report-print-scope td { padding-top: 6px !important; padding-bottom: 6px !important; }
-            .report-print-scope * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            .movement-report-print-screen { left: 0 !important; opacity: 1 !important; pointer-events: auto !important; }
+            .movement-report-print { font-size: 12px !important; }
+            .movement-report-print .text-right { text-align: right !important; }
           }
         `}</style>
 
@@ -7074,12 +8934,6 @@ export default function Placeholder() {
                 className="w-[340px] max-w-[80vw] pl-9 pr-3 py-2 rounded-xl border border-gray-200 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500"
               />
             </div>
-            <button type="button" className="px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-medium hover:bg-green-700" onClick={() => navigate('/purchases')}>
-              <span className="inline-flex items-center gap-2">
-                <Plus className="w-4 h-4" />
-                Stock In
-              </span>
-            </button>
             <button
               type="button"
               data-no-loading="true"
@@ -7092,7 +8946,7 @@ export default function Placeholder() {
           </div>
         </div>
 
-        <div className="report-print-scope bg-white border border-gray-200 rounded-2xl p-6">
+        <div className="bg-white border border-gray-200 rounded-2xl p-6">
           {storeTab === 'movement' ? (
             <>
               <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -7102,6 +8956,14 @@ export default function Placeholder() {
                   <div className="mt-2 text-sm text-gray-600">All stock in &amp; stock out events — {fromDate} to {toDate}</div>
                 </div>
                 <div className="flex items-center gap-2 report-no-print">
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm text-gray-700">Product</div>
+                    <select className="px-3 py-2 border rounded-xl text-sm" value={movementProductKey} onChange={(e) => setMovementProductKey(e.target.value)}>
+                      {movementProducts.map((p) => (
+                        <option key={p.key} value={p.key}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
                   <div className="flex items-center gap-2">
                     <div className="text-sm text-gray-700">From</div>
                     <DateInput className="px-3 py-2 border rounded-xl text-sm" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
@@ -7154,28 +9016,17 @@ export default function Placeholder() {
                     <div className="text-sm font-medium text-gray-900">Stock Movement Log</div>
                     <div className="text-xs text-gray-600">All stock in &amp; stock out events — tracked automatically</div>
                   </div>
-                  <div className="flex items-center gap-2 report-no-print">
-                    <select value={moveType} onChange={(e) => setMoveType(e.target.value)} className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm">
-                      <option value="IN">Stock In</option>
-                      <option value="OUT">Stock Out</option>
-                    </select>
-                    <button type="button" className="px-3 py-2 rounded-xl bg-green-600 text-white text-sm font-medium hover:bg-green-700 inline-flex items-center gap-2" onClick={() => navigate('/purchases')}>
-                      <Plus className="w-4 h-4" />
-                      Add Stock In
-                    </button>
-                  </div>
                 </div>
 
                 <div className="overflow-auto">
-                  <table className="min-w-[1320px] w-full">
+                  <table className="min-w-[1200px] w-full">
                     <thead className="bg-gray-50 border-b border-gray-200 text-[12px] text-gray-600">
-                      <tr className="grid grid-cols-[60px_220px_110px_100px_110px_120px_120px_140px_120px_140px_170px_110px] px-5 py-3">
+                      <tr className="grid grid-cols-[60px_220px_110px_100px_110px_120px_140px_120px_140px_170px_110px] px-5 py-3">
                         <th className="text-left tracking-wide">#</th>
                         <th className="text-left tracking-wide">PRODUCT</th>
                         <th className="text-left tracking-wide">TYPE</th>
                         <th className="text-right tracking-wide">QTY IN</th>
                         <th className="text-right tracking-wide">QTY OUT</th>
-                        <th className="text-right tracking-wide">UNIT COST</th>
                         <th className="text-right tracking-wide">SELL PRICE</th>
                         <th className="text-right tracking-wide">TOTAL AMOUNT</th>
                         <th className="text-right tracking-wide">BALANCE QTY</th>
@@ -7188,20 +9039,26 @@ export default function Placeholder() {
                       {rowsWithBalance.map((r, idx) => {
                         const qtyIn = r.type === 'IN' ? Number(r.quantity || 0) : 0;
                         const qtyOut = r.type === 'OUT' ? Number(r.quantity || 0) : 0;
-                        const total = r.type === 'IN' ? qtyIn * Number(r.unitCost || 0) : qtyOut * Number(r.sellingPrice || 0);
+                        const total = (qtyIn || qtyOut) ? (qtyIn || qtyOut) * Number(r.sellingPrice || 0) : 0;
                         const dt = r.dateTime || r.date || '';
+                        const canDeleteRow = canDelete;
                         return (
-                          <tr key={r.id} className="grid grid-cols-[60px_220px_110px_100px_110px_120px_120px_140px_120px_140px_170px_110px] px-5 py-3 items-center">
+                          <tr key={r.id} className="grid grid-cols-[60px_220px_110px_100px_110px_120px_140px_120px_140px_170px_110px] px-5 py-3 items-center">
                             <td className="text-sm text-gray-700">{idx + 1}</td>
                             <td className="text-sm font-medium text-gray-900 truncate">{r.name || '—'}</td>
                             <td className="text-sm">
-                              <span className={r.type === 'IN' ? 'px-3 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium' : 'px-3 py-1 rounded-full bg-rose-100 text-rose-700 text-xs font-medium'}>
+                              <span
+                                className={
+                                  r.type === 'IN'
+                                    ? 'px-3 py-1 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium'
+                                    : 'px-3 py-1 rounded-full bg-rose-100 text-rose-700 text-xs font-medium'
+                                }
+                              >
                                 {r.type === 'IN' ? 'Stock In' : 'Stock Out'}
                               </span>
                             </td>
-                            <td className="text-sm text-gray-800 text-right">{qtyIn ? qtyIn.toLocaleString() : '—'}</td>
-                            <td className="text-sm text-gray-800 text-right">{qtyOut ? qtyOut.toLocaleString() : '—'}</td>
-                            <td className="text-sm text-gray-800 text-right">{r.unitCost ? `TSH ${money(r.unitCost)}` : '—'}</td>
+                            <td className="text-sm text-gray-800 text-right">{qtyIn ? `+${qtyIn.toLocaleString()}` : '—'}</td>
+                            <td className="text-sm text-gray-800 text-right">{qtyOut ? `-${qtyOut.toLocaleString()}` : '—'}</td>
                             <td className="text-sm text-gray-800 text-right">{r.sellingPrice ? `TSH ${money(r.sellingPrice)}` : '—'}</td>
                             <td className="text-sm text-gray-900 text-right">{total ? `TSH ${money(total)}` : '—'}</td>
                             <td className="text-sm text-gray-900 text-right">{Number(r.balanceQty || 0).toLocaleString()}</td>
@@ -7211,9 +9068,10 @@ export default function Placeholder() {
                               <div className="flex items-center gap-2">
                                 <button
                                   type="button"
-                                  className={canDelete ? 'px-3 py-2 rounded-xl border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 inline-flex items-center gap-2' : 'px-3 py-2 rounded-xl border border-gray-200 bg-gray-50 text-gray-400 cursor-not-allowed inline-flex items-center gap-2'}
-                                  onClick={() => (canDelete ? openDeleteOne(r) : null)}
-                                  disabled={!canDelete}
+                                  data-delete-trigger="true"
+                                  className={canDeleteRow ? 'px-3 py-2 rounded-xl border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 inline-flex items-center gap-2' : 'px-3 py-2 rounded-xl border border-gray-200 bg-gray-50 text-gray-400 cursor-not-allowed inline-flex items-center gap-2'}
+                                  onClick={() => (canDeleteRow ? openDeleteOne(r) : null)}
+                                  disabled={!canDeleteRow}
                                 >
                                   <Trash2 className="w-4 h-4" />
                                   Delete
@@ -7239,7 +9097,7 @@ export default function Placeholder() {
                   <div className="flex items-center gap-2">
                     <button type="button" data-no-loading="true" className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportCSV}>
                       <Download className="w-4 h-4" />
-                      CSV
+                      Excel
                     </button>
                     <button type="button" data-no-loading="true" className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={printReport}>
                       <Printer className="w-4 h-4" />
@@ -7258,18 +9116,9 @@ export default function Placeholder() {
                   <div className="mt-2 text-sm text-gray-600">Estimated inventory value based on current balances</div>
                 </div>
                 <div className="flex items-center gap-2 report-no-print">
-                  <button
-                    type="button"
-                    data-no-loading="true"
-                    className="px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-medium hover:bg-green-700 inline-flex items-center gap-2"
-                    onClick={() => navigate('/purchases')}
-                  >
-                    <Plus className="w-4 h-4" />
-                    Add Stocks
-                  </button>
                   <button type="button" data-no-loading="true" className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportStockValueCSV}>
                     <Download className="w-4 h-4" />
-                    CSV
+                    Excel
                   </button>
                   <button type="button" data-no-loading="true" className="px-3 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={printStockValue}>
                     <Printer className="w-4 h-4" />
@@ -7370,7 +9219,7 @@ export default function Placeholder() {
                 <div className="bg-white border border-gray-200 rounded-2xl p-5">
                   <div className="text-sm font-semibold text-gray-900">Assets Depreciation</div>
                   <div className="mt-1 text-xs italic text-gray-600">
-                    Total assets: {assetsSummary.count} • Total value: TSH {money(assetsSummary.totalValue)} • Annual depreciation: TSH {money(assetsSummary.totalAnnualDep)}
+                    Total assets: {assetsSummary.count} • Total value: TSH {money(assetsSummary.totalOriginal)} • Current value: TSH {money(assetsSummary.totalCurrent)} • Depreciated: TSH {money(assetsSummary.totalDepToDate)} • Dep/yr: TSH {money(assetsSummary.totalAnnualDep)}
                   </div>
 
                   <div className="mt-4 grid grid-cols-1 gap-2">
@@ -7391,7 +9240,7 @@ export default function Placeholder() {
                       <input
                         value={assetDraft.years}
                         onChange={(e) => setAssetDraft((p) => ({ ...p, years: e.target.value.replace(/[^0-9.,]/g, '') }))}
-                        placeholder="Time used (years)"
+                        placeholder="Useful life (years)"
                         className="px-3 py-2 rounded-xl border border-gray-200 text-sm outline-none focus:ring-2 focus:ring-green-500"
                         inputMode="decimal"
                       />
@@ -7410,15 +9259,13 @@ export default function Placeholder() {
                       {(Array.isArray(assets) ? assets : []).length ? (
                         <div className="divide-y divide-gray-100">
                           {(Array.isArray(assets) ? assets : []).map((a) => {
-                            const value = toMoney(a?.value);
-                            const years = parseFloat(String(a?.years || '').replace(/,/g, ''));
-                            const annual = value && years ? value / years : 0;
+                            const d = calcAssetDep(a);
                             return (
                               <div key={a.id} className="px-3 py-3 flex items-start justify-between gap-3">
                                 <div className="min-w-0">
                                   <div className="text-sm font-semibold text-gray-900 truncate">{String(a?.name || '').trim() || '—'}</div>
                                   <div className="text-xs italic text-gray-600">
-                                    Value: TSH {money(value)} • Years: {Number.isFinite(years) ? years : '—'} • Dep/yr: TSH {money(annual)}
+                                    Value: TSH {money(d.value)} • Life: {Number.isFinite(d.years) ? d.years : '—'}y • Age: {Number(d.ageYears || 0).toFixed(1)}y • Current: TSH {money(d.current)} • Dep/yr: TSH {money(d.annual)}
                                   </div>
                                 </div>
                                 <button
@@ -7443,12 +9290,67 @@ export default function Placeholder() {
           )}
         </div>
 
+        <div className="movement-report-print movement-report-print-screen">
+          <div className="text-lg font-semibold text-gray-900">Stock Movement Log</div>
+          <div className="text-sm text-gray-600 mt-1">{fromDate} to {toDate}</div>
+          <div className="mt-4">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr>
+                  <th className="text-left">No</th>
+                  <th className="text-left">Product</th>
+                  <th className="text-left">Movement</th>
+                  <th className="text-right">Qty In</th>
+                  <th className="text-right">Qty Out</th>
+                  <th className="text-right">Sell Price (TSH)</th>
+                  <th className="text-right">Total Amount (TSH)</th>
+                  <th className="text-right">Balance Qty</th>
+                  <th className="text-left">Reference</th>
+                  <th className="text-left">Date & Time</th>
+                  <th className="text-left">Note</th>
+                  <th className="text-left">Category</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rowsWithBalance.map((r, idx) => {
+                  const qtyIn = r.type === 'IN' ? Number(r.quantity || 0) : 0;
+                  const qtyOut = r.type === 'OUT' ? Number(r.quantity || 0) : 0;
+                  const total = (qtyIn || qtyOut) ? (qtyIn || qtyOut) * Number(r.sellingPrice || 0) : 0;
+                  const dt = r.dateTime || r.date || '';
+                  return (
+                    <tr key={`print_${String(r.id || idx)}`}>
+                      <td className="text-left">{idx + 1}</td>
+                      <td className="text-left">{r.name || '—'}</td>
+                      <td className="text-left">{r.type === 'IN' ? 'Stock In' : 'Stock Out'}</td>
+                      <td className="text-right">{qtyIn ? `+${qtyIn.toLocaleString()}` : '—'}</td>
+                      <td className="text-right">{qtyOut ? `-${qtyOut.toLocaleString()}` : '—'}</td>
+                      <td className="text-right">{r.sellingPrice ? money(r.sellingPrice) : '—'}</td>
+                      <td className="text-right">{total ? money(total) : '—'}</td>
+                      <td className="text-right">{Number(r.balanceQty || 0).toLocaleString()}</td>
+                      <td className="text-left">{r.reference ? String(r.reference) : '—'}</td>
+                      <td className="text-left">{dt ? String(dt).slice(0, 19).replace('T', ' ') : '—'}</td>
+                      <td className="text-left">{r.note ? String(r.note) : '—'}</td>
+                      <td className="text-left">{r.itemType ? String(r.itemType) : '—'}</td>
+                    </tr>
+                  );
+                })}
+                {rowsWithBalance.length === 0 ? (
+                  <tr>
+                    <td colSpan={12} className="text-left">No records found</td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <ConfirmDeleteModal
           open={deleteOpen}
           title="Delete this stock record?"
           description="This will remove the selected stock movement record and cannot be undone."
           confirmText="Delete"
           loading={deleteLoading}
+          noBackdrop
           onCancel={() => {
             if (deleteLoading) return;
             setDeleteOpen(false);
@@ -7564,18 +9466,23 @@ export default function Placeholder() {
       });
       // Login/Logout from systemActivity
       readArray('systemActivity').forEach((a) => {
-        const t = String(a?.type || '').toLowerCase();
-        if (t === 'login' || t === 'logout') {
-          out.push({
-            id: String(a?.id || `act_${Math.random()}`),
-            level: 'success',
-            title: t === 'login' ? 'User signed in' : 'User signed out',
-            details: String(a?.details || ''),
-            user: 'System',
-            module: 'Auth',
-            ts: parseTime(a?.ts || Date.now())
-          });
-        }
+        const actorName = (() => {
+          const fullName = String(a?.actor?.fullName || '').trim();
+          const emp = String(a?.actor?.employeeId || '').trim();
+          if (fullName && emp) return `${fullName} (${emp})`;
+          if (fullName) return fullName;
+          if (emp) return emp;
+          return 'System';
+        })();
+        out.push({
+          id: String(a?.id || `act_${Math.random()}`),
+          level: String(a?.level || 'success'),
+          title: String(a?.title || ''),
+          details: String(a?.details || ''),
+          user: actorName,
+          module: String(a?.module || ''),
+          ts: parseTime(a?.ts || Date.now())
+        });
       });
       // Filter out old if cutoff set
       return out.filter((e) => e.ts >= cutoff).sort((a, b) => b.ts - a.ts);
@@ -7627,12 +9534,7 @@ export default function Placeholder() {
       setNonce((n) => n + 1);
       setTimeout(() => setRefreshing(false), 700);
     };
-    const clearOld = () => {
-      try {
-        localStorage.setItem('systemLogsCutoff', new Date().toISOString());
-      } catch {}
-      setNonce((n) => n + 1);
-    };
+    
     const fmt = (d) => {
       try {
         return formatDisplayDate(d.toISOString().slice(0,10));
@@ -7643,18 +9545,13 @@ export default function Placeholder() {
     return (
       <div className="space-y-6">
         <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div>
-            <div className="text-xs text-gray-500">Activity <span className="mx-1">›</span> System Logs</div>
-            <div className="text-2xl md:text-3xl font-extrabold text-gray-900 mt-1">System Logs</div>
-            <div className="text-sm text-gray-600">All events, errors and security activity</div>
-          </div>
+          <div />
           <div className="flex items-center gap-2">
             <button type="button" className={marking ? 'px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold cursor-not-allowed' : 'px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold hover:bg-gray-50'} onClick={markAllRead} disabled={marking}>
               {marking ? 'Marking…' : '✓ Mark All Read'}
             </button>
             <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-semibold hover:bg-gray-50" onClick={exportCSV}>Export</button>
             <button type="button" className={refreshing ? 'px-4 py-2 rounded-xl bg-green-600/80 text-white text-sm font-semibold flex items-center gap-2 cursor-not-allowed' : 'px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-semibold hover:bg-green-700 flex items-center gap-2'} onClick={refresh} disabled={refreshing}>
-              {refreshing ? <span className="w-4 h-4 rounded-full border-2 border-white/60 border-t-white animate-spin" /> : <span className="w-4 h-4 rounded-full border-2 border-white/60" style={{ borderTopColor: 'transparent' }} />}
               Refresh
             </button>
           </div>
@@ -7707,7 +9604,6 @@ export default function Placeholder() {
                 <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search logs..." className="w-64 pl-9 pr-3 py-2 rounded-xl border border-gray-200 bg-white text-sm outline-none focus:ring-2 focus:ring-green-500" />
               </div>
-              <button type="button" className="px-3 py-2 rounded-xl border border-red-200 bg-red-50 text-sm font-semibold text-red-700 hover:bg-red-100" onClick={clearOld}>Clear Old</button>
             </div>
           </div>
           <div className="mt-3 overflow-auto">
@@ -7751,8 +9647,13 @@ export default function Placeholder() {
     );
   };
 
+  void SystemLogs;
+
   if (page === 'sales-order') {
     return <SalesOrder />;
+  }
+  if (page === 'notifications') {
+    return <SystemLogsPage />;
   }
   if (page === 'products') {
     return <Products />;
@@ -7776,6 +9677,12 @@ export default function Placeholder() {
     return <SalesReturns />;
   }
   if (page === 'returns-history') {
+    return <ReturnsHistory />;
+  }
+  if (page === 'damage-stocks') {
+    return <SalesReturns />;
+  }
+  if (page === 'damage-history') {
     return <ReturnsHistory />;
   }
   if (page === 'credit-history') {
@@ -7802,9 +9709,6 @@ export default function Placeholder() {
   if (page === 'production-performance') {
     return <ProductionPerformance />;
   }
-  if (page === 'purchase-planning') {
-    return <PurchasePlanningGuide />;
-  }
   if (page === 'expenses-analytics') {
     return <ExpensesAnalytics />;
   }
@@ -7812,10 +9716,16 @@ export default function Placeholder() {
     return <SystemPreferences />;
   }
   if (page === 'alerts-low-stock') {
-    return <LowStockAlerts />;
+    return <PaymentDueAlerts />;
   }
   if (page === 'alerts-payment-due') {
     return <PaymentDueAlerts />;
+  }
+  if (page === 'subscription') {
+    return <PaymentDueAlerts />;
+  }
+  if (page === 'reports-kpis') {
+    return <Navigate to="/placeholder/reports-sales" replace />;
   }
   if (page === 'reports-sales') {
     return <SalesReport />;
@@ -7823,12 +9733,95 @@ export default function Placeholder() {
   if (page === 'reports-expenses') {
     return <ExpensesReport />;
   }
+  if (page === 'reports-inventory') {
+    return <InventoryReport />;
+  }
   if (page === 'reports-production') {
     return <PurchaseReport />;
   }
   if (page === 'system-logs') {
-    return <SystemLogs />;
+    return <Navigate to="/placeholder/notifications" replace />;
+  }
+  if (page === 'accounting') {
+    return <AccountingHome />;
+  }
+  if (page === 'income-overview') {
+    return <IncomeOverview />;
+  }
+  if (page === 'expense-overview') {
+    return <ExpenseOverview />;
+  }
+  if (page === 'stock-value') {
+    return <StockValueAccounting />;
+  }
+  if (page === 'period-closing') {
+    return <PeriodClosing />;
+  }
+  if (page === 'audit-trail') {
+    return <AuditTrail />;
+  }
+  if (page === 'support') {
+    return <SupportPage />;
   }
 
-  return <div className="bg-white border border-gray-200 rounded-xl p-6 text-gray-700">Coming soon</div>;
+  return (
+    <div className="space-y-6">
+      <div className="bg-white border border-gray-200 rounded-xl p-6 text-gray-700">
+        <div className="text-lg text-gray-900">Page not found</div>
+        <div className="text-sm text-gray-600 mt-1">{String(page || '') ? `/${String(page || '')}` : 'Unknown page'}</div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button type="button" className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700" onClick={() => navigate('/dashboard')}>
+            Dashboard
+          </button>
+          <button type="button" className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-50" onClick={() => navigate('/placeholder/products')}>
+            Products
+          </button>
+          <button type="button" className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-50" onClick={() => navigate('/placeholder/sales-order')}>
+            Sales
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function Placeholder() {
+  const currentUser = (() => {
+    try {
+      return safeJsonParse(window.localStorage.getItem('currentUser'), null);
+    } catch {
+      return null;
+    }
+  })();
+  if (!currentUser) return <Navigate to="/login" replace />;
+  const storageProxy = {
+    getItem(k) {
+      const key = String(k || '');
+      if (!key) return null;
+      const v = localStore.get(key, null);
+      if (v === null || v === undefined) return null;
+      if (typeof v === 'string') return v;
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    },
+    setItem(k, value) {
+      const key = String(k || '');
+      if (!key) return;
+      const raw = value == null ? '' : String(value);
+      try {
+        localStore.set(key, JSON.parse(raw));
+      } catch {
+        localStore.set(key, raw);
+      }
+    },
+    removeItem(k) {
+      const key = String(k || '');
+      if (!key) return;
+      localStore.del(key);
+    }
+  };
+  return <PlaceholderInner __localStore={storageProxy} />;
 }

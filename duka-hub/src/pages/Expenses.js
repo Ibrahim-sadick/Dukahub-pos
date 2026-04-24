@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Plus, Trash2, ChevronDown, Printer, Mail, Share2 } from 'lucide-react';
+import { Plus, Trash2, ChevronDown, Printer, Mail, Share2, Loader2 } from 'lucide-react';
 import DateInput from '../shared/DateInput';
-
-const EXPENSE_SEQUENCE_STORAGE_KEY = 'expenseNextNumber';
+import { expensesApi } from '../services/expensesApi';
+import { appendSystemActivity } from '../utils/systemActivity';
+import { withMinimumDelay } from '../utils/loadingDelay';
 
 const toNumber = (v) => {
   const n = Number(String(v ?? '').replace(/,/g, ''));
@@ -18,48 +19,35 @@ const formatMoney0 = (value) => {
   }
 };
 
-const getNextExpenseNumber = () => {
-  try {
-    const v = parseInt(localStorage.getItem(EXPENSE_SEQUENCE_STORAGE_KEY) || '100', 10);
-    return Number.isFinite(v) ? v : 100;
-  } catch {
-    return 100;
-  }
-};
-
-const generateExpenseNumber = () => {
-  return String(getNextExpenseNumber()).padStart(4, '0');
-};
-
-const normalizeArray = (v) => (Array.isArray(v) ? v : []);
-
 export default function Expenses() {
   const [isSaving, setIsSaving] = useState(false);
   const [showShareMenu, setShowShareMenu] = useState(false);
-  const [refreshNonce, setRefreshNonce] = useState(0);
-
-  const expenses = useMemo(() => {
-    void refreshNonce;
-    try {
-      const list = JSON.parse(localStorage.getItem('expenses') || '[]');
-      return Array.isArray(list) ? list : [];
-    } catch {
-      return [];
-    }
-  }, [refreshNonce]);
+  const [expenses, setExpenses] = useState([]);
+  const [editingExpenseId, setEditingExpenseId] = useState(null);
 
   useEffect(() => {
-    const bump = () => setRefreshNonce((v) => v + 1);
-    window.addEventListener('dataUpdated', bump);
-    window.addEventListener('storage', bump);
+    let alive = true;
+    const load = () => {
+      Promise.resolve()
+        .then(async () => {
+          const savedExpenses = await expensesApi.list();
+          const savedNext = expensesApi.getNextExpenseNumber();
+          if (!alive) return;
+          setExpenses(Array.isArray(savedExpenses) ? savedExpenses : []);
+          setHeader((p) => ({ ...p, expenseNumber: savedNext.expenseNumber }));
+        })
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener('dataUpdated', load);
     return () => {
-      window.removeEventListener('dataUpdated', bump);
-      window.removeEventListener('storage', bump);
+      alive = false;
+      window.removeEventListener('dataUpdated', load);
     };
   }, []);
 
   const [header, setHeader] = useState(() => ({
-    expenseNumber: generateExpenseNumber(),
+    expenseNumber: expensesApi.getNextExpenseNumber().expenseNumber,
     date: new Date().toISOString().slice(0, 10),
     status: 'Paid',
     paymentMethod: 'cash',
@@ -160,9 +148,10 @@ export default function Expenses() {
       .reverse();
   }, [expenses, header.category]);
 
-  const resetForm = () => {
+  const resetForm = (nextInfo = expensesApi.getNextExpenseNumber()) => {
+    setEditingExpenseId(null);
     setHeader({
-      expenseNumber: generateExpenseNumber(),
+      expenseNumber: nextInfo.expenseNumber,
       date: new Date().toISOString().slice(0, 10),
       status: 'Paid',
       paymentMethod: 'cash',
@@ -187,53 +176,83 @@ export default function Expenses() {
     }));
   };
 
-  const saveExpense = () => {
+  const loadExpenseForEdit = (expense) => {
+    if (!expense || !expense.id) return;
+    const nextItems = Array.isArray(expense.items) && expense.items.length
+      ? expense.items.map((item) => ({
+          subcategory: String(item?.subcategory || '').trim() || getSubcategoriesForCategory(expense.category)[0],
+          description: String(item?.description || '').trim(),
+          unit: String(item?.unit || '').trim() || unitOptions[0],
+          qty: toNumber(item?.qty),
+          rate: toNumber(item?.rate)
+        }))
+      : [{ subcategory: getSubcategoriesForCategory(expense.category)[0], description: '', unit: unitOptions[0], qty: 1, rate: 0 }];
+
+    setEditingExpenseId(String(expense.id));
+    setHeader({
+      expenseNumber: String(expense.expenseNumber || ''),
+      date: String(expense.date || '').slice(0, 10) || new Date().toISOString().slice(0, 10),
+      status: String(expense.status || 'Paid'),
+      paymentMethod: String(expense.paymentMethod || 'cash'),
+      reference: String(expense.reference || ''),
+      location: String(expense.location || ''),
+      category: String(expense.category || 'Other')
+    });
+    setItems(nextItems);
+    setNotes(String(expense.notes || ''));
+  };
+
+  const saveExpense = async () => {
     if (isSaving) return;
 
     setIsSaving(true);
-    setTimeout(() => {
-      const total = totals.total;
-      const category = String(header.category || '').trim() || 'Other';
-      const record = {
-        id: Date.now(),
-        expenseNumber: String(header.expenseNumber || '').trim(),
-        date: String(header.date || '').trim(),
-        status: header.status,
-        paymentMethod: header.paymentMethod,
-        reference: String(header.reference || '').trim(),
-        location: String(header.location || '').trim(),
-        supplier: '',
-        supplierAddress: '',
-        items: normalizeArray(items).map((r) => ({
-          category,
-          subcategory: String(r.subcategory || '').trim(),
-          description: String(r.description || '').trim(),
-          unit: String(r.unit || '').trim(),
-          qty: toNumber(r.qty),
-          rate: toNumber(r.rate),
-          amount: toNumber(r.qty) * toNumber(r.rate)
-        })),
-        notes: String(notes || '').trim(),
-        category,
-        amount: toNumber(total)
-      };
+    const category = String(header.category || '').trim() || 'Other';
+    const totalAmount = Number(totals.total || 0) || 0;
+    const isEdit = Boolean(editingExpenseId);
 
-      try {
-        const existing = JSON.parse(localStorage.getItem('expenses') || '[]');
-        const list = Array.isArray(existing) ? existing : [];
-        const next = [...list, record];
-        localStorage.setItem('expenses', JSON.stringify(next));
-        try {
-          const cur = parseInt(String(header.expenseNumber || '').replace(/[^\d]/g, '') || '', 10);
-          const base = Number.isFinite(cur) ? cur : getNextExpenseNumber();
-          localStorage.setItem(EXPENSE_SEQUENCE_STORAGE_KEY, String(base + 1));
-        } catch {}
-        window.dispatchEvent(new CustomEvent('dataUpdated'));
-      } catch {}
-
-      resetForm();
+    try {
+      await withMinimumDelay(async () => {
+        const savedExpense = isEdit
+          ? await expensesApi.update(editingExpenseId, {
+              expenseNumber: header.expenseNumber,
+              date: header.date,
+              status: header.status,
+              paymentMethod: header.paymentMethod,
+              reference: header.reference,
+              location: header.location,
+              category,
+              notes,
+              items,
+              amount: totalAmount
+            })
+          : await expensesApi.create({
+              expenseNumber: header.expenseNumber,
+              date: header.date,
+              status: header.status,
+              paymentMethod: header.paymentMethod,
+              reference: header.reference,
+              location: header.location,
+              category,
+              notes,
+              items,
+              amount: totalAmount
+            });
+        const nextInfo = expensesApi.getNextExpenseNumber();
+        appendSystemActivity(
+          isEdit ? 'expense_update' : 'expense_create',
+          isEdit ? 'Expense updated' : 'Expense created',
+          `${category} • TSH ${totalAmount.toLocaleString()}`,
+          'Expenses',
+          'success',
+          { expenseId: savedExpense?.id || editingExpenseId || header.expenseNumber || null }
+        );
+        resetForm(nextInfo);
+      }, 5000);
+    } catch (error) {
+      alert(error?.message || `Failed to ${isEdit ? 'update' : 'save'} expense.`);
+    } finally {
       setIsSaving(false);
-    }, 300);
+    }
   };
 
   const shareSummary = useMemo(() => {
@@ -351,7 +370,7 @@ export default function Expenses() {
             </div>
           </div>
 
-          <div className="grid grid-cols-12 gap-4 items-start mb-6">
+          <div className="grid grid-cols-12 gap-4 items-start mb-4">
             <div className="col-span-12 lg:col-span-6" />
             <div className="col-span-12 lg:col-span-3">
               <label className="block text-xs font-medium text-gray-500 mb-1">Payment Method</label>
@@ -369,7 +388,7 @@ export default function Expenses() {
             </div>
             <div className="col-span-12 lg:col-span-3">
               <label className="block text-xs font-medium text-gray-500 mb-1">Location</label>
-              <textarea className="w-full px-3 py-2 border rounded-lg text-sm h-20" value={header.location} onChange={(e) => setHeaderField('location', e.target.value)} placeholder="Where expense occurred" />
+              <textarea className="w-full px-3 py-2 border rounded-lg text-sm h-14" value={header.location} onChange={(e) => setHeaderField('location', e.target.value)} placeholder="Where expense occurred" />
               <div className="mt-3">
                 <label className="block text-xs font-medium text-gray-500 mb-1">Status</label>
                 <select className="w-full px-3 py-2 border rounded-lg text-sm" value={header.status} onChange={(e) => setHeaderField('status', e.target.value)}>
@@ -388,8 +407,8 @@ export default function Expenses() {
                 <span className="text-sm">Add Line</span>
               </button>
             </div>
-            <div className="p-4 overflow-auto">
-              <table className="min-w-[1100px] w-full table-fixed border-collapse border border-gray-200">
+            <div className="p-4 overflow-x-hidden">
+              <table className="w-full table-fixed border-collapse border border-gray-200">
                 <thead>
                   <tr className="bg-gray-50">
                     <th className="px-3 py-2 text-sm font-semibold text-gray-700 text-center w-1/12 border border-gray-200">No.</th>
@@ -457,10 +476,10 @@ export default function Expenses() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 items-start">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 items-start">
             <div className="max-w-sm">
               <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
-              <textarea className="w-full px-3 py-2 border rounded-lg h-20 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Comments" />
+              <textarea className="w-full px-3 py-2 border rounded-lg h-14 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Comments" />
             </div>
             <div className="w-full max-w-md ml-auto">
               <div className="flex justify-between text-sm text-gray-700">
@@ -475,14 +494,17 @@ export default function Expenses() {
           </div>
 
           <div className="mt-6 px-6 py-4 border-t border-gray-200 flex items-center justify-end gap-3">
-            <button type="button" onClick={clearForm} className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100">Clear</button>
+            <button type="button" onClick={clearForm} className="px-4 py-2 rounded-lg border border-gray-300 text-gray-800 hover:bg-gray-100">
+              {editingExpenseId ? 'Cancel Edit' : 'Clear'}
+            </button>
             <button
               type="button"
               disabled={isSaving}
               onClick={saveExpense}
-              className={`px-4 py-2 rounded-lg ${isSaving ? 'bg-green-600/60 text-white cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}
+              className={`px-4 py-2 rounded-lg inline-flex items-center gap-2 ${isSaving ? 'bg-green-600/60 text-white cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}
             >
-              Save & New
+              {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              <span>{isSaving ? 'Saving...' : editingExpenseId ? 'Update Expense' : 'Save & New'}</span>
             </button>
           </div>
         </div>
@@ -498,12 +520,24 @@ export default function Expenses() {
           </div>
           <div className="bg-white border border-gray-200 rounded-lg p-4">
             <div className="text-sm font-semibold text-gray-900 mb-2">Recent Transactions</div>
-            <div className="space-y-1 text-sm text-gray-700 italic">
+            <div className="space-y-2 text-sm text-gray-700 italic">
               {categoryHistory.length ? (
                 categoryHistory.map((e) => (
-                  <div key={e.id} className="flex justify-between">
-                    <span>{String(e.date || '').slice(0, 10) || '—'}</span>
-                    <span className="font-medium">TZS {formatMoney0(e.amount || 0)}</span>
+                  <div key={e.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="not-italic text-gray-900">{String(e.date || '').slice(0, 10) || '—'}</div>
+                      <div className="text-xs text-gray-500 not-italic">{e.expenseNumber || e.id}</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium not-italic">TZS {formatMoney0(e.amount || 0)}</span>
+                      <button
+                        type="button"
+                        onClick={() => loadExpenseForEdit(e)}
+                        className="px-2 py-1 rounded-lg border border-gray-300 text-xs text-gray-700 hover:bg-gray-100 not-italic"
+                      >
+                        Edit
+                      </button>
+                    </div>
                   </div>
                 ))
               ) : (

@@ -1,8 +1,73 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { TrendingUp, Wallet, BarChart3, Package, RefreshCw, Calendar, Download, ChevronDown, ChevronUp } from 'lucide-react';
 import { formatDisplayDate } from '../utils/date';
 import SalesOrderPrint from '../shared/SalesOrderPrint';
+import { damageStocksApi } from '../services/damageStocksApi';
+import { expensesApi } from '../services/expensesApi';
+import { productsApi } from '../services/productsApi';
+import { reportingApi } from '../services/reportingApi';
+import { salesApi } from '../services/salesApi';
+import { businessApi } from '../services/businessApi';
+import { customersApi } from '../services/customersApi';
+import { purchasesApi, suppliersApi } from '../services/purchasingApi';
+
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const localStore = {
+  get(key, fallback) {
+    try {
+      const raw = window.localStorage.getItem(String(key || ''));
+      if (raw == null) return fallback;
+      return safeJsonParse(raw, fallback);
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value, options) {
+    const k = String(key || '');
+    if (!k) return false;
+    let ok = false;
+    try {
+      window.localStorage.setItem(k, JSON.stringify(value));
+      ok = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (ok && !options?.silent) {
+        try {
+          window.dispatchEvent(new CustomEvent('dataUpdated'));
+        } catch {}
+      }
+    }
+  },
+  list() {
+    void safeJsonParse;
+    try {
+      const keys = [];
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i);
+        if (k) keys.push(k);
+      }
+      return keys.sort().map((key) => ({ key, value: localStore.get(key, null) }));
+    } catch {
+      return [];
+    }
+  }
+};
+
+const subscriptionsApi = {
+  async current() {
+    return null;
+  }
+};
 
 const Dashboard = () => {
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
@@ -11,25 +76,31 @@ const Dashboard = () => {
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [overviewRange, setOverviewRange] = useState('months12');
   const [invoiceToPrint, setInvoiceToPrint] = useState(null);
-  const [dashboardMode, setDashboardMode] = useState('realtime');
-  const [tabTap, setTabTap] = useState('');
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [snapshot, setSnapshot] = useState({
+    companyInfo: {},
+    sales: [],
+    salesOrders: [],
+    expenses: [],
+    customers: [],
+    purchases: [],
+    suppliers: [],
+    inventoryItems: [],
+    creditSales: [],
+    damagedStocks: [],
+    stockInRecords: [],
+    stockOutRecords: []
+  });
+  const [subscriptionSummary, setSubscriptionSummary] = useState({ status: '', planName: '', endsAt: '', trialEndsAt: '', daysRemaining: null, durationDays: null });
+  const [dashboardSummary, setDashboardSummary] = useState(null);
 
-  const companyInfo = useMemo(() => {
-    void refreshNonce;
-    try {
-      return JSON.parse(localStorage.getItem('companyInfo') || '{}') || {};
-    } catch {
-      return {};
-    }
-  }, [refreshNonce]);
+  const companyInfo = snapshot.companyInfo || {};
 
   useEffect(() => {
     const bump = () => setRefreshNonce((v) => v + 1);
     window.addEventListener('dataUpdated', bump);
-    window.addEventListener('storage', bump);
     return () => {
       window.removeEventListener('dataUpdated', bump);
-      window.removeEventListener('storage', bump);
     };
   }, []);
 
@@ -44,10 +115,76 @@ const Dashboard = () => {
   }, [selectedMonth, selectedYear]);
 
   useEffect(() => {
-    if (dashboardMode !== 'realtime') return;
     const id = window.setInterval(() => setRefreshNonce((v) => v + 1), 5000);
     return () => window.clearInterval(id);
-  }, [dashboardMode]);
+  }, []);
+
+  const refreshSubscriptionNow = useCallback(async () => {
+    try {
+      const calcDaysBetween = (endIso) => {
+        const end = Date.parse(String(endIso || ''));
+        if (!Number.isFinite(end) || !end) return null;
+        const now = Date.now();
+        const ms = end - now;
+        const days = Math.floor(ms / (24 * 60 * 60 * 1000));
+        return days < 0 ? 0 : days;
+      };
+      const calcDaysFromStart = (startIso, durationDays) => {
+        const start = Date.parse(String(startIso || ''));
+        if (!Number.isFinite(start) || !start) return null;
+        const end = start + Number(durationDays || 0) * 24 * 60 * 60 * 1000;
+        return calcDaysBetween(new Date(end).toISOString());
+      };
+      const localUser = localStore.get('currentUser', {}) || {};
+      const company = localStore.get('companyInfo', {}) || {};
+      const sub = (await subscriptionsApi.current()) || {};
+      const status = String(
+        sub?.status ||
+          localUser?.subscriptionPaymentStatus ||
+          company?.subscriptionPaymentStatus ||
+          ''
+      ).toLowerCase();
+      const startedAt = String(sub?.startedAt || localUser?.subscriptionStartedAt || company?.subscriptionStartedAt || '');
+      const trialEndsAt = String(sub?.trialEndsAt || localUser?.subscriptionTrialEndsAt || company?.subscriptionTrialEndsAt || '');
+      const endsAt = String(sub?.endsAt || localUser?.subscriptionEndsAt || company?.subscriptionEndsAt || '');
+      const durationDaysRaw = Number(
+        sub?.durationDays ||
+          localUser?.durationDays ||
+          company?.durationDays ||
+          localUser?.subscriptionDurationDays ||
+          company?.subscriptionDurationDays ||
+          0
+      ) || 0;
+      const planName = String(sub?.plan?.name || localUser?.subscriptionPlan || company?.subscriptionPlan || '').trim();
+      const durationDays = status === 'trial' ? 7 : durationDaysRaw || 30;
+      const daysRemaining = (() => {
+        if (status === 'trial') {
+          if (trialEndsAt) return calcDaysBetween(trialEndsAt);
+          return calcDaysFromStart(startedAt, 7);
+        }
+        if (endsAt) return calcDaysBetween(endsAt);
+        return calcDaysFromStart(startedAt, durationDays);
+      })();
+      setSubscriptionSummary({ status, planName, endsAt, trialEndsAt, daysRemaining, durationDays });
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      if (!alive) return;
+      await refreshSubscriptionNow();
+    };
+    refresh();
+    const id = window.setInterval(refresh, 60000);
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refreshSubscriptionNow]);
 
   const formatTZS = (value) => {
     try {
@@ -62,15 +199,152 @@ const Dashboard = () => {
     }
   };
 
+  const waitForInvoicePrintReady = () =>
+    new Promise((resolve) => {
+      const kick = () => {
+        try {
+          const root = document.querySelector('.dashboard-invoice-preview');
+          if (!root) {
+            resolve();
+            return;
+          }
+          const imgs = Array.from(root.querySelectorAll('img'));
+          if (!imgs.length) {
+            resolve();
+            return;
+          }
+          let pending = 0;
+          const finish = () => {
+            pending -= 1;
+            if (pending <= 0) resolve();
+          };
+          imgs.forEach((img) => {
+            if (img.complete && img.naturalWidth > 0) return;
+            pending += 1;
+            const done = () => finish();
+            img.addEventListener('load', done, { once: true });
+            img.addEventListener('error', done, { once: true });
+          });
+          if (pending === 0) resolve();
+          setTimeout(resolve, 1200);
+        } catch {
+          resolve();
+        }
+      };
+      requestAnimationFrame(() => requestAnimationFrame(kick));
+    });
+
+  const loadSnapshot = useCallback(async () => {
+    const [companyInfoLocal, customers, suppliers, damagedStocks] = await Promise.all([
+      businessApi.get().catch(() => localStore.get('companyInfo', {})),
+      customersApi.list().catch(() => []),
+      suppliersApi.list().catch(() => []),
+      damageStocksApi.list().catch(() => [])
+    ]);
+
+    const [business, rawSales, invoicedSales, expenses, purchases, inventoryItems] = await Promise.all([
+      localStore.get('currentUser', null),
+      salesApi.list().catch(() => []),
+      localStore.get('invoicedSales', []),
+      expensesApi.list().catch(() => []),
+      purchasesApi.list().catch(() => []),
+      productsApi.list().catch(() => [])
+    ]);
+
+    const combinedSalesRaw = [...(Array.isArray(rawSales) ? rawSales : []), ...(Array.isArray(invoicedSales) ? invoicedSales : [])];
+    const mappedSales = combinedSalesRaw.map((s) => {
+      const items = Array.isArray(s?.items) ? s.items : [];
+      const qty = items.reduce((sum, it) => sum + Number(it?.quantity ?? it?.qty ?? 0), 0);
+      const first = items[0] || null;
+      const amount = Number(s?.total ?? s?.finalTotal ?? 0) || 0;
+      return {
+        id: s?.id,
+        date: s?.date || s?.createdAt || null,
+        productName: first?.productName || first?.item || first?.name || 'Sale',
+        productType: first?.productType || 'general',
+        quantity: qty,
+        amount,
+        finalTotal: amount,
+        customerName: s?.customerName || s?.customer || s?.name || 'Customer',
+        status: s?.status || 'paid',
+        paymentMethod: s?.paymentMethod || '',
+        invoiceNumber: s?.saleNumber || s?.invoiceNumber || s?.invoiceNo || ''
+      };
+    });
+    const creditSales = mappedSales.filter((sale) => String(sale?.paymentMethod || '').toLowerCase() === 'credit');
+
+    setSnapshot({
+      companyInfo:
+        business && typeof business === 'object'
+          ? { ...(companyInfoLocal && typeof companyInfoLocal === 'object' ? companyInfoLocal : {}), companyName: business.businessName, phone: business.phone, email: business.email, location: business.address }
+          : companyInfoLocal && typeof companyInfoLocal === 'object'
+            ? companyInfoLocal
+            : {},
+      sales: mappedSales,
+      salesOrders: [],
+      expenses: Array.isArray(expenses) ? expenses : [],
+      customers: Array.isArray(customers) ? customers : [],
+      purchases: Array.isArray(purchases) ? purchases : [],
+      suppliers: Array.isArray(suppliers) ? suppliers : [],
+      inventoryItems: Array.isArray(inventoryItems) ? inventoryItems : [],
+      creditSales,
+      damagedStocks: Array.isArray(damagedStocks) ? damagedStocks : [],
+      stockInRecords: [],
+      stockOutRecords: []
+    });
+  }, []);
+
+  useEffect(() => {
+    Promise.resolve()
+      .then(async () => {
+        try {
+          await loadSnapshot();
+        } catch {}
+      })
+      .catch(() => {});
+  }, [loadSnapshot, refreshNonce]);
+
+  const selectedRange = useMemo(() => {
+    if (selectedDay) {
+      const day = new Date(selectedYear, selectedMonth, selectedDay);
+      return { from: day, to: day };
+    }
+    return {
+      from: new Date(selectedYear, selectedMonth, 1),
+      to: new Date(selectedYear, selectedMonth + 1, 0)
+    };
+  }, [selectedDay, selectedMonth, selectedYear]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const summary = await reportingApi.dashboardSummary(selectedRange);
+        if (!alive) return;
+        setDashboardSummary(summary || null);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setDashboardSummary(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [refreshNonce, selectedRange]);
+
   const data = useMemo(() => {
     void refreshNonce;
     const readArray = (key) => {
-      try {
-        const list = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(list) ? list : [];
-      } catch {
-        return [];
-      }
+      if (key === 'sales') return Array.isArray(snapshot.sales) ? snapshot.sales : [];
+      if (key === 'salesOrders') return Array.isArray(snapshot.salesOrders) ? snapshot.salesOrders : [];
+      if (key === 'expenses') return Array.isArray(snapshot.expenses) ? snapshot.expenses : [];
+      if (key === 'customers') return Array.isArray(snapshot.customers) ? snapshot.customers : [];
+      if (key === 'purchases') return Array.isArray(snapshot.purchases) ? snapshot.purchases : [];
+      if (key === 'suppliers') return Array.isArray(snapshot.suppliers) ? snapshot.suppliers : [];
+      if (key === 'inventoryItems') return Array.isArray(snapshot.inventoryItems) ? snapshot.inventoryItems : [];
+      if (key === 'creditSales') return Array.isArray(snapshot.creditSales) ? snapshot.creditSales : [];
+      if (key === 'damagedStocks') return Array.isArray(snapshot.damagedStocks) ? snapshot.damagedStocks : [];
+      return [];
     };
     const pad2 = (n) => String(n).padStart(2, '0');
     const keyFromDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -151,63 +425,25 @@ const Dashboard = () => {
     const avgSale = totalSales > 0 ? revenue / totalSales : 0;
     const expensesAll = readArray('expenses');
     const expensesMonth = filterByPeriod(expensesAll).reduce((sum, e) => sum + toNumber(e.amount), 0);
+    const damageLosses = filterByPeriod(readArray('damagedStocks')).reduce(
+      (sum, record) => sum + toNumber(record?.lossTotal ?? record?.estimatedValue ?? record?.amount),
+      0
+    );
+    const totalOutflows = expensesMonth + damageLosses;
+    const netProfit = revenue - totalOutflows;
     const unitsSoldTotal = categorySales.reduce((sum, s) => sum + toNumber(s.quantity), 0);
 
-    let customerCount = 0;
-    try {
-      const list = JSON.parse(localStorage.getItem('customers') || '[]');
-      customerCount = (Array.isArray(list) ? list : []).length;
-    } catch {}
+    const customerCount = (readArray('customers') || []).length;
 
     let inventoryValue = 0;
     try {
-      const keys = Object.keys(localStorage || {});
-      const qtyByName = new Map();
-      const priceByName = new Map();
-      const lastSeenByName = new Map();
-      const addQty = (name, delta) => {
-        const key = String(name || 'Unknown').trim() || 'Unknown';
-        const prev = qtyByName.get(key) || 0;
-        qtyByName.set(key, prev + delta);
-      };
-      const maybeUpdatePrice = (name, price, dateRaw) => {
-        const key = String(name || 'Unknown').trim() || 'Unknown';
-        const t = dateRaw ? Date.parse(String(dateRaw)) : 0;
-        const prev = lastSeenByName.get(key) || 0;
-        if (t >= prev) {
-          lastSeenByName.set(key, t);
-          priceByName.set(key, price);
-        }
-      };
-      keys.forEach((k) => {
-        if (!/^stockIn_/.test(k)) return;
-        try {
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = r?.itemName || r?.name || 'Unknown';
-            const qty = toNumber(r?.quantity);
-            addQty(name, qty);
-            const price = toNumber(r?.pricePerItem || r?.price || 0);
-            if (price > 0) maybeUpdatePrice(name, price, r?.date || r?.createdAt || '');
-          });
-        } catch {}
-      });
-      keys.forEach((k) => {
-        if (!/^stockOut_/.test(k)) return;
-        try {
-          const list = JSON.parse(localStorage.getItem(k) || '[]');
-          (Array.isArray(list) ? list : []).forEach((r) => {
-            const name = r?.itemName || r?.name || 'Unknown';
-            const qty = toNumber(r?.quantity);
-            addQty(name, -qty);
-          });
-        } catch {}
-      });
-      qtyByName.forEach((qty, name) => {
-        if (qty <= 0) return;
-        const price = priceByName.get(name) || 0;
-        if (price <= 0) return;
-        inventoryValue += qty * price;
+      const inv = readArray('inventoryItems');
+      (Array.isArray(inv) ? inv : []).forEach((it) => {
+        const qty = toNumber(it?.stockQuantity ?? it?.qty ?? it?.quantity ?? 0);
+        const unitCost = Number(it?.buyingPrice ?? it?.buyPrice ?? it?.costPrice ?? 0) || 0;
+        if (!Number.isFinite(qty) || qty <= 0) return;
+        if (!(unitCost > 0)) return;
+        inventoryValue += qty * unitCost;
       });
     } catch {}
 
@@ -348,6 +584,9 @@ const Dashboard = () => {
       totalSales,
       avgSale,
       expensesMonth,
+      damageLosses,
+      totalOutflows,
+      netProfit,
       unitsSoldTotal,
       customerCount,
       inventoryValue,
@@ -360,7 +599,7 @@ const Dashboard = () => {
       topInvoices,
       primaryCategory
     };
-  }, [refreshNonce, selectedDay, selectedMonth, selectedYear]);
+  }, [refreshNonce, selectedDay, selectedMonth, selectedYear, snapshot]);
 
   const calendarMeta = useMemo(() => {
     const daysInMonth = new Date(selectedYear, selectedMonth + 1, 0).getDate();
@@ -372,12 +611,10 @@ const Dashboard = () => {
     void refreshNonce;
     const set = new Set();
     const readArray = (key) => {
-      try {
-        const list = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(list) ? list : [];
-      } catch {
-        return [];
-      }
+      if (key === 'sales') return Array.isArray(snapshot.sales) ? snapshot.sales : [];
+      if (key === 'salesOrders') return Array.isArray(snapshot.salesOrders) ? snapshot.salesOrders : [];
+      if (key === 'expenses') return Array.isArray(snapshot.expenses) ? snapshot.expenses : [];
+      return [];
     };
     const addIfMatch = (dateValue) => {
       const raw = String(dateValue || '').trim();
@@ -394,7 +631,7 @@ const Dashboard = () => {
     readArray('salesOrders').forEach((o) => addIfMatch(o?.orderDate || o?.date));
     readArray('expenses').forEach((e) => addIfMatch(e?.date));
     return set;
-  }, [refreshNonce, selectedMonth, selectedYear]);
+  }, [refreshNonce, selectedMonth, selectedYear, snapshot]);
 
   const overview = useMemo(() => {
     void refreshNonce;
@@ -403,12 +640,9 @@ const Dashboard = () => {
       return isNaN(n) ? 0 : n;
     };
     const readArray = (key) => {
-      try {
-        const list = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(list) ? list : [];
-      } catch {
-        return [];
-      }
+      if (key === 'sales') return Array.isArray(snapshot.sales) ? snapshot.sales : [];
+      if (key === 'salesOrders') return Array.isArray(snapshot.salesOrders) ? snapshot.salesOrders : [];
+      return [];
     };
     const salesAllRaw = readArray('sales');
     const ordersAllRaw = readArray('salesOrders');
@@ -499,7 +733,7 @@ const Dashboard = () => {
     const totalCount = countValues.reduce((a, b) => a + b, 0);
     const maxCount = Math.max(...countValues, 1);
     return { title: 'Months 12', series, totalAmount, totalCount, maxCount };
-  }, [overviewRange, refreshNonce, selectedDay, selectedMonth, selectedYear]);
+  }, [overviewRange, refreshNonce, selectedDay, selectedMonth, selectedYear, snapshot]);
 
   const profit = useMemo(() => {
     void refreshNonce;
@@ -508,12 +742,10 @@ const Dashboard = () => {
       return isNaN(n) ? 0 : n;
     };
     const readArray = (key) => {
-      try {
-        const list = JSON.parse(localStorage.getItem(key) || '[]');
-        return Array.isArray(list) ? list : [];
-      } catch {
-        return [];
-      }
+      if (key === 'sales') return Array.isArray(snapshot.sales) ? snapshot.sales : [];
+      if (key === 'salesOrders') return Array.isArray(snapshot.salesOrders) ? snapshot.salesOrders : [];
+      if (key === 'expenses') return Array.isArray(snapshot.expenses) ? snapshot.expenses : [];
+      return [];
     };
     const salesAllRaw = readArray('sales');
     const ordersAllRaw = readArray('salesOrders');
@@ -528,6 +760,7 @@ const Dashboard = () => {
     });
     const salesAll = [...salesAllRaw, ...salesOrdersAll];
     const expensesAll = readArray('expenses');
+    const lossesAll = readArray('damagedStocks');
 
     const toMonthKey = (value) => {
       const raw = String(value || '').trim();
@@ -543,6 +776,7 @@ const Dashboard = () => {
 
     const monthSales = new Array(12).fill(0);
     const monthExpenses = new Array(12).fill(0);
+    const monthLosses = new Array(12).fill(0);
 
     salesAll.forEach((s) => {
       const t = toMonthKey(s?.date);
@@ -556,18 +790,32 @@ const Dashboard = () => {
       if (t.y !== selectedYear) return;
       monthExpenses[t.m] += toNumber(e.amount);
     });
+    lossesAll.forEach((loss) => {
+      const t = toMonthKey(loss?.rmaDate || loss?.date || loss?.createdAt);
+      if (!t) return;
+      if (t.y !== selectedYear) return;
+      monthLosses[t.m] += toNumber(loss?.lossTotal ?? loss?.estimatedValue ?? loss?.amount);
+    });
 
     const series = Array.from({ length: 12 }, (_, i) => {
-      const value = monthSales[i] - monthExpenses[i];
+      const value = monthSales[i] - monthExpenses[i] - monthLosses[i];
       const label = new Date(2000, i, 1).toLocaleString(undefined, { month: 'short' });
       return { key: `${selectedYear}-${String(i + 1).padStart(2, '0')}`, label, value };
     });
     const maxAbs = Math.max(...series.map((x) => Math.abs(x.value)), 1);
     return { series, maxAbs };
-  }, [refreshNonce, selectedYear]);
+  }, [refreshNonce, selectedYear, snapshot]);
 
   const refreshData = () => {
     setRefreshNonce((v) => v + 1);
+    setIsRefreshing(true);
+    (async () => {
+      try {
+        await Promise.allSettled([Promise.resolve(refreshSubscriptionNow()), Promise.resolve(loadSnapshot())]);
+      } finally {
+        setIsRefreshing(false);
+      }
+    })();
   };
 
   const [insightsUpdatedAt, setInsightsUpdatedAt] = useState(() => new Date());
@@ -583,12 +831,12 @@ const Dashboard = () => {
         title: 'Start recording sales',
         message: 'No sales found for this period. Add sales transactions to unlock performance insights.'
       });
-    } else if (data.expensesMonth > data.revenue * 0.6) {
+    } else if (data.totalOutflows > data.revenue * 0.6) {
       items.push({
         tag: 'Sales',
         severity: 'Medium',
         title: 'Review expenses vs revenue',
-        message: 'Expenses are high compared to revenue for this period. Consider reducing operational costs or increasing sales volume.'
+        message: 'Expenses and damaged stock losses are high compared to revenue for this period. Consider reducing operational costs or increasing sales volume.'
       });
     } else {
       items.push({
@@ -613,12 +861,12 @@ const Dashboard = () => {
         tag: 'Stock',
         severity: 'High',
         title: 'Update inventory',
-        message: 'Inventory value is not available. Record stock-in transactions so the system can calculate stock value.'
+        message: 'Inventory value is not available. Sync products or record purchases so current stock can be valued.'
       });
     }
 
     return items.slice(0, 4);
-  }, [data.customerCount, data.expensesMonth, data.inventoryValue, data.revenue, refreshNonce]);
+  }, [data.customerCount, data.inventoryValue, data.revenue, data.totalOutflows, refreshNonce]);
 
   const salesCircleSize = useMemo(() => {
     const v = Math.max(0, Number(data.revenue) || 0);
@@ -630,10 +878,28 @@ const Dashboard = () => {
   const salesCircleInset = useMemo(() => Math.round(salesCircleSize * 0.16), [salesCircleSize]);
   const salesCircleFill = useMemo(() => {
     const rev = Math.max(0, Number(data.revenue) || 0);
-    const exp = Math.max(0, Number(data.expensesMonth) || 0);
+    const exp = Math.max(0, Number(data.totalOutflows) || 0);
     const denom = rev + exp;
     return denom > 0 ? Math.max(0, Math.min(1, rev / denom)) : 0;
-  }, [data.expensesMonth, data.revenue]);
+  }, [data.revenue, data.totalOutflows]);
+
+  const headlineSummary = useMemo(() => {
+    const totals = dashboardSummary?.totals || {};
+    const counts = dashboardSummary?.counts || {};
+    const revenue = Math.max(Number(totals.sales || 0), Number(data.revenue || 0));
+    const expenses = Math.max(Number(totals.expenses || 0), Number(data.expensesMonth || 0));
+    const losses = Math.max(Number(totals.losses || 0), Number(data.damageLosses || 0));
+    const totalOutflows = expenses + losses;
+    const profitValue = revenue - totalOutflows;
+    return {
+      revenue,
+      expenses,
+      losses,
+      totalOutflows,
+      profit: profitValue,
+      damagedStocks: Math.max(Number(counts.damagedStocks || 0), Number(data.damagedStocksCount || 0))
+    };
+  }, [dashboardSummary, data.damageLosses, data.damagedStocksCount, data.expensesMonth, data.revenue]);
 
   return (
     <div className="bg-white min-h-screen">
@@ -691,48 +957,20 @@ const Dashboard = () => {
           </div>
           <div className="flex items-center gap-2">
             <button
-              type="button"
-              className={
-                `px-3 py-2 text-sm rounded-lg border border-gray-200 text-gray-700 transition-transform active:scale-95 ` +
-                `${dashboardMode === 'realtime' ? 'bg-green-50 border-green-200 text-green-700 font-semibold' : 'bg-white hover:bg-gray-50'} ` +
-                `${tabTap === 'realtime' ? 'dash-tab-tap' : ''}`
-              }
-              onClick={() => {
-                setTabTap('');
-                window.requestAnimationFrame(() => setTabTap('realtime'));
-                window.setTimeout(() => setTabTap(''), 220);
-                setDashboardMode('realtime');
-              }}
-            >
-              Real-time
-            </button>
-            <button
-              type="button"
-              className={
-                `px-3 py-2 text-sm rounded-lg border border-gray-200 text-gray-700 transition-transform active:scale-95 ` +
-                `${dashboardMode === 'historical' ? 'bg-green-50 border-green-200 text-green-700 font-semibold' : 'bg-white hover:bg-gray-50'} ` +
-                `${tabTap === 'historical' ? 'dash-tab-tap' : ''}`
-              }
-              onClick={() => {
-                setTabTap('');
-                window.requestAnimationFrame(() => setTabTap('historical'));
-                window.setTimeout(() => setTabTap(''), 220);
-                setDashboardMode('historical');
-              }}
-            >
-              Historical
-            </button>
-            <button
               className="px-3 py-2 text-sm rounded-lg border border-gray-200 bg-white text-gray-700 flex items-center gap-2 disabled:opacity-60"
+              disabled={isRefreshing}
               onClick={() => {
-                setTabTap('');
-                window.requestAnimationFrame(() => setTabTap('refresh'));
-                window.setTimeout(() => setTabTap(''), 520);
                 refreshData();
               }}
             >
               <RefreshCw className="w-4 h-4" />
-              Refresh Data
+              <span>{isRefreshing ? 'Refreshing...' : 'Refresh Data'}</span>
+              {subscriptionSummary.daysRemaining != null && subscriptionSummary.status ? (
+                <span className="text-xs text-gray-500">
+                  • {subscriptionSummary.status === 'trial' ? 'Trial' : 'Plan'} {subscriptionSummary.daysRemaining}/
+                  {subscriptionSummary.status === 'trial' ? 7 : (Number(subscriptionSummary.durationDays || 30) || 30)}
+                </span>
+              ) : null}
             </button>
           </div>
         </div>
@@ -743,8 +981,7 @@ const Dashboard = () => {
               <span className="text-sm text-gray-600">Total Revenue</span>
               <Wallet className="w-4 h-4 text-green-600" />
             </div>
-            <div className="mt-2 text-2xl font-bold text-gray-900">{formatTZS(data.revenue)}</div>
-            <div className="mt-1 text-xs text-green-600">+12.5% vs last month</div>
+            <div className="mt-2 text-2xl font-bold text-gray-900">{formatTZS(headlineSummary.revenue)}</div>
           </div>
           <div className="bg-white border border-gray-200 rounded-xl p-4">
             <div className="flex items-center justify-between">
@@ -752,7 +989,6 @@ const Dashboard = () => {
               <TrendingUp className="w-4 h-4 text-green-600" />
             </div>
             <div className="mt-2 text-2xl font-bold text-gray-900">{data.totalSales.toLocaleString()}</div>
-            <div className="mt-1 text-xs text-green-600">+5.2% vs last month</div>
           </div>
           <div className="bg-white border border-gray-200 rounded-xl p-4">
             <div className="flex items-center justify-between">
@@ -767,8 +1003,12 @@ const Dashboard = () => {
               <span className="text-sm text-gray-600">Total Expenses</span>
               <Package className="w-4 h-4 text-green-600" />
             </div>
-            <div className="mt-2 text-2xl font-bold text-gray-900">{formatTZS(data.expensesMonth)}</div>
-            <div className="mt-1 text-xs text-gray-600">This period</div>
+            <div className="mt-2 text-2xl font-bold text-gray-900">{formatTZS(headlineSummary.totalOutflows)}</div>
+            <div className="mt-1 text-xs text-gray-600">
+              {headlineSummary.losses > 0
+                ? `Includes ${formatTZS(headlineSummary.losses)} damaged stock losses`
+                : 'This period'}
+            </div>
           </div>
         </div>
 
@@ -828,21 +1068,25 @@ const Dashboard = () => {
                   <div className="text-sm font-semibold text-gray-900">Net Profit</div>
                   <div className="mt-1 text-xs text-gray-600">This period</div>
                 </div>
-                <div className={`text-2xl font-extrabold ${data.revenue - data.expensesMonth >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                  {formatTZS(data.revenue - data.expensesMonth)}
+                <div className={`text-2xl font-extrabold ${headlineSummary.profit >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                  {formatTZS(headlineSummary.profit)}
                 </div>
                 <div className="text-xs text-gray-600 space-y-1">
                   <div className="flex items-center justify-between">
                     <span>Sales</span>
-                    <span className="font-semibold text-gray-900">{formatTZS(data.revenue)}</span>
+                    <span className="font-semibold text-gray-900">{formatTZS(headlineSummary.revenue)}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Expenses</span>
-                    <span className="font-semibold text-gray-900">{formatTZS(data.expensesMonth)}</span>
+                    <span className="font-semibold text-gray-900">{formatTZS(headlineSummary.expenses)}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Damaged Stock Losses</span>
+                    <span className="font-semibold text-gray-900">{formatTZS(headlineSummary.losses)}</span>
                   </div>
                   <div className="pt-2 mt-2 border-t border-gray-200 flex items-center justify-between">
                     <span className="font-semibold text-gray-900">Net Profit</span>
-                    <span className="font-extrabold text-gray-900">{formatTZS(data.revenue - data.expensesMonth)}</span>
+                    <span className="font-extrabold text-gray-900">{formatTZS(headlineSummary.profit)}</span>
                   </div>
                 </div>
               </div>
@@ -933,8 +1177,8 @@ const Dashboard = () => {
                 </div>
                 <button className="text-sm text-green-600">View All</button>
               </div>
-              <div className="overflow-hidden">
-                <table className="w-full table-fixed">
+              <div className="overflow-x-auto">
+                <table className="min-w-[820px] w-full table-fixed">
                   <thead className="bg-gray-50">
                     <tr className="text-left text-xs font-semibold text-gray-600">
                       <th className="px-4 py-3 w-[34%]">Date</th>
@@ -1014,8 +1258,8 @@ const Dashboard = () => {
                   : new Date(selectedYear, selectedMonth, 1).toLocaleString(undefined, { month: 'long', year: 'numeric' })}
               </div>
               <div className="grid grid-cols-7 gap-2 text-center text-xs text-gray-600">
-                {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d) => (
-                  <div key={d} className="py-1">
+                {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, i) => (
+                  <div key={`${d}-${i}`} className="py-1">
                     {d}
                   </div>
                 ))}
@@ -1123,8 +1367,8 @@ const Dashboard = () => {
               <div className="flex items-center justify-between mb-4">
                 <div className="text-gray-900 font-semibold">Invoice</div>
               </div>
-              <div className="overflow-x-hidden overflow-y-auto max-h-[360px]">
-                <table className="w-full table-fixed">
+              <div className="overflow-auto max-h-[360px]">
+                <table className="min-w-[520px] w-full table-fixed">
                   <thead className="bg-gray-50">
                     <tr className="text-left text-xs font-semibold text-gray-600">
                       <th className="px-4 py-2 w-[54%]">Invoice #</th>
@@ -1134,8 +1378,9 @@ const Dashboard = () => {
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {data.topInvoices.slice(0, 50).map((inv, i) => {
-                      const downloadInvoice = () => {
+                      const downloadInvoice = async () => {
                         flushSync(() => setInvoiceToPrint(inv));
+                        await waitForInvoicePrintReady();
                         window.print();
                       };
                       return (

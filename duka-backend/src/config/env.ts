@@ -1,30 +1,39 @@
-import dotenv from 'dotenv';
+import { config } from 'dotenv';
 import { z } from 'zod';
 
-dotenv.config();
+config();
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
   DATABASE_URL: z.string().min(1),
+  APP_NAME: z.string().default('DukaHub Backend'),
   JWT_ACCESS_SECRET: z.string().min(16),
   JWT_REFRESH_SECRET: z.string().min(16),
-  JWT_ACCESS_TTL_SECONDS: z.coerce.number().int().positive().default(900),
-  JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
-  CORS_ORIGIN: z.string().min(1).default('http://localhost:3000'),
-  MINIO_ENDPOINT: z.string().min(1).default('localhost'),
-  MINIO_PORT: z.coerce.number().int().positive().default(9000),
-  MINIO_USE_SSL: z.coerce.boolean().default(false),
-  MINIO_ACCESS_KEY: z.string().min(1).default('minioadmin'),
-  MINIO_SECRET_KEY: z.string().min(1).default('minioadmin'),
-  MINIO_BUCKET: z.string().min(1).default('duka-files')
+  JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
+  JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
+  BCRYPT_SALT_ROUNDS: z.coerce.number().int().min(8).max(15).default(12),
+  CORS_ORIGIN: z.string().default(''),
+  FRONTEND_ORIGINS: z
+    .string()
+    .default('http://localhost:3000,http://127.0.0.1:3000,https://dukahub.co.tz,https://www.dukahub.co.tz'),
+  TRUST_PROXY: z.coerce.number().int().min(0).default(1),
+  COOKIE_DOMAIN: z.string().trim().optional(),
+  COOKIE_SECURE: z.coerce.boolean().default(true)
 });
 
 const parsed = envSchema.safeParse(process.env);
+
 if (!parsed.success) {
-  process.stderr.write(`Invalid environment variables. Create .env from .env.example\n`);
-  process.stderr.write(`${JSON.stringify(parsed.error.format(), null, 2)}\n`);
-  process.exit(1);
+  console.error('Invalid environment configuration', parsed.error.flatten().fieldErrors);
+  throw new Error('Invalid environment configuration');
 }
 
-export const env = parsed.data;
+const cookieSecure =
+  process.env.COOKIE_SECURE == null ? parsed.data.NODE_ENV === 'production' : parsed.data.COOKIE_SECURE;
+
+export const env = {
+  ...parsed.data,
+  COOKIE_SECURE: cookieSecure
+};
+export const isProduction = env.NODE_ENV === 'production';

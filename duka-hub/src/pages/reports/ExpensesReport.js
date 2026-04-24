@@ -1,7 +1,27 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Download, FileText, Printer } from 'lucide-react';
 import { formatDisplayDate } from '../../utils/date';
-import { downloadCsvFile, printWithTitle } from '../../utils/reportActions';
+import { downloadExcelFile, printWithTitle } from '../../utils/reportActions';
+import { expensesApi } from '../../services/expensesApi';
+
+const safeJsonParse = (raw, fallback) => {
+  try {
+    return JSON.parse(String(raw ?? ''));
+  } catch {
+    return fallback;
+  }
+};
+
+const authApi = {
+  getCurrentUserSync() {
+    void safeJsonParse;
+    try {
+      return safeJsonParse(window.localStorage.getItem('currentUser'), null);
+    } catch {
+      return null;
+    }
+  }
+};
 
 const toNum = (v) => {
   const n = Number(String(v ?? '').replace(/,/g, ''));
@@ -104,33 +124,30 @@ export default function ExpensesReport() {
   const [period, setPeriod] = useState('thisMonth');
   const [category, setCategory] = useState('all');
   const [refreshKey, setRefreshKey] = useState(0);
+  const [allExpenses, setAllExpenses] = useState([]);
 
-  const currentUser = useMemo(() => {
-    try {
-      return JSON.parse(localStorage.getItem('currentUser') || 'null') || JSON.parse(sessionStorage.getItem('currentUser') || 'null');
-    } catch {
-      return null;
-    }
-  }, []);
+  const currentUser = useMemo(() => (authApi.getCurrentUserSync ? authApi.getCurrentUserSync() : null), []);
 
   useEffect(() => {
     const onEvent = () => setRefreshKey((v) => v + 1);
     window.addEventListener('dataUpdated', onEvent);
-    window.addEventListener('storage', onEvent);
     return () => {
       window.removeEventListener('dataUpdated', onEvent);
-      window.removeEventListener('storage', onEvent);
     };
   }, []);
 
-  const allExpenses = useMemo(() => {
-    void refreshKey;
-    try {
-      const raw = JSON.parse(localStorage.getItem('expenses') || '[]');
-      return Array.isArray(raw) ? raw : [];
-    } catch {
-      return [];
-    }
+  useEffect(() => {
+    let alive = true;
+    Promise.resolve()
+      .then(async () => {
+        const raw = await expensesApi.list().catch(() => []);
+        if (!alive) return;
+        setAllExpenses(Array.isArray(raw) ? raw : []);
+      })
+      .catch(() => setAllExpenses([]));
+    return () => {
+      alive = false;
+    };
   }, [refreshKey]);
 
   const categoryOptions = useMemo(() => {
@@ -250,7 +267,7 @@ export default function ExpensesReport() {
     return arr.slice(0, 12);
   }, [filtered]);
 
-  const exportCSV = () => {
+  const exportExcel = () => {
     const rows = [['Ref', 'Description', 'Category', 'Amount', 'Paid To', 'Date', 'Approved By']];
     filtered.forEach((e) => {
       const ref = String(e.expenseNumber || e.id || '');
@@ -262,7 +279,11 @@ export default function ExpensesReport() {
       const approvedBy = String(currentUser?.fullName || 'Admin');
       rows.push([ref, desc, cat, amount, paidTo, date, approvedBy]);
     });
-    downloadCsvFile(`expenses_report_${new Date().toISOString().slice(0, 10)}.csv`, rows);
+    downloadExcelFile(`expenses_report_${new Date().toISOString().slice(0, 10)}.xls`, {
+      title: 'Expenses Report',
+      subtitle: String(range?.label || ''),
+      rows
+    });
   };
 
   const exportPDF = () => printWithTitle(`Expenses Report - ${range.label}`);
@@ -287,11 +308,14 @@ export default function ExpensesReport() {
   return (
     <div className="space-y-6">
       <style>{`
+        .report-print-only { display: none; }
         @media print {
+          @page { size: landscape; margin: 12mm; }
           body * { visibility: hidden !important; }
           .report-print-scope, .report-print-scope * { visibility: visible !important; }
           .report-print-scope { position: absolute !important; inset: 0 !important; padding: 16px !important; background: white !important; }
           .report-no-print { display: none !important; }
+          .report-print-only { display: block !important; }
         }
       `}</style>
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -309,9 +333,9 @@ export default function ExpensesReport() {
             <FileText className="w-4 h-4" />
             PDF
           </button>
-          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportCSV}>
+          <button type="button" className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm font-medium hover:bg-gray-50 inline-flex items-center gap-2" onClick={exportExcel}>
             <Download className="w-4 h-4" />
-            CSV
+            Excel
           </button>
           <button type="button" className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 inline-flex items-center gap-2" onClick={exportPDF}>
             <Printer className="w-4 h-4" />
@@ -320,12 +344,11 @@ export default function ExpensesReport() {
         </div>
       </div>
 
-      <div className="report-print-scope bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
+      <div className="bg-slate-50/70 border border-slate-200 rounded-2xl p-6">
         <div className="flex items-start justify-between gap-6 flex-wrap">
           <div>
             <div className="text-[12px] text-rose-700 font-medium tracking-wide">Cost analysis</div>
-            <div className="mt-2 text-3xl font-semibold text-gray-900">Expenses Report</div>
-            <div className="mt-2 text-sm text-gray-600">Full breakdown of operational costs — {range.label}</div>
+            <div className="mt-2 text-sm text-gray-600">Full breakdown of operational costs</div>
           </div>
           <div className="flex items-center gap-3 report-no-print">
             <select value={category} onChange={(e) => setCategory(e.target.value)} className="px-4 py-2 rounded-xl border border-gray-200 bg-white text-sm">
@@ -381,10 +404,14 @@ export default function ExpensesReport() {
           </div>
         </div>
 
-        <div className="mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
+        <div className="report-print-scope mt-4 bg-white border border-gray-200 rounded-2xl overflow-hidden">
           <div className="p-5 border-b border-gray-200 flex items-center justify-between gap-3">
-            <div className="text-base font-semibold text-gray-900">Expense Records</div>
-            <span className="px-3 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">{range.label}</span>
+            <div>
+              <div className="report-print-only">
+                <div className="text-lg font-semibold text-gray-900">Expenses Report</div>
+              </div>
+              <div className="report-no-print text-base font-semibold text-gray-900">Expense Records</div>
+            </div>
           </div>
           <div className="overflow-auto">
             <table className="min-w-[980px] w-full">
